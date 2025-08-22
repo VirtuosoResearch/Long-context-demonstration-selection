@@ -10,6 +10,7 @@ from datasets import load_from_disk, load_dataset
 from peft import PeftConfig, PeftModel
 from tqdm.auto import tqdm
 from transformers import (
+    AutoTokenizer,
     LlamaTokenizer,
     StoppingCriteria,
     StoppingCriteriaList,
@@ -18,6 +19,7 @@ from swebench.inference.llamao.modeling_flash_llama import (
     LlamaForCausalLM as AutoModelForCausalLM,
 )
 from swebench.inference.make_datasets.utils import extract_diff
+from transformers import AutoModelForCausalLM as HF_AutoModelForCausalLM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -125,6 +127,9 @@ def load_model(model_name_or_path, peft_path):
         "cpu": "20GIB",
     }
     logger.info(f"Using max memory {max_memory}")
+    # print(DEVICE_MAPS)
+    # if "-1b" in model_name_or_path or "-1B" in model_name_or_path:
+    #     device_map = DEVICE_MAPS["1b"][str(torch.cuda.device_count())]
     if "-7b" in model_name_or_path:
         device_map = DEVICE_MAPS["7b"][str(torch.cuda.device_count())]
     elif "-13b" in model_name_or_path:
@@ -132,7 +137,25 @@ def load_model(model_name_or_path, peft_path):
     elif "-34b" in model_name_or_path:
         device_map = DEVICE_MAPS["34b"][str(torch.cuda.device_count())]
     else:
-        raise ValueError(f"No device map for {model_name_or_path}")
+        logger.warning(
+            f"No static device map for {model_name_or_path}; falling back to HF AutoModel with device_map='auto'"
+        )
+        model = HF_AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+        ).eval()
+        if peft_path is not None:
+            from peft import PeftModel
+            logger.info(f"Loading PEFT adapters from {peft_path}")
+            model = PeftModel.from_pretrained(
+                model,
+                peft_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                max_memory=max_memory,
+            )
+        return model
     logger.info(f"Using device_map {device_map}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
@@ -156,8 +179,9 @@ def load_model(model_name_or_path, peft_path):
 
 def load_tokenizer(model_name_or_path):
     logger.info(f"Loading tokenizer {model_name_or_path}")
-    tokenizer = LlamaTokenizer.from_pretrained(model_name_or_path)
-    return tokenizer
+    # tokenizer = LlamaTokenizer.from_pretrained(model_name_or_path)
+    # return tokenizer
+    return AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
 
 
 def load_data(
