@@ -164,11 +164,14 @@ cython_debug/
 .keys
 .vscode/
 *.jsonl
+*.json
 *.jsonl.*
 *.patch
 *.DS_Store
 data/repos/copies
-notebooks/
+# notebooks/
 *logs/
 
 cmd_results/
+README_SWE.md
+datasets/
