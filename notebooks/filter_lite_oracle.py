@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Classify tasks in `princeton-nlp/SWE-bench_Lite` by category.
-
-Categories:
-- bugfix
-- feature
-- compat
-- docs
-- test
-- refactor
-
-Heuristics are keyword-based with priority ordering and scoring.
-Outputs:
-- swebench_lite_classification.csv (per-instance labels)
-- swebench_lite_classification_summary.csv (counts)
-- swebench_lite_classification.jsonl (optional: per-instance with scores)
-
-Usage:
-    python classify_swebench_lite.py --split test --out out_dir
-    # If the HF hub is blocked, pass a local dataset path exported with datasets:
-    python classify_swebench_lite.py --dataset_path /path/to/local --split test --out out_dir
-"""
 import argparse
 import json
 import os
@@ -35,7 +11,6 @@ try:
     from datasets import load_dataset, load_from_disk
 except Exception as e:
     raise SystemExit("Please `pip install datasets pandas` before running this script.")
-
 
 CATEGORY_PRIORITY = ["bugfix", "compat", "feature", "test", "docs", "refactor"]
 
@@ -71,7 +46,6 @@ KEYWORDS: List[Tuple[re.Pattern, Tuple[str, int]]] = [
     (re.compile(r"\b(dead code|remove unused)\b", re.I), ("refactor", 2)),
 ]
 
-
 def text_from_example(ex: Dict) -> str:
     """Concatenate available text fields robustly across SWE-bench variants."""
     fields_priority = [
@@ -98,7 +72,6 @@ def text_from_example(ex: Dict) -> str:
             parts.append(str(ex[f]))
     return "\n".join(parts).strip()
 
-
 def score_categories(text: str) -> Tuple[str, Dict[str, int], Dict[str, List[str]]]:
     """Return (best_category, score_map, hits_map)."""
     scores = defaultdict(int)
@@ -124,7 +97,6 @@ def score_categories(text: str) -> Tuple[str, Dict[str, int], Dict[str, List[str
             return cat, dict(scores), hits
     return candidates[0], dict(scores), hits
 
-
 def load_swebench_lite(dataset_path: str = None, split: str = "test"):
     if dataset_path:
         ds = load_from_disk(dataset_path)
@@ -136,10 +108,10 @@ def load_swebench_lite(dataset_path: str = None, split: str = "test"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset_path", type=str, default=None, help="Local path exported by `datasets` (optional).")
-    ap.add_argument("--split", type=str, default="test", help="Dataset split (default: test).")
-    ap.add_argument("--out", type=str, default=".", help="Output directory.")
-    ap.add_argument("--jsonl", action="store_true", help="Also write per-instance JSONL with scores and hits.")
+    ap.add_argument("--dataset_path", type=str, default=None)
+    ap.add_argument("--split", type=str, default="test")
+    ap.add_argument("--out", type=str, default=".")
+    ap.add_argument("--jsonl", action="store_true")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)

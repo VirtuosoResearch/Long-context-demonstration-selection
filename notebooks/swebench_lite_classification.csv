@@ -1,0 +1,301 @@
+idx,instance_id,repo,title,category,scores
+0,astropy__astropy-12907,astropy/astropy,,bugfix,{'bugfix': 8}
+1,astropy__astropy-14182,astropy/astropy,,compat,"{'bugfix': 4, 'feature': 2, 'compat': 12, 'docs': 3, 'refactor': 6}"
+2,astropy__astropy-14365,astropy/astropy,,compat,"{'bugfix': 4, 'compat': 10, 'docs': 1, 'test': 9, 'refactor': 4}"
+3,astropy__astropy-14995,astropy/astropy,,compat,"{'bugfix': 22, 'compat': 30}"
+4,astropy__astropy-6938,astropy/astropy,,bugfix,"{'bugfix': 11, 'refactor': 2}"
+5,astropy__astropy-7746,astropy/astropy,,bugfix,{'bugfix': 14}
+6,django__django-10914,django/django,,bugfix,"{'bugfix': 13, 'compat': 2, 'docs': 3, 'refactor': 3}"
+7,django__django-10924,django/django,,feature,{'feature': 2}
+8,django__django-11001,django/django,,bugfix,"{'bugfix': 21, 'docs': 1}"
+9,django__django-11019,django/django,,bugfix,{'bugfix': 6}
+10,django__django-11039,django/django,,test,"{'feature': 2, 'test': 6}"
+11,django__django-11049,django/django,,bugfix,"{'bugfix': 8, 'feature': 2, 'refactor': 6}"
+12,django__django-11099,django/django,,bugfix,"{'bugfix': 2, 'feature': 2, 'docs': 1}"
+13,django__django-11133,django/django,,bugfix,{}
+14,django__django-11179,django/django,,bugfix,{}
+15,django__django-11283,django/django,,bugfix,{'bugfix': 16}
+16,django__django-11422,django/django,,compat,"{'feature': 2, 'compat': 2}"
+17,django__django-11564,django/django,,feature,"{'bugfix': 3, 'feature': 4}"
+18,django__django-11583,django/django,,compat,"{'bugfix': 8, 'feature': 4, 'compat': 48}"
+19,django__django-11620,django/django,,bugfix,"{'bugfix': 21, 'feature': 4, 'docs': 1}"
+20,django__django-11630,django/django,,bugfix,{'bugfix': 12}
+21,django__django-11742,django/django,,feature,{'feature': 2}
+22,django__django-11797,django/django,,bugfix,{}
+23,django__django-11815,django/django,,bugfix,"{'bugfix': 11, 'docs': 1}"
+24,django__django-11848,django/django,,feature,"{'bugfix': 6, 'feature': 12, 'refactor': 2}"
+25,django__django-11905,django/django,,bugfix,"{'bugfix': 4, 'feature': 2}"
+26,django__django-11910,django/django,,feature,{'feature': 4}
+27,django__django-11964,django/django,,test,"{'bugfix': 14, 'feature': 2, 'docs': 1, 'test': 21}"
+28,django__django-11999,django/django,,compat,"{'compat': 4, 'docs': 1}"
+29,django__django-12113,django/django,,bugfix,"{'bugfix': 34, 'test': 24}"
+30,django__django-12125,django/django,,bugfix,{'bugfix': 3}
+31,django__django-12184,django/django,,bugfix,"{'bugfix': 25, 'compat': 6, 'refactor': 4}"
+32,django__django-12284,django/django,,bugfix,"{'bugfix': 6, 'docs': 1}"
+33,django__django-12286,django/django,,bugfix,"{'bugfix': 4, 'docs': 4}"
+34,django__django-12308,django/django,,bugfix,"{'bugfix': 2, 'feature': 2, 'docs': 1}"
+35,django__django-12453,django/django,,bugfix,"{'bugfix': 10, 'test': 3}"
+36,django__django-12470,django/django,,bugfix,{}
+37,django__django-12497,django/django,,bugfix,"{'bugfix': 7, 'compat': 2}"
+38,django__django-12589,django/django,,bugfix,{'bugfix': 8}
+39,django__django-12700,django/django,,docs,{'docs': 1}
+40,django__django-12708,django/django,,bugfix,"{'bugfix': 9, 'feature': 6, 'refactor': 3}"
+41,django__django-12747,django/django,,bugfix,"{'bugfix': 6, 'docs': 1, 'refactor': 2}"
+42,django__django-12856,django/django,,feature,{'feature': 2}
+43,django__django-12908,django/django,,bugfix,{}
+44,django__django-12915,django/django,,bugfix,"{'bugfix': 12, 'feature': 2, 'compat': 2}"
+45,django__django-12983,django/django,,test,"{'bugfix': 5, 'docs': 1, 'test': 12}"
+46,django__django-13028,django/django,,bugfix,"{'bugfix': 18, 'compat': 14}"
+47,django__django-13033,django/django,,bugfix,"{'bugfix': 8, 'test': 6}"
+48,django__django-13158,django/django,,bugfix,"{'bugfix': 8, 'docs': 1}"
+49,django__django-13220,django/django,,feature,"{'feature': 4, 'test': 3}"
+50,django__django-13230,django/django,,feature,{'feature': 6}
+51,django__django-13265,django/django,,bugfix,{'bugfix': 9}
+52,django__django-13315,django/django,,bugfix,{'bugfix': 2}
+53,django__django-13321,django/django,,bugfix,"{'bugfix': 59, 'compat': 48}"
+54,django__django-13401,django/django,,test,{'test': 3}
+55,django__django-13447,django/django,,bugfix,{}
+56,django__django-13448,django/django,,compat,"{'bugfix': 41, 'feature': 6, 'compat': 48, 'test': 36}"
+57,django__django-13551,django/django,,bugfix,"{'bugfix': 2, 'feature': 2}"
+58,django__django-13590,django/django,,bugfix,{'bugfix': 10}
+59,django__django-13658,django/django,,feature,"{'feature': 2, 'docs': 2}"
+60,django__django-13660,django/django,,compat,"{'bugfix': 4, 'feature': 2, 'compat': 20, 'docs': 1}"
+61,django__django-13710,django/django,,bugfix,"{'bugfix': 5, 'feature': 2}"
+62,django__django-13757,django/django,,bugfix,"{'bugfix': 3, 'test': 3}"
+63,django__django-13768,django/django,,bugfix,{'bugfix': 12}
+64,django__django-13925,django/django,,bugfix,"{'bugfix': 9, 'docs': 1}"
+65,django__django-13933,django/django,,bugfix,{'bugfix': 16}
+66,django__django-13964,django/django,,bugfix,"{'bugfix': 12, 'test': 3}"
+67,django__django-14016,django/django,,bugfix,"{'bugfix': 14, 'docs': 1}"
+68,django__django-14017,django/django,,bugfix,"{'bugfix': 4, 'compat': 4, 'docs': 1}"
+69,django__django-14155,django/django,,bugfix,{}
+70,django__django-14238,django/django,,compat,"{'bugfix': 7, 'feature': 2, 'compat': 20, 'docs': 4}"
+71,django__django-14382,django/django,,bugfix,{'bugfix': 12}
+72,django__django-14411,django/django,,bugfix,{}
+73,django__django-14534,django/django,,bugfix,"{'bugfix': 4, 'refactor': 2}"
+74,django__django-14580,django/django,,bugfix,{'bugfix': 17}
+75,django__django-14608,django/django,,bugfix,"{'bugfix': 8, 'feature': 8}"
+76,django__django-14667,django/django,,docs,{'docs': 2}
+77,django__django-14672,django/django,,compat,"{'bugfix': 6, 'feature': 8, 'compat': 40}"
+78,django__django-14730,django/django,,bugfix,{'bugfix': 4}
+79,django__django-14752,django/django,,feature,"{'bugfix': 2, 'feature': 4, 'docs': 2, 'refactor': 3}"
+80,django__django-14787,django/django,,bugfix,"{'bugfix': 11, 'test': 6}"
+81,django__django-14855,django/django,,bugfix,"{'bugfix': 3, 'feature': 2, 'docs': 1}"
+82,django__django-14915,django/django,,bugfix,"{'bugfix': 4, 'feature': 2, 'docs': 1}"
+83,django__django-14997,django/django,,bugfix,{'bugfix': 24}
+84,django__django-14999,django/django,,bugfix,{}
+85,django__django-15061,django/django,,docs,{'docs': 1}
+86,django__django-15202,django/django,,bugfix,{'bugfix': 4}
+87,django__django-15213,django/django,,bugfix,{'bugfix': 3}
+88,django__django-15252,django/django,,bugfix,"{'bugfix': 9, 'test': 6}"
+89,django__django-15320,django/django,,bugfix,{'bugfix': 3}
+90,django__django-15347,django/django,,bugfix,"{'bugfix': 23, 'feature': 4}"
+91,django__django-15388,django/django,,bugfix,{'bugfix': 8}
+92,django__django-15400,django/django,,bugfix,"{'bugfix': 4, 'feature': 4}"
+93,django__django-15498,django/django,,bugfix,{'bugfix': 12}
+94,django__django-15695,django/django,,docs,{'docs': 1}
+95,django__django-15738,django/django,,bugfix,"{'bugfix': 19, 'compat': 4}"
+96,django__django-15781,django/django,,bugfix,"{'bugfix': 8, 'feature': 8, 'compat': 4, 'docs': 8}"
+97,django__django-15789,django/django,,feature,"{'feature': 8, 'docs': 3}"
+98,django__django-15790,django/django,,bugfix,"{'bugfix': 4, 'feature': 2}"
+99,django__django-15814,django/django,,bugfix,"{'bugfix': 13, 'feature': 2, 'compat': 2}"
+100,django__django-15819,django/django,,feature,{'feature': 2}
+101,django__django-15851,django/django,,bugfix,{}
+102,django__django-15902,django/django,,compat,{'compat': 8}
+103,django__django-15996,django/django,,feature,{'feature': 2}
+104,django__django-16041,django/django,,bugfix,"{'bugfix': 3, 'test': 3}"
+105,django__django-16046,django/django,,bugfix,{'bugfix': 4}
+106,django__django-16139,django/django,,bugfix,"{'bugfix': 6, 'refactor': 6}"
+107,django__django-16229,django/django,,bugfix,"{'bugfix': 10, 'feature': 2, 'test': 3}"
+108,django__django-16255,django/django,,bugfix,"{'bugfix': 19, 'compat': 12}"
+109,django__django-16379,django/django,,compat,"{'bugfix': 4, 'feature': 4, 'compat': 10}"
+110,django__django-16400,django/django,,bugfix,"{'bugfix': 14, 'feature': 6, 'docs': 1}"
+111,django__django-16408,django/django,,bugfix,"{'bugfix': 14, 'feature': 2, 'test': 3}"
+112,django__django-16527,django/django,,feature,{'feature': 4}
+113,django__django-16595,django/django,,bugfix,"{'bugfix': 6, 'feature': 2}"
+114,django__django-16816,django/django,,bugfix,{'bugfix': 35}
+115,django__django-16820,django/django,,compat,{'compat': 12}
+116,django__django-16873,django/django,,bugfix,"{'bugfix': 16, 'docs': 3, 'test': 6}"
+117,django__django-16910,django/django,,bugfix,{'bugfix': 3}
+118,django__django-17051,django/django,,feature,{'feature': 8}
+119,django__django-17087,django/django,,bugfix,{'bugfix': 7}
+120,matplotlib__matplotlib-18869,matplotlib/matplotlib,,feature,"{'feature': 24, 'compat': 12, 'docs': 3}"
+121,matplotlib__matplotlib-22711,matplotlib/matplotlib,,compat,"{'bugfix': 14, 'compat': 30}"
+122,matplotlib__matplotlib-22835,matplotlib/matplotlib,,compat,"{'bugfix': 20, 'compat': 40}"
+123,matplotlib__matplotlib-23299,matplotlib/matplotlib,,compat,"{'bugfix': 22, 'compat': 24, 'test': 2}"
+124,matplotlib__matplotlib-23314,matplotlib/matplotlib,,compat,"{'bugfix': 13, 'compat': 18}"
+125,matplotlib__matplotlib-23476,matplotlib/matplotlib,,compat,"{'bugfix': 14, 'compat': 50, 'docs': 3}"
+126,matplotlib__matplotlib-23562,matplotlib/matplotlib,,compat,"{'bugfix': 11, 'compat': 12, 'docs': 1}"
+127,matplotlib__matplotlib-23563,matplotlib/matplotlib,,compat,"{'bugfix': 22, 'compat': 68}"
+128,matplotlib__matplotlib-23913,matplotlib/matplotlib,,feature,"{'bugfix': 5, 'feature': 6, 'compat': 4}"
+129,matplotlib__matplotlib-23964,matplotlib/matplotlib,,compat,"{'bugfix': 33, 'compat': 60, 'docs': 1}"
+130,matplotlib__matplotlib-23987,matplotlib/matplotlib,,compat,"{'bugfix': 10, 'compat': 18}"
+131,matplotlib__matplotlib-24149,matplotlib/matplotlib,,bugfix,"{'bugfix': 57, 'feature': 6, 'compat': 42}"
+132,matplotlib__matplotlib-24265,matplotlib/matplotlib,,compat,"{'bugfix': 35, 'compat': 40}"
+133,matplotlib__matplotlib-24334,matplotlib/matplotlib,,bugfix,"{'bugfix': 7, 'compat': 4, 'docs': 3}"
+134,matplotlib__matplotlib-24970,matplotlib/matplotlib,,compat,"{'bugfix': 19, 'feature': 12, 'compat': 50}"
+135,matplotlib__matplotlib-25079,matplotlib/matplotlib,,compat,"{'bugfix': 24, 'compat': 80}"
+136,matplotlib__matplotlib-25311,matplotlib/matplotlib,,compat,"{'bugfix': 14, 'compat': 16}"
+137,matplotlib__matplotlib-25332,matplotlib/matplotlib,,compat,"{'bugfix': 10, 'compat': 16}"
+138,matplotlib__matplotlib-25433,matplotlib/matplotlib,,compat,"{'bugfix': 10, 'compat': 28, 'test': 6}"
+139,matplotlib__matplotlib-25442,matplotlib/matplotlib,,compat,"{'bugfix': 22, 'compat': 34}"
+140,matplotlib__matplotlib-25498,matplotlib/matplotlib,,compat,"{'bugfix': 8, 'compat': 26, 'docs': 1}"
+141,matplotlib__matplotlib-26011,matplotlib/matplotlib,,bugfix,"{'bugfix': 13, 'compat': 10}"
+142,matplotlib__matplotlib-26020,matplotlib/matplotlib,,compat,"{'bugfix': 29, 'compat': 50, 'test': 3, 'refactor': 4}"
+143,mwaskom__seaborn-2848,mwaskom/seaborn,,bugfix,"{'bugfix': 18, 'compat': 8}"
+144,mwaskom__seaborn-3010,mwaskom/seaborn,,bugfix,"{'bugfix': 28, 'feature': 6, 'compat': 14}"
+145,mwaskom__seaborn-3190,mwaskom/seaborn,,bugfix,"{'bugfix': 11, 'feature': 2, 'compat': 2}"
+146,mwaskom__seaborn-3407,mwaskom/seaborn,,compat,"{'bugfix': 3, 'compat': 16}"
+147,pallets__flask-4045,pallets/flask,,bugfix,{'bugfix': 8}
+148,pallets__flask-4992,pallets/flask,,feature,"{'bugfix': 4, 'feature': 10, 'compat': 2}"
+149,pallets__flask-5063,pallets/flask,,test,"{'bugfix': 2, 'feature': 6, 'test': 30}"
+150,psf__requests-1963,psf/requests,,bugfix,"{'bugfix': 3, 'docs': 3}"
+151,psf__requests-2148,psf/requests,,bugfix,"{'bugfix': 24, 'compat': 20}"
+152,psf__requests-2317,psf/requests,,bugfix,"{'bugfix': 18, 'compat': 4}"
+153,psf__requests-2674,psf/requests,,feature,{'feature': 2}
+154,psf__requests-3362,psf/requests,,compat,"{'compat': 2, 'docs': 1}"
+155,psf__requests-863,psf/requests,,feature,"{'bugfix': 3, 'feature': 4}"
+156,pydata__xarray-3364,pydata/xarray,,bugfix,"{'bugfix': 3, 'feature': 2}"
+157,pydata__xarray-4094,pydata/xarray,,compat,"{'bugfix': 3, 'compat': 12, 'test': 3}"
+158,pydata__xarray-4248,pydata/xarray,,feature,"{'feature': 4, 'docs': 1}"
+159,pydata__xarray-4493,pydata/xarray,,compat,"{'compat': 10, 'docs': 2, 'test': 3}"
+160,pydata__xarray-5131,pydata/xarray,,refactor,"{'bugfix': 3, 'feature': 4, 'compat': 2, 'docs': 4, 'refactor': 12}"
+161,pylint-dev__pylint-5859,pylint-dev/pylint,,test,"{'bugfix': 5, 'feature': 4, 'compat': 4, 'test': 21}"
+162,pylint-dev__pylint-6506,pylint-dev/pylint,,bugfix,"{'bugfix': 25, 'feature': 12, 'compat': 4, 'docs': 3, 'refactor': 2}"
+163,pylint-dev__pylint-7080,pylint-dev/pylint,,compat,"{'bugfix': 5, 'compat': 14}"
+164,pylint-dev__pylint-7114,pylint-dev/pylint,,bugfix,"{'bugfix': 28, 'compat': 6, 'docs': 1, 'refactor': 6}"
+165,pylint-dev__pylint-7228,pylint-dev/pylint,,compat,"{'bugfix': 25, 'compat': 38, 'refactor': 2}"
+166,pylint-dev__pylint-7993,pylint-dev/pylint,,bugfix,"{'bugfix': 25, 'compat': 18, 'test': 18}"
+167,pytest-dev__pytest-11143,pytest-dev/pytest,,test,"{'bugfix': 20, 'compat': 28, 'docs': 10, 'test': 51}"
+168,pytest-dev__pytest-11148,pytest-dev/pytest,,test,"{'bugfix': 4, 'compat': 2, 'test': 21, 'refactor': 4}"
+169,pytest-dev__pytest-5103,pytest-dev/pytest,,test,"{'bugfix': 9, 'feature': 2, 'compat': 4, 'docs': 2, 'test': 28}"
+170,pytest-dev__pytest-5221,pytest-dev/pytest,,test,"{'docs': 3, 'test': 24}"
+171,pytest-dev__pytest-5227,pytest-dev/pytest,,test,"{'test': 9, 'refactor': 2}"
+172,pytest-dev__pytest-5413,pytest-dev/pytest,,test,"{'bugfix': 8, 'compat': 6, 'test': 39}"
+173,pytest-dev__pytest-5495,pytest-dev/pytest,,test,"{'bugfix': 8, 'docs': 1, 'test': 13}"
+174,pytest-dev__pytest-5692,pytest-dev/pytest,,test,"{'feature': 2, 'compat': 4, 'docs': 2, 'test': 15}"
+175,pytest-dev__pytest-6116,pytest-dev/pytest,,test,"{'feature': 4, 'test': 15}"
+176,pytest-dev__pytest-7168,pytest-dev/pytest,,compat,"{'bugfix': 16, 'compat': 90, 'test': 21}"
+177,pytest-dev__pytest-7220,pytest-dev/pytest,,test,"{'bugfix': 38, 'compat': 4, 'test': 66}"
+178,pytest-dev__pytest-7373,pytest-dev/pytest,,test,"{'bugfix': 8, 'compat': 2, 'docs': 1, 'test': 38}"
+179,pytest-dev__pytest-7432,pytest-dev/pytest,,test,"{'bugfix': 5, 'docs': 1, 'test': 37}"
+180,pytest-dev__pytest-7490,pytest-dev/pytest,,test,"{'bugfix': 4, 'feature': 2, 'compat': 28, 'docs': 1, 'test': 120, 'refactor': 10}"
+181,pytest-dev__pytest-8365,pytest-dev/pytest,,test,"{'bugfix': 10, 'compat': 4, 'test': 24}"
+182,pytest-dev__pytest-8906,pytest-dev/pytest,,test,"{'bugfix': 22, 'feature': 4, 'compat': 6, 'docs': 3, 'test': 48}"
+183,pytest-dev__pytest-9359,pytest-dev/pytest,,test,"{'bugfix': 42, 'compat': 12, 'docs': 1, 'test': 66}"
+184,scikit-learn__scikit-learn-10297,scikit-learn/scikit-learn,,feature,"{'bugfix': 9, 'feature': 20, 'compat': 8, 'docs': 5, 'test': 3}"
+185,scikit-learn__scikit-learn-10508,scikit-learn/scikit-learn,,compat,"{'bugfix': 19, 'compat': 20}"
+186,scikit-learn__scikit-learn-10949,scikit-learn/scikit-learn,,compat,"{'bugfix': 8, 'compat': 24}"
+187,scikit-learn__scikit-learn-11040,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 8, 'feature': 2}"
+188,scikit-learn__scikit-learn-11281,scikit-learn/scikit-learn,,feature,{'feature': 4}
+189,scikit-learn__scikit-learn-12471,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 18, 'compat': 10, 'test': 6}"
+190,scikit-learn__scikit-learn-13142,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 18, 'compat': 18, 'test': 12}"
+191,scikit-learn__scikit-learn-13241,scikit-learn/scikit-learn,,bugfix,{}
+192,scikit-learn__scikit-learn-13439,scikit-learn/scikit-learn,,compat,"{'bugfix': 4, 'feature': 4, 'compat': 6}"
+193,scikit-learn__scikit-learn-13496,scikit-learn/scikit-learn,,feature,"{'feature': 12, 'docs': 4, 'test': 3}"
+194,scikit-learn__scikit-learn-13497,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 4, 'compat': 2, 'test': 3}"
+195,scikit-learn__scikit-learn-13584,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 5, 'compat': 2}"
+196,scikit-learn__scikit-learn-13779,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 3, 'feature': 2}"
+197,scikit-learn__scikit-learn-14087,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 16, 'feature': 2, 'compat': 12}"
+198,scikit-learn__scikit-learn-14092,scikit-learn/scikit-learn,,feature,"{'bugfix': 8, 'feature': 20, 'compat': 2, 'docs': 1}"
+199,scikit-learn__scikit-learn-14894,scikit-learn/scikit-learn,,compat,"{'bugfix': 12, 'feature': 2, 'compat': 18}"
+200,scikit-learn__scikit-learn-14983,scikit-learn/scikit-learn,,compat,{'compat': 6}
+201,scikit-learn__scikit-learn-15512,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 18, 'feature': 2, 'compat': 8, 'docs': 7}"
+202,scikit-learn__scikit-learn-15535,scikit-learn/scikit-learn,,bugfix,"{'bugfix': 5, 'feature': 2, 'compat': 2}"
+203,scikit-learn__scikit-learn-25500,scikit-learn/scikit-learn,,compat,"{'bugfix': 15, 'compat': 60}"
+204,scikit-learn__scikit-learn-25570,scikit-learn/scikit-learn,,compat,"{'bugfix': 20, 'compat': 70, 'docs': 1}"
+205,scikit-learn__scikit-learn-25638,scikit-learn/scikit-learn,,compat,"{'bugfix': 4, 'feature': 6, 'compat': 12, 'test': 6}"
+206,scikit-learn__scikit-learn-25747,scikit-learn/scikit-learn,,compat,"{'bugfix': 32, 'feature': 4, 'compat': 68}"
+207,sphinx-doc__sphinx-10325,sphinx-doc/sphinx,,feature,"{'feature': 8, 'docs': 6}"
+208,sphinx-doc__sphinx-10451,sphinx-doc/sphinx,,docs,"{'bugfix': 4, 'docs': 21}"
+209,sphinx-doc__sphinx-11445,sphinx-doc/sphinx,,docs,"{'bugfix': 8, 'compat': 10, 'docs': 28}"
+210,sphinx-doc__sphinx-7686,sphinx-doc/sphinx,,docs,"{'bugfix': 5, 'compat': 4, 'docs': 8}"
+211,sphinx-doc__sphinx-7738,sphinx-doc/sphinx,,bugfix,"{'bugfix': 5, 'feature': 4, 'compat': 4, 'docs': 3, 'test': 3}"
+212,sphinx-doc__sphinx-7975,sphinx-doc/sphinx,,docs,{'docs': 3}
+213,sphinx-doc__sphinx-8273,sphinx-doc/sphinx,,bugfix,"{'bugfix': 5, 'docs': 3}"
+214,sphinx-doc__sphinx-8282,sphinx-doc/sphinx,,bugfix,"{'bugfix': 11, 'compat': 4, 'docs': 5}"
+215,sphinx-doc__sphinx-8435,sphinx-doc/sphinx,,bugfix,"{'bugfix': 11, 'compat': 4, 'docs': 8}"
+216,sphinx-doc__sphinx-8474,sphinx-doc/sphinx,,docs,{'docs': 6}
+217,sphinx-doc__sphinx-8506,sphinx-doc/sphinx,,feature,"{'bugfix': 12, 'feature': 20, 'docs': 18}"
+218,sphinx-doc__sphinx-8595,sphinx-doc/sphinx,,docs,"{'bugfix': 5, 'compat': 4, 'docs': 14}"
+219,sphinx-doc__sphinx-8627,sphinx-doc/sphinx,,docs,"{'bugfix': 5, 'compat': 6, 'docs': 15}"
+220,sphinx-doc__sphinx-8713,sphinx-doc/sphinx,,bugfix,"{'bugfix': 4, 'compat': 4, 'docs': 3}"
+221,sphinx-doc__sphinx-8721,sphinx-doc/sphinx,,bugfix,"{'bugfix': 5, 'compat': 4, 'docs': 3}"
+222,sphinx-doc__sphinx-8801,sphinx-doc/sphinx,,docs,"{'bugfix': 5, 'feature': 2, 'compat': 4, 'docs': 17}"
+223,sympy__sympy-11400,sympy/sympy,,bugfix,{}
+224,sympy__sympy-11870,sympy/sympy,,bugfix,{}
+225,sympy__sympy-11897,sympy/sympy,,bugfix,{'bugfix': 6}
+226,sympy__sympy-12171,sympy/sympy,,bugfix,{'bugfix': 8}
+227,sympy__sympy-12236,sympy/sympy,,bugfix,"{'bugfix': 56, 'compat': 4}"
+228,sympy__sympy-12419,sympy/sympy,,bugfix,{'bugfix': 5}
+229,sympy__sympy-12454,sympy/sympy,,bugfix,{'bugfix': 8}
+230,sympy__sympy-12481,sympy/sympy,,bugfix,{'bugfix': 3}
+231,sympy__sympy-13031,sympy/sympy,,bugfix,{}
+232,sympy__sympy-13043,sympy/sympy,,test,{'test': 3}
+233,sympy__sympy-13146,sympy/sympy,,refactor,{'refactor': 9}
+234,sympy__sympy-13177,sympy/sympy,,bugfix,{}
+235,sympy__sympy-13437,sympy/sympy,,bugfix,{'bugfix': 7}
+236,sympy__sympy-13471,sympy/sympy,,compat,"{'bugfix': 11, 'compat': 14, 'docs': 1}"
+237,sympy__sympy-13480,sympy/sympy,,bugfix,{'bugfix': 3}
+238,sympy__sympy-13647,sympy/sympy,,refactor,"{'docs': 1, 'refactor': 3}"
+239,sympy__sympy-13773,sympy/sympy,,bugfix,"{'bugfix': 7, 'compat': 4}"
+240,sympy__sympy-13895,sympy/sympy,,refactor,{'refactor': 9}
+241,sympy__sympy-13915,sympy/sympy,,compat,{'compat': 2}
+242,sympy__sympy-13971,sympy/sympy,,bugfix,{'bugfix': 3}
+243,sympy__sympy-14024,sympy/sympy,,refactor,{'refactor': 6}
+244,sympy__sympy-14308,sympy/sympy,,bugfix,{'bugfix': 3}
+245,sympy__sympy-14317,sympy/sympy,,bugfix,{'bugfix': 6}
+246,sympy__sympy-14396,sympy/sympy,,bugfix,"{'bugfix': 8, 'feature': 4}"
+247,sympy__sympy-14774,sympy/sympy,,bugfix,"{'bugfix': 5, 'feature': 2, 'docs': 1}"
+248,sympy__sympy-14817,sympy/sympy,,bugfix,{'bugfix': 27}
+249,sympy__sympy-15011,sympy/sympy,,bugfix,{'bugfix': 7}
+250,sympy__sympy-15308,sympy/sympy,,bugfix,{}
+251,sympy__sympy-15345,sympy/sympy,,bugfix,{'bugfix': 3}
+252,sympy__sympy-15346,sympy/sympy,,refactor,"{'compat': 2, 'refactor': 18}"
+253,sympy__sympy-15609,sympy/sympy,,bugfix,{}
+254,sympy__sympy-15678,sympy/sympy,,bugfix,"{'bugfix': 8, 'feature': 4}"
+255,sympy__sympy-16106,sympy/sympy,,bugfix,"{'bugfix': 14, 'compat': 8}"
+256,sympy__sympy-16281,sympy/sympy,,bugfix,{}
+257,sympy__sympy-16503,sympy/sympy,,bugfix,{}
+258,sympy__sympy-16792,sympy/sympy,,bugfix,"{'bugfix': 13, 'compat': 4, 'docs': 1}"
+259,sympy__sympy-16988,sympy/sympy,,bugfix,{}
+260,sympy__sympy-17022,sympy/sympy,,bugfix,"{'bugfix': 4, 'feature': 2, 'compat': 2}"
+261,sympy__sympy-17139,sympy/sympy,,refactor,"{'bugfix': 4, 'refactor': 51}"
+262,sympy__sympy-17630,sympy/sympy,,compat,"{'bugfix': 16, 'compat': 28}"
+263,sympy__sympy-17655,sympy/sympy,,bugfix,"{'bugfix': 24, 'feature': 4, 'compat': 6, 'test': 9, 'refactor': 7}"
+264,sympy__sympy-18057,sympy/sympy,,bugfix,"{'bugfix': 6, 'test': 1}"
+265,sympy__sympy-18087,sympy/sympy,,bugfix,"{'bugfix': 3, 'refactor': 3}"
+266,sympy__sympy-18189,sympy/sympy,,bugfix,{}
+267,sympy__sympy-18199,sympy/sympy,,bugfix,{'bugfix': 6}
+268,sympy__sympy-18532,sympy/sympy,,bugfix,{'bugfix': 2}
+269,sympy__sympy-18621,sympy/sympy,,compat,"{'bugfix': 4, 'feature': 2, 'compat': 16}"
+270,sympy__sympy-18698,sympy/sympy,,bugfix,"{'bugfix': 3, 'docs': 1}"
+271,sympy__sympy-18835,sympy/sympy,,bugfix,{'bugfix': 11}
+272,sympy__sympy-19007,sympy/sympy,,bugfix,{'bugfix': 6}
+273,sympy__sympy-19254,sympy/sympy,,feature,{'feature': 4}
+274,sympy__sympy-19487,sympy/sympy,,bugfix,{'bugfix': 9}
+275,sympy__sympy-20049,sympy/sympy,,bugfix,"{'bugfix': 4, 'feature': 2, 'compat': 2}"
+276,sympy__sympy-20154,sympy/sympy,,bugfix,"{'bugfix': 3, 'docs': 3}"
+277,sympy__sympy-20212,sympy/sympy,,docs,{'docs': 6}
+278,sympy__sympy-20322,sympy/sympy,,refactor,"{'bugfix': 3, 'refactor': 15}"
+279,sympy__sympy-20442,sympy/sympy,,bugfix,"{'bugfix': 4, 'docs': 1}"
+280,sympy__sympy-20590,sympy/sympy,,bugfix,"{'bugfix': 9, 'compat': 2}"
+281,sympy__sympy-20639,sympy/sympy,,bugfix,"{'bugfix': 5, 'compat': 2}"
+282,sympy__sympy-21055,sympy/sympy,,bugfix,"{'bugfix': 8, 'refactor': 6}"
+283,sympy__sympy-21171,sympy/sympy,,compat,"{'bugfix': 8, 'feature': 12, 'compat': 44}"
+284,sympy__sympy-21379,sympy/sympy,,bugfix,"{'bugfix': 34, 'compat': 6}"
+285,sympy__sympy-21612,sympy/sympy,,bugfix,"{'bugfix': 6, 'compat': 4}"
+286,sympy__sympy-21614,sympy/sympy,,bugfix,{'bugfix': 6}
+287,sympy__sympy-21627,sympy/sympy,,bugfix,{'bugfix': 13}
+288,sympy__sympy-21847,sympy/sympy,,bugfix,"{'bugfix': 9, 'docs': 4}"
+289,sympy__sympy-22005,sympy/sympy,,bugfix,{'bugfix': 4}
+290,sympy__sympy-22714,sympy/sympy,,bugfix,"{'bugfix': 12, 'compat': 12}"
+291,sympy__sympy-22840,sympy/sympy,,bugfix,"{'bugfix': 3, 'docs': 2, 'test': 2}"
+292,sympy__sympy-23117,sympy/sympy,,bugfix,"{'bugfix': 10, 'feature': 2, 'compat': 10}"
+293,sympy__sympy-23191,sympy/sympy,,bugfix,{'bugfix': 5}
+294,sympy__sympy-23262,sympy/sympy,,bugfix,{'bugfix': 5}
+295,sympy__sympy-24066,sympy/sympy,,test,{'test': 1}
+296,sympy__sympy-24102,sympy/sympy,,bugfix,"{'bugfix': 18, 'compat': 8, 'docs': 4}"
+297,sympy__sympy-24152,sympy/sympy,,bugfix,{'bugfix': 20}
+298,sympy__sympy-24213,sympy/sympy,,bugfix,"{'bugfix': 7, 'compat': 2}"
+299,sympy__sympy-24909,sympy/sympy,,bugfix,"{'bugfix': 5, 'compat': 4}"
