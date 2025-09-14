@@ -14,10 +14,28 @@
 #   --temperature 0 \
 #   --top_p 1
 
+# python -m swebench.inference.run_llama \
+#   --dataset_path ./datasets/oracle_lite_test \
+#   --model_name_or_path meta-llama/Llama-3.2-3B-Instruct \
+#   --output_dir ./outputs/llama-3.2-3b-instruct_lite_test \
+#   --split test \
+#   --temperature 0 \
+#   --top_p 1
+
+# codellama/CodeLlama-7b-Instruct-hf
+
+# python -m swebench.inference.run_llama \
+#   --dataset_path ./datasets/oracle_lite_test \
+#   --model_name_or_path princeton-nlp/SWE-Llama-7b \
+#   --output_dir ./outputs/codellama-7b-instruct_lite_test \
+#   --split test \
+#   --temperature 0 \
+#   --top_p 1
+
 python -m swebench.inference.run_llama \
   --dataset_path ./datasets/oracle_lite_test \
-  --model_name_or_path meta-llama/Llama-3.2-3B-Instruct \
-  --output_dir ./outputs/llama-3.2-3b-instruct_lite_test \
+  --model_name_or_path Qwen/Qwen2.5-Coder-7B-Instruct \
+  --output_dir ./outputs/codellama-7b-instruct_lite_test \
   --split test \
   --temperature 0 \
   --top_p 1
