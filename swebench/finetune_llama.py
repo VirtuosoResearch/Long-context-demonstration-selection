@@ -6,11 +6,8 @@ from typing import Dict, List
 import torch
 from datasets import load_dataset
 from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
+    DataCollatorForLanguageModeling, Trainer,
 )
 
 from peft import LoraConfig, get_peft_model, TaskType
@@ -34,12 +31,12 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16 if USE_BF16 else torch.float16,
-    bnb_4bit_use_double_quant=True,
-)
+# bnb_config = BitsAndBytesConfig(
+#     load_in_4bit=True,
+#     bnb_4bit_quant_type="nf4",
+#     bnb_4bit_compute_dtype=torch.bfloat16 if USE_BF16 else torch.float16,
+#     bnb_4bit_use_double_quant=True,
+# )
 
 INSTRUCTION = """You are a software engineer. Read the issue and failing tests, then output a git patch that fixes the bug.
 
@@ -92,6 +89,28 @@ def load_and_prepare_dataset(sample_size: int, seed: int):
     return ds
 
 
+# def build_model_and_tokenizer():
+#     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=True)
+#     if tokenizer.pad_token is None:
+#         tokenizer.pad_token = tokenizer.eos_token
+
+#     model = AutoModelForCausalLM.from_pretrained(
+#         BASE_MODEL,
+#         device_map="auto",
+#         quantization_config=bnb_config,
+#         trust_remote_code=True
+#     )
+
+#     lora_cfg = LoraConfig(
+#         task_type=TaskType.CAUSAL_LM,
+#         r=LORA_R,
+#         lora_alpha=LORA_ALPHA,
+#         lora_dropout=LORA_DROPOUT,
+#         target_modules=TARGET_MODULES
+#     )
+#     model = get_peft_model(model, lora_cfg)
+#     return model, tokenizer
+
 def build_model_and_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -100,7 +119,7 @@ def build_model_and_tokenizer():
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         device_map="auto",
-        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True
     )
 
@@ -145,20 +164,20 @@ def train_and_save():
         save_strategy="steps",
         save_steps=200,
         save_total_limit=2,
-        bf16=USE_BF16,
-        optim="paged_adamw_8bit",
+        bf16=USE_BF16, 
+        # fp16=True, 
+        optim="adamw_torch",
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         ddp_find_unused_parameters=False,
         report_to="none",
     )
 
-    trainer = SFTTrainer(
+
+    trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
-        train_dataset=tokenized,
         args=args,
-        packing=False,
+        train_dataset=tokenized,
         data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
 
