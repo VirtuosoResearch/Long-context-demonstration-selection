@@ -14,10 +14,16 @@
 #   --temperature 0 \
 #   --top_p 1
 
-python -m swebench.inference.run_llama \
-  --dataset_path ./datasets/oracle_lite_test \
-  --model_name_or_path meta-llama/Llama-3.2-3B-Instruct \
-  --output_dir ./outputs/llama-3.2-3b-instruct_lite_test \
-  --split test \
-  --temperature 0 \
-  --top_p 1
+# python -m swebench.inference.run_llama \
+#   --dataset_path princeton-nlp/SWE-bench_Lite \
+#   --model_name_or_path princeton-nlp/SWE-Llama-7b \
+#   --output_dir ./outputs/swe-llama-7b_lite_test \
+#   --split test \
+#   --temperature 0 \
+#   --top_p 1
+
+CUDA_VISIBLE_DEVICES=0,1 python -m swebench.inference.run_llama \
+  --dataset_path princeton-nlp/SWE-bench_Lite \
+  --model_name_or_path princeton-nlp/SWE-Llama-7b \
+  --output_dir ./outputs/swe-llama-7b_lite_test2 \
+  --split test --temperature 0 --top_p 1
