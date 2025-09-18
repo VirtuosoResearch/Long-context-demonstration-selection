@@ -14,18 +14,16 @@ from peft import LoraConfig, get_peft_model, TaskType
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 import torch
-
-BASE_MODEL = "princeton-nlp/SWE-Llama-7b"
-OUTPUT_DIR = "./outputs/swe-llama-7b-lora_test"
-MERGED_DIR = "./outputs/swe-llama-7b-lora-merged_test" 
+import argparse
+import json
 
 SEED = 42
 SAMPLE_SIZE = 300
-MAX_LEN = 10000
+MAX_LEN = 12000
 LR = 6e-4
 NUM_EPOCHS = 10
 BATCH_SIZE_PER_DEVICE = 1
-GRAD_ACCUM = 16
+GRAD_ACCUM = 8
 USE_BF16 = True
 
 LORA_R = 16
@@ -72,33 +70,35 @@ class DataCollatorForCausalLMWithIgnore:
             "labels": torch.tensor(labels, dtype=torch.long),
         }
     
-def set_seed(seed: int):
+def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def format_example(ex: Dict) -> Dict:
+def format_example(ex):
     return {"prompt": ex["text"], "patch": ex["patch"]}
 
-def load_and_prepare_dataset(sample_size: int, seed: int):
-    ds_all = load_dataset("princeton-nlp/SWE-bench_Lite_oracle")
-    split_name = "test"
-    ds = ds_all[split_name]
-    idx = list(range(len(ds)))
-    random.Random(seed).shuffle(idx)
-    idx = idx[:sample_size]
-    ds = ds.select(idx)
+def load_and_prepare_dataset(dataset, split, category, sample_size):
+    ds_all = load_dataset(dataset)
+    ds = ds_all[split]
+    with open(f"./classified/{dataset.split("/")[1]}_{split}.json", "r", encoding="utf-8") as f:
+        category_data = json.load(f)
+    cat_ids = set(category_data.get(category, []))
+    ds = ds.filter(lambda ex: ex["instance_id"] in cat_ids)
+    print(f"dataset size: {len(ds)}")
+    if len(ds)>sample_size:
+        ds = ds.select(range(sample_size))
     ds = ds.map(format_example, remove_columns=ds.column_names)
     return ds
 
-def build_model_and_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, trust_remote_code=True)
+def build_model_and_tokenizer(model_name):
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    max_memory = {0: "45GiB", 1: "45GiB", "cpu": "0GiB"} 
+    max_memory = {0: "45GiB", 1: "45GiB", "cpu": "20GiB"} 
     model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
+        model_name,
         device_map="auto",
         max_memory=max_memory,
         torch_dtype=torch.bfloat16 if USE_BF16 else torch.float16,
@@ -120,7 +120,7 @@ def build_model_and_tokenizer():
     model = get_peft_model(model, lora_cfg)
     return model, tokenizer
 
-def _truncate_pair_with_mask(enc_prompt, enc_patch, max_len: int):
+def _truncate_pair_with_mask(enc_prompt, enc_patch, max_len):
     p_ids = enc_prompt["input_ids"]
     t_ids = enc_patch["input_ids"]
     p_mask = enc_prompt["attention_mask"]
@@ -141,7 +141,7 @@ def _truncate_pair_with_mask(enc_prompt, enc_patch, max_len: int):
     labels = [-100] * len(p_ids) + t_ids
     return ids, mask, labels
 
-def tokenize_fn(examples: Dict, tokenizer: AutoTokenizer):
+def tokenize_fn(examples, tokenizer):
     prompts = examples["prompt"]
     patches = examples["patch"]
     input_ids, attention_mask, labels = [], [], []
@@ -159,13 +159,15 @@ def tokenize_fn(examples: Dict, tokenizer: AutoTokenizer):
 
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-def train_and_save():
+def main(args):
     set_seed(SEED)
+    OUTPUT_DIR = os.path.join(args.output, args.model.split("/")[1]+f"{args.category}_lora")
+    MERGED_DIR = os.path.join(args.output, args.model.split("/")[1]+f"{args.category}_lora_merged")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(MERGED_DIR, exist_ok=True)
 
-    ds = load_and_prepare_dataset(SAMPLE_SIZE, SEED)
-    model, tokenizer = build_model_and_tokenizer()
+    ds = load_and_prepare_dataset(args.dataset, args.split, args.category, SAMPLE_SIZE)
+    model, tokenizer = build_model_and_tokenizer(args.model)
 
     tokenized = ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True, remove_columns=["prompt","patch"])
 
@@ -177,7 +179,7 @@ def train_and_save():
         num_train_epochs=NUM_EPOCHS,
         logging_steps=10,
         save_strategy="steps",
-        save_steps=200,
+        save_steps=100,
         save_total_limit=2,
         bf16=USE_BF16,
         optim="adamw_torch",
@@ -209,4 +211,11 @@ def train_and_save():
     print(f"Merged full model saved to: {MERGED_DIR}")
 
 if __name__ == "__main__":
-    train_and_save()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="princeton-nlp/SWE-bench_bm25_13K")
+    parser.add_argument("--split", type=str, default="dev")
+    parser.add_argument("--model", type=str, default="princeton-nlp/SWE-Llama-7b")
+    parser.add_argument("--output", type=str, default="./outputs")
+    parser.add_argument("--category", type=str, default="bugfix")
+    args = parser.parse_args()
+    main(args)
