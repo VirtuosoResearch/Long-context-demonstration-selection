@@ -33,3 +33,7 @@ for REF in "${REFS[@]}"; do
   fi
 done
 echo "done"
+
+# chmod +x retag_ghcr_to_harness.sh
+# ./retag_ghcr_to_harness.sh
+# docker images --filter reference='swebench/sweb.eval.x86_64.*:latest'
