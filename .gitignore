@@ -175,3 +175,6 @@ data/repos/copies
 cmd_results/
 README_SWE.md
 datasets/
+
+*.txt
+./notebooks/samples

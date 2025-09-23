@@ -215,7 +215,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="princeton-nlp/SWE-bench_bm25_13K")
     parser.add_argument("--split", type=str, default="dev")
     parser.add_argument("--model", type=str, default="princeton-nlp/SWE-Llama-7b")
-    parser.add_argument("--output", type=str, default="./outputs")
+    parser.add_argument("--output", type=str, default="./models")
     parser.add_argument("--category", type=str, default="bugfix")
     args = parser.parse_args()
     main(args)
