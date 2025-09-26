@@ -4,18 +4,18 @@ Project document [https://docs.google.com/document/d/1poyVOmL3mc69hc4HIanicUG3-v
 
 ## Run open-sourced model
 
-1. Generate patch:
+1. Generate patch.
 ```bash
 python -m swebench.inference.run_llama \
   --dataset_path ./datasets/oracle_lite_test \ # This can be online datasets and local datasets.
   --split test \
   --model_name_or_path SWE-bench/SWE-agent-LM-7B \ # This can be online models and local models.
-  --output_dir ./outputs/swe-agent-lm-7b \
+  --output_dir ./outputs/swe-agent-lm-7b \ # the patch will be generated in this path.
   --temperature 0 \
   --top_p 1
 ```
 
-2. Test patch:
+2. Test patch.
 ```bash
 python -m swebench.harness.run_evaluation \
     --dataset_name princeton-nlp/SWE-bench_Lite \ # This can be online datasets and local datasets.
@@ -36,13 +36,29 @@ python ./swebench/finetune_parallal.py \
 
 ## Run agent
 
+1. Use open-sourced model to evaluate.
 ```bash
+cd ./SWE-agent
 sweagent run-batch \
   --config config/hf_llama_model.yaml \
   --agent.model.name huggingface/meta-llama/Llama-3.2-1B-Instruct:novita \
   --instances.type swe_bench \
   --instances.subset lite \
   --instances.split dev \
-  --instances.slice : \
+  --instances.slice :3 \
   --instances.shuffle=True
+```
+
+2. Use api to evaluate.
+```bash
+cd ./SWE-agent
+sweagent run-batch \
+    --config config/default.yaml \
+    --agent.model.name gpt-4o \
+    --agent.model.per_instance_cost_limit 2.00 \
+    --instances.type swe_bench \
+    --instances.subset lite \
+    --instances.split dev  \
+    --instances.slice :3 \
+    --instances.shuffle=True
 ```
