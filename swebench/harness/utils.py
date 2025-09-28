@@ -131,7 +131,9 @@ def load_swebench_dataset(
     if instance_ids:
         instance_ids = set(instance_ids)
     # Load from local .json/.jsonl file
-    if name.endswith(".json"):
+    if "feature" in name.lower() or "bugfix" in name.lower():
+        dataset = cast(Dataset, load_from_disk(Path(name)))
+    elif name.endswith(".json"):
         dataset = json.loads(Path(name).read_text())
     elif name.endswith(".jsonl"):
         dataset = [json.loads(line) for line in Path(name).read_text().splitlines()]

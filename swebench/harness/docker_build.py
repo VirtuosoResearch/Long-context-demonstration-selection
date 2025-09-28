@@ -6,6 +6,9 @@ import logging
 import sys
 import traceback
 
+import os
+import re
+
 from pathlib import Path
 
 from swebench.harness.constants import (
@@ -429,6 +432,17 @@ def build_instance_image(
     if new_logger:
         close_logger(logger)
 
+def to_standard_instance_id(s: str) -> str:
+    m = re.fullmatch(r'([A-Za-z0-9]+)_[0-9]+_([A-Za-z0-9\-]+)', s)
+    if m:
+        return f"{m.group(1)}__{m.group(2)}"
+    return s
+
+def ghcr_ref_from_instance(instance_id: str, arch: str = "x86_64") -> str:
+    ns = os.getenv("SWE_BENCH_GHCR_NAMESPACE", "epoch-research")
+    prefix = os.getenv("SWE_BENCH_GHCR_PREFIX", "swe-bench.eval")
+    tag = os.getenv("SWE_BENCH_GHCR_TAG", "latest")
+    return f"ghcr.io/{ns}/{prefix}.{arch}.{instance_id}:{tag}"
 
 def build_container(
     test_spec: TestSpec,
@@ -460,12 +474,30 @@ def build_container(
         except docker.errors.ImageNotFound:
             try:
                 client.images.pull(test_spec.instance_image_key)
-            except docker.errors.NotFound as e:
-                raise BuildImageError(test_spec.instance_id, str(e), logger) from e
-            except Exception as e:
-                raise Exception(
-                    f"Error occurred while pulling image {test_spec.base_image_key}: {str(e)}"
-                )
+            except Exception:
+                std_iid = to_standard_instance_id(test_spec.instance_id)
+                ghcr_name = ghcr_ref_from_instance(std_iid, arch=test_spec.arch if hasattr(test_spec, "arch") else "x86_64")
+                logger.info(f"Falling back to GHCR: pulling {ghcr_name}")
+                try:
+                    client.images.pull(ghcr_name)
+                    client.images.get(ghcr_name).tag(test_spec.instance_image_key)
+                except docker.errors.NotFound as e:
+                    raise BuildImageError(test_spec.instance_id, str(e), logger) from e
+                except Exception as e:
+                    raise Exception(
+                        f"Error occurred while pulling image {ghcr_name}: {str(e)}"
+                    )
+        # try:
+        #     client.images.get(test_spec.instance_image_key)
+        # except docker.errors.ImageNotFound:
+        #     try:
+        #         client.images.pull(test_spec.instance_image_key)
+        #     except docker.errors.NotFound as e:
+        #         raise BuildImageError(test_spec.instance_id, str(e), logger) from e
+        #     except Exception as e:
+        #         raise Exception(
+        #             f"Error occurred while pulling image {test_spec.base_image_key}: {str(e)}"
+        #         )
 
     container = None
     try:

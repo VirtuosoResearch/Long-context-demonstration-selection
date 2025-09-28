@@ -1,5 +1,7 @@
 # retag_ghcr_to_harness.sh
 #!/usr/bin/env bash
+python ./notebooks/fetch_offline_image.py
+
 set -euo pipefail
 ARCH="x86_64"
 SRC_PREFIX="ghcr.io/epoch-research/swe-bench.eval.${ARCH}"

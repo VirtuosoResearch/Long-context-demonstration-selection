@@ -24,18 +24,26 @@
 
 # codellama/CodeLlama-7b-Instruct-hf
 
-python -m swebench.inference.run_llama \
-  --dataset_path /home/michael/project/MTL-SWE-agents/datasets/oracle_lite_test_bugfix \
-  --model_name_or_path /home/michael/project/MTL-SWE-agents/model/SWE-Llama-7bbugfix_lora_merged \
-  --output_dir ./outputs/swellama-7b_lite_test_ft_on_bm25_bugfix \
-  --split test \
-  --temperature 0 \
-  --top_p 1
+# python -m swebench.inference.run_llama \
+#   --dataset_path /home/michael/project/MTL-SWE-agents/datasets/oracle_lite_test_bugfix \
+#   --model_name_or_path /home/michael/project/MTL-SWE-agents/model/SWE-Llama-7bbugfix_lora_merged \
+#   --output_dir ./outputs/swellama-7b_lite_test_ft_on_bm25_bugfix \
+#   --split test \
+#   --temperature 0 \
+#   --top_p 1
+
+# python -m swebench.inference.run_llama \
+#   --dataset_path /home/michael/project/MTL-SWE-agents/datasets/oracle_lite_test_feature \
+#   --model_name_or_path /home/michael/project/MTL-SWE-agents/model/SWE-Llama-7bfeature_lora_merged \
+#   --output_dir ./outputs/swellama-7b_lite_test_ft_on_bm25_feature \
+#   --split test \
+#   --temperature 0 \
+#   --top_p 1
 
 python -m swebench.inference.run_llama \
-  --dataset_path /home/michael/project/MTL-SWE-agents/datasets/oracle_lite_test_feature \
-  --model_name_or_path /home/michael/project/MTL-SWE-agents/model/SWE-Llama-7bfeature_lora_merged \
-  --output_dir ./outputs/swellama-7b_lite_test_ft_on_bm25_feature \
+  --dataset_path ./datasets/oracle_lite_test \
+  --model_name_or_path SWE-bench/SWE-agent-LM-7B \
+  --output_dir ./outputs/swe-agent-lm-7b \
   --split test \
   --temperature 0 \
   --top_p 1

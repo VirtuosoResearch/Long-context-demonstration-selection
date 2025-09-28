@@ -4,6 +4,7 @@ import re
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
+import numpy as np
 
 import torch
 from datasets import load_from_disk, load_dataset
@@ -19,7 +20,7 @@ from swebench.inference.llamao.modeling_flash_llama import (
     LlamaForCausalLM as AutoModelForCausalLM,
 )
 from swebench.inference.make_datasets.utils import extract_diff
-from transformers import AutoModelForCausalLM as HF_AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -140,7 +141,7 @@ def load_model(model_name_or_path, peft_path):
         logger.warning(
             f"No static device map for {model_name_or_path}; falling back to HF AutoModel with device_map='auto'"
         )
-        model = HF_AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             device_map="auto",
             torch_dtype=torch.bfloat16,
@@ -215,7 +216,9 @@ def load_data(
         dataset: The preprocessed dataset for model inference.
     """
     logger.info(f"Loading dataset from {dataset_path}")
-    if not Path(dataset_path).exists():
+    if "bugfix" in dataset_path or "feature" in dataset_path:
+        dataset = load_from_disk(Path(dataset_path))
+    elif not Path(dataset_path).exists():
         dataset = load_dataset(dataset_path, split=split)
     elif Path(dataset_path, split).exists():
         dataset = load_from_disk(Path(dataset_path) / split)
@@ -225,6 +228,13 @@ def load_data(
         model_nickname = "__".join(peft_path.split("/")[-2:])
     else:
         model_nickname = "__".join(model_name_or_path.split("/")[-2:])
+
+    print(dataset[0])
+    print("column name: ", dataset.column_names)
+    in_context_data = dataset[0]
+    # print("in_context_data: ", in_context_data)
+    with open("./in_context_data.json", "w") as f:
+        json.dump(in_context_data,f, indent=4)
     if "input_ids" not in dataset.column_names:
         dataset = dataset.map(
             lambda x: tokenizer(x["text"], truncation=False),
@@ -236,13 +246,14 @@ def load_data(
         dataset = dataset.map(
             lambda x: {"input_ids": x["input_ids"] + [13]}, batched=False
         )
-    filter_func = None
+    # filter_func = None
     if min_len is not None and max_len is None:
         filter_func = lambda x: x >= min_len
     elif min_len is None and max_len is not None:
         filter_func = lambda x: x < max_len
     elif min_len is not None and max_len is not None:
         filter_func = lambda x: min_len <= x < max_len
+    print(filter_func)
     if filter_func is not None:
         dataset = dataset.filter(
             lambda x: filter_func(len(x["input_ids"])), desc="filtering for length"
@@ -357,7 +368,6 @@ def generate(
                 fail_count += 1
                 if fail_count >= 3:
                     raise ValueError("too many failures")
-
 
 def get_all_existing_ids(output_file):
     stub_pattern = re.compile(
