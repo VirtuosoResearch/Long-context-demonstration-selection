@@ -129,6 +129,7 @@ def make_run_report(
             }
         )
     report_file = Path(
+        "results/"+
         list(predictions.values())[0][KEY_MODEL].replace("/", "__")
         + f".{run_id}"
         + ".json"

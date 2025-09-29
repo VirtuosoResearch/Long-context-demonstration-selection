@@ -62,3 +62,37 @@ sweagent run-batch \
     --instances.slice :3 \
     --instances.shuffle=True
 ```
+
+## System structure
+
+The structure of our system is:
+
+```bash
+./classified/ # the classified mapping of the dataset, conclude in Json version
+
+./datasets/ # the cache of different datasets
+
+./logs/run_evaluation # the logs of each evaluation
+└── test_gold_all # we use gold test as an example
+    └── astropy__astropy-6938 # a single instance within the dataset
+        └── eval.sh # scripts to run the patch
+        └── patch.diff # the generated patch
+        └── report.json # the conclusion report of this single running
+        └── run_instance.log # logs of running the instance
+        └── test_output.txt # detailed running output in the terminal
+    ......
+    └── sympy__sympy-24909
+
+./outputs/ # the location of generated patch
+└── swe-llama-7b # use swe-llama-7b as an example
+    └── princeton-nlp__SWE-bench_oracle__test__princeton-nlp__SWE-Llama-7b__temp-0.0__top-p-1.0.json # the generated patches are in Json version
+
+./results/ # the conclusion report of the whole running
+
+./scripts/ # the scripts to fetch offline image, generate patch, finetune, run agent, and test patch.
+
+./SWE-agent # source code for agent usage
+
+./swebench # source code for LLM usage
+
+```
