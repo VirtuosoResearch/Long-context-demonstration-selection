@@ -2,6 +2,10 @@
 
 Project document [https://docs.google.com/document/d/1poyVOmL3mc69hc4HIanicUG3-vxnDa8V_rsbH4LNIN8/edit?usp=sharing](https://docs.google.com/document/d/1poyVOmL3mc69hc4HIanicUG3-vxnDa8V_rsbH4LNIN8/edit?usp=sharing).
 
+## Environment
+
+We provide the [environment file](./environment.yml) including the package versions we used in the experiments. For optimal reproducibility, we recommend using the same package versions.
+
 ## System structure
 
 The structure of our system is:
