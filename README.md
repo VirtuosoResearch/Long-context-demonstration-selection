@@ -2,6 +2,42 @@
 
 Project document [https://docs.google.com/document/d/1poyVOmL3mc69hc4HIanicUG3-vxnDa8V_rsbH4LNIN8/edit?usp=sharing](https://docs.google.com/document/d/1poyVOmL3mc69hc4HIanicUG3-vxnDa8V_rsbH4LNIN8/edit?usp=sharing).
 
+## System structure
+
+The structure of our system is:
+
+```bash
+./classified/ # classified mapping of the dataset, conclude in Json version
+
+./datasets/ # cache of different datasets
+
+./logs/run_evaluation # logs of each evaluation
+└── test_gold_all # we use gold test as an example
+    └── astropy__astropy-6938 # a single instance within the dataset
+        └── eval.sh # scripts to run the patch
+        └── patch.diff # generated patch
+        └── report.json # conclusion report of this single running
+        └── run_instance.log # logs of running the instance
+        └── test_output.txt # detailed running output in the terminal
+    ......
+    └── sympy__sympy-24909
+
+./outputs/ # location of generated patch
+└── swe-llama-7b # use swe-llama-7b as an example
+    └── princeton-nlp__SWE-bench_oracle__test__princeton-nlp__SWE-Llama-7b__temp-0.0__top-p-1.0.json # the generated patches are in Json version
+
+./results/ # conclusion report of the whole running
+
+./scripts/ # scripts to fetch offline image, generate patch, finetune, run agent, and test patch.
+
+./SWE-agent/ # source code for agent usage
+
+./swebench/ # source code for LLM usage
+
+```
+
+The soft evaluation and offline evaluation are enrolled in the source codes.
+
 ## Run open-sourced model
 
 1. Generate patch.
@@ -61,38 +97,4 @@ sweagent run-batch \
     --instances.split dev  \
     --instances.slice :3 \
     --instances.shuffle=True
-```
-
-## System structure
-
-The structure of our system is:
-
-```bash
-./classified/ # the classified mapping of the dataset, conclude in Json version
-
-./datasets/ # the cache of different datasets
-
-./logs/run_evaluation # the logs of each evaluation
-└── test_gold_all # we use gold test as an example
-    └── astropy__astropy-6938 # a single instance within the dataset
-        └── eval.sh # scripts to run the patch
-        └── patch.diff # the generated patch
-        └── report.json # the conclusion report of this single running
-        └── run_instance.log # logs of running the instance
-        └── test_output.txt # detailed running output in the terminal
-    ......
-    └── sympy__sympy-24909
-
-./outputs/ # the location of generated patch
-└── swe-llama-7b # use swe-llama-7b as an example
-    └── princeton-nlp__SWE-bench_oracle__test__princeton-nlp__SWE-Llama-7b__temp-0.0__top-p-1.0.json # the generated patches are in Json version
-
-./results/ # the conclusion report of the whole running
-
-./scripts/ # the scripts to fetch offline image, generate patch, finetune, run agent, and test patch.
-
-./SWE-agent # source code for agent usage
-
-./swebench # source code for LLM usage
-
 ```
