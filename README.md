@@ -102,3 +102,9 @@ sweagent run-batch \
     --instances.slice :3 \
     --instances.shuffle=True
 ```
+
+## Utilize offline evaluation
+To accelerate the evaluation process, please run following commands to fetch offline images.
+```bash
+python ./notebooks/fetch_offline_image.py
+```
