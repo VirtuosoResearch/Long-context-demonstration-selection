@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 Agent-style evaluation loop for bigcode/humanevalpack (Python).
 - Loads tasks
@@ -7,9 +5,6 @@ Agent-style evaluation loop for bigcode/humanevalpack (Python).
 - Runs the official tests in a subprocess with a timeout
 - If tests fail, feeds traceback back to the model for self-repair (N rounds)
 - Reports pass rate
-
-Security note: This executes model-generated code. For real runs, execute inside a
-sandbox (Docker, firejail) with resource limits and no network.
 """
 
 import argparse
@@ -26,9 +21,6 @@ from typing import List, Optional, Tuple
 
 from datasets import load_dataset
 
-# -----------------------------
-# Model backends
-# -----------------------------
 class Generator:
     def generate(self, prompt: str, max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
         raise NotImplementedError
@@ -36,11 +28,9 @@ class Generator:
 class TransformersGenerator(Generator):
     def __init__(self, model_name: str, device: Optional[str] = None):
         from transformers import AutoTokenizer, AutoModelForCausalLM
-        self.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, trust_remote_code=True, device_map="auto"
-        )
-        self.is_chat = hasattr(self.tok, "apply_chat_template")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
+        self.is_chat = hasattr(self.tokenizer, "apply_chat_template")
 
     def _make_inputs(self, task_prompt: str) -> str:
         sys_inst = (
@@ -58,7 +48,7 @@ class TransformersGenerator(Generator):
                 {"role": "system", "content": sys_inst},
                 {"role": "user", "content": f"{user_inst}\n\n{code}"},
             ]
-            return self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
             preface = sys_inst + "\n\n" + user_inst + "\n\n"
             return preface + code
@@ -74,7 +64,7 @@ class TransformersGenerator(Generator):
                 {"role": "system", "content": "You are a senior Python engineer who fixes code using unit test feedback."},
                 {"role": "user", "content": repair_inst + "\n\n" + context},
             ]
-            return self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
             return repair_inst + "\n\n" + context + "\n"
 
@@ -88,7 +78,7 @@ class TransformersGenerator(Generator):
     def generate(self, prompt: str, max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
         inputs = self._make_inputs(prompt)
         import torch
-        input_ids = self.tok(inputs, return_tensors="pt").to(self.model.device)
+        input_ids = self.tokenizer(inputs, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(
                 **input_ids,
@@ -96,18 +86,18 @@ class TransformersGenerator(Generator):
                 temperature=temp,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
-                pad_token_id=self.tok.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
             )
-        text = self.tok.decode(out[0], skip_special_tokens=True)
+        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
         # Return only the newly generated tail
-        tail = text[len(self.tok.decode(input_ids["input_ids"][0], skip_special_tokens=True)) :]
+        tail = text[len(self.tokenizer.decode(input_ids["input_ids"][0], skip_special_tokens=True)) :]
         return self._strip_fences(tail)
 
     def repair(self, task_prompt: str, prev_code: str, error_msg: str, max_new_tokens: int = 256,
                temp: float = 0.2, top_p: float = 0.95) -> str:
         inputs = self._make_repair_inputs(task_prompt, prev_code, error_msg)
         import torch
-        input_ids = self.tok(inputs, return_tensors="pt").to(self.model.device)
+        input_ids = self.tokenizer(inputs, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(
                 **input_ids,
@@ -115,47 +105,11 @@ class TransformersGenerator(Generator):
                 temperature=temp,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
-                pad_token_id=self.tok.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
             )
-        text = self.tok.decode(out[0], skip_special_tokens=True)
-        tail = text[len(self.tok.decode(input_ids["input_ids"][0], skip_special_tokens=True)) :]
+        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
+        tail = text[len(self.tokenizer.decode(input_ids["input_ids"][0], skip_special_tokens=True)) :]
         return self._strip_fences(tail)
-
-class VLLMGenerator(Generator):
-    def __init__(self, model_name: str):
-        from vllm import LLM, SamplingParams
-        self.llm = LLM(model=model_name, trust_remote_code=True)
-        self.sampling_default = {"temperature": 0.2, "top_p": 0.95}
-        self.model_name = model_name
-
-    @staticmethod
-    def _wrap(task_prompt: str) -> str:
-        # Generic instruction wrapper for chatty models
-        sys_inst = (
-            "You are a meticulous software engineer. "
-            "Complete the Python function so that it passes tests. "
-            "Return ONLY Python code (no ``` fences)."
-        )
-        return f"{sys_inst}\n\n{task_prompt}"
-
-    def generate(self, prompt: str, max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
-        from vllm import SamplingParams
-        sp = SamplingParams(max_tokens=max_new_tokens, temperature=temp, top_p=top_p)
-        res = self.llm.generate([self._wrap(prompt)], sp)
-        out = res[0].outputs[0].text
-        return out.strip().removeprefix("```python").removesuffix("```").strip()
-
-    def repair(self, task_prompt: str, prev_code: str, error_msg: str, max_new_tokens: int = 256,
-               temp: float = 0.2, top_p: float = 0.95) -> str:
-        from vllm import SamplingParams
-        sp = SamplingParams(max_tokens=max_new_tokens, temperature=temp, top_p=top_p)
-        repair_inst = (
-            "The previous attempt failed tests. Read the traceback and produce a corrected version. "
-            "Return ONLY valid Python code; no comments; no fences."
-        )
-        msg = f"{repair_inst}\n\n### PROMPT\n{task_prompt}\n\n### PREVIOUS CODE\n{prev_code}\n\n### TRACEBACK\n{error_msg}\n\n### FIXED CODE"
-        res = self.llm.generate([msg], sp)
-        return res[0].outputs[0].text.strip().removeprefix("```python").removesuffix("```").strip()
 
 # -----------------------------
 # Utilities
@@ -217,13 +171,10 @@ class TaskResult:
     attempts: int
     last_error: Optional[str]
 
-# -----------------------------
-# Main evaluation loop
-# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
-    ap.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers")
+    ap.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers") # no vllm currently
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.2)
     ap.add_argument("--top-p", type=float, default=0.95)
@@ -233,17 +184,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    # Load dataset (Python split, test set)
-    # Ref: dataset fields documented in HF card. :contentReference[oaicite:1]{index=1}
     ds = load_dataset("bigcode/humanevalpack", "python", split="test")
-
-    # Initialize generator
-    if args.engine == "vllm":
-        gen = VLLMGenerator(args.model)
-    else:
-        gen = TransformersGenerator(args.model)
-
-    # Work dir
+    gen = TransformersGenerator(args.model)
     tmp_root = tempfile.mkdtemp(prefix="humanevalpack_eval_")
     results: List[TaskResult] = []
 
@@ -280,12 +222,12 @@ def main():
                 ok, err = run_with_timeout(main_py, timeout_sec=args.timeout)
                 if ok:
                     passed = True
-                    print(f"  ✓ Passed on attempt {attempt}")
+                    print(f"Passed on attempt {attempt}")
                     shutil.rmtree(work_dir, ignore_errors=True)
                     break
                 else:
                     last_error = err[-2000:] if err else ""
-                    print(f"  ✗ Failed attempt {attempt}. Retrying…" if attempt < args.num_iter else "  ✗ Failed. Giving up.")
+                    print(f" Failed attempt {attempt}. Retrying…" if attempt < args.num_iter else " Failed. Giving up.")
                     # Self-repair for next round
                     if attempt < args.num_iter:
                         completion = gen.repair(prompt, completion, last_error,
