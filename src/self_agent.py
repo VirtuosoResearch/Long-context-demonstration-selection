@@ -134,6 +134,7 @@ def write_solution_file(task_prompt: str, completion: str, imports: str, test_se
         code.append(test.strip())
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n\n".join(code))
+    # print(code)
 
 def run_with_timeout(pyfile: str, timeout_sec: int = 5) -> Tuple[bool, str]:
     """
@@ -173,7 +174,7 @@ class TaskResult:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+    ap.add_argument("--model", type=str, default="codellama/CodeLlama-7b-Instruct-hf")
     ap.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers") # no vllm currently
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.2)
@@ -189,67 +190,66 @@ def main():
     tmp_root = tempfile.mkdtemp(prefix="humanevalpack_eval_")
     results: List[TaskResult] = []
 
-    try:
-        total = len(ds) if args.limit <= 0 else min(args.limit, len(ds))
-        print(f"Running {total} HumanEvalPack(Python) tasks with {args.model} ({args.engine})")
-        print(f"Max iters per task: {args.num_iter}, timeout: {args.timeout}s\n")
+    total = len(ds) if args.limit <= 0 else min(args.limit, len(ds))
+    print(f"Running {total} HumanEvalPack(Python) tasks with {args.model} ({args.engine})")
+    print(f"Max iters per task: {args.num_iter}, timeout: {args.timeout}s\n")
 
-        for i, ex in enumerate(ds):
-            if i >= total:
-                break
-            task_id = ex["task_id"]
-            prompt = ex["prompt"] or ex["declaration"] or ""
-            imports = ex.get("import", "") or ""
-            test_setup = ex.get("test_setup", "") or ""
-            test = ex.get("test", "") or ""
+    for i, ex in enumerate(ds):
+        if i >= total:
+            break
+        task_id = ex["task_id"]
+        prompt = ex["prompt"] or ex["declaration"] or ""
+        imports = ex.get("import", "") or ""
+        test_setup = ex.get("test_setup", "") or ""
+        test = ex.get("test", "") or ""
 
-            print(f"[{i+1}/{total}] {task_id}")
+        print(f"[{i+1}/{total}] {task_id}")
 
-            # First attempt
-            completion = gen.generate(prompt, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
-            completion = strip_non_code(completion)
+        # First attempt
+        completion = gen.generate(prompt, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+        completion = strip_non_code(completion)
 
-            passed = False
-            attempts = 0
-            last_error = ""
+        passed = False
+        attempts = 0
+        last_error = ""
 
-            for attempt in range(1, args.num_iter + 1):
-                attempts = attempt
-                work_dir = tempfile.mkdtemp(prefix=f"task_{i:03d}_", dir=tmp_root)
-                main_py = os.path.join(work_dir, "main.py")
-                write_solution_file(prompt, completion, imports, test_setup, test, main_py)
+        for attempt in range(1, args.num_iter + 1):
+            attempts = attempt
+            work_dir = tempfile.mkdtemp(prefix=f"task_{i:03d}_", dir=tmp_root)
+            main_py = os.path.join(work_dir, "main.py")
+            write_solution_file(prompt, completion, imports, test_setup, test, main_py)
+            print("main: ",main_py)
 
-                ok, err = run_with_timeout(main_py, timeout_sec=args.timeout)
-                if ok:
-                    passed = True
-                    print(f"Passed on attempt {attempt}")
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                    break
-                else:
-                    last_error = err[-2000:] if err else ""
-                    print(f" Failed attempt {attempt}. Retrying…" if attempt < args.num_iter else " Failed. Giving up.")
-                    # Self-repair for next round
-                    if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error,
-                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
-                        completion = strip_non_code(completion)
-
+            ok, err = run_with_timeout(main_py, timeout_sec=args.timeout)
+            if ok:
+                passed = True
+                print(f"Passed on attempt {attempt}")
                 shutil.rmtree(work_dir, ignore_errors=True)
+                break
+            else:
+                last_error = err[-2000:] if err else ""
+                print(f" Failed attempt {attempt}. Retrying…" if attempt < args.num_iter else " Failed. Giving up.")
+                # Self-repair for next round
+                if attempt < args.num_iter:
+                    completion = gen.repair(prompt, completion, last_error,
+                                            max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                    completion = strip_non_code(completion)
 
-            results.append(TaskResult(task_id=task_id, passed=passed, attempts=attempts, last_error=None if passed else last_error))
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-        # Summary
-        passed_count = sum(r.passed for r in results)
-        print("\n=== Summary ===")
-        print(f"Passed: {passed_count}/{len(results)}  ({passed_count/len(results)*100:.2f}%)")
-        # Save raw results
-        out_json = os.path.join(tmp_root, "results.json")
-        with open(out_json, "w", encoding="utf-8") as f:
-            json.dump([r.__dict__ for r in results], f, ensure_ascii=False, indent=2)
-        print(f"Per-task results saved to: {out_json}")
-    finally:
-        # Keep tmp_root for artifacts (results.json). Comment the next line if you want to keep all per-task files.
-        pass
+        results.append(TaskResult(task_id=task_id, passed=passed, attempts=attempts, last_error=None if passed else last_error))
+        print(results)
+
+    # Summary
+    passed_count = sum(r.passed for r in results)
+    print("\n=== Summary ===")
+    print(f"Passed: {passed_count}/{len(results)}  ({passed_count/len(results)*100:.2f}%)")
+    # Save raw results
+    out_json = os.path.join(tmp_root, "results.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump([r.__dict__ for r in results], f, ensure_ascii=False, indent=2)
+    print(f"Per-task results saved to: {out_json}")
+
 
 if __name__ == "__main__":
     main()
