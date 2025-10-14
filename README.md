@@ -108,3 +108,9 @@ To accelerate the evaluation process, please run following commands to fetch off
 ```bash
 python ./notebooks/fetch_offline_image.py
 ```
+
+## Personalized agent loop
+We offer the option for users to build their own agent.
+```bash
+bash ./src/personalized/self_agent.sh
+```
