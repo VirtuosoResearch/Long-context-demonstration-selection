@@ -30,7 +30,7 @@ class TransformersGenerator(Generator):
         from transformers import AutoTokenizer, AutoModelForCausalLM
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
-        self.is_chat = hasattr(self.tokenizer, "apply_chat_template")
+        self.is_chat = getattr(self.tokenizer, "chat_template", None) not in (None, "", False)
 
     def _make_inputs(self, task_prompt: str) -> str:
         sys_inst = (
