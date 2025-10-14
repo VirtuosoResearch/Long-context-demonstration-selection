@@ -1,4 +1,4 @@
-python src/self_agent.py \
+python src/personalized/self_agent.py \
   --model codellama/CodeLlama-7b-Instruct-hf \
   --engine transformers \
   --max-new-tokens 256 \

@@ -174,7 +174,7 @@ class TaskResult:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="codellama/CodeLlama-7b-Instruct-hf")
+    ap.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     ap.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers") # no vllm currently
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.2)
@@ -184,7 +184,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="If >0, only evaluate first N tasks.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-
+    print("Model: ",args.model)
     ds = load_dataset("bigcode/humanevalpack", "python", split="test")
     gen = TransformersGenerator(args.model)
     tmp_root = tempfile.mkdtemp(prefix="humanevalpack_eval_")
