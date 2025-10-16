@@ -171,12 +171,6 @@ def compile_cpp(src_path: str, exe_path: str, timeout_sec: int = 15) -> Tuple[bo
 
 
 def run_exe_with_timeout(exe_path: str, timeout_sec: int = 5) -> Tuple[bool, str]:
-    """
-    Run compiled binary. Return (passed, stderr_or_output).
-    Convention:
-      - We assume tests return 0 when passed; nonzero when failed (and print diagnostics).
-      - If the dataset test harness relies on assertions/exceptions, ensure main() reflects pass/fail in exit code.
-    """
     try:
         cp = subprocess.run(
             [exe_path],
