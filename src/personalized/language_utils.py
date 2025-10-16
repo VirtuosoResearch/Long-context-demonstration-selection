@@ -253,3 +253,153 @@ def run_with_timeout(pyfile: str, timeout_sec: int = 5) -> Tuple[bool, str]:
             return False, err.strip()
     except subprocess.TimeoutExpired as e:
         return False, f"Timeout after {timeout_sec}s\n{str(e)}"
+
+
+# -----------------------------
+# Java
+# -----------------------------
+
+
+def choose_public_class_and_filename(includes: str, prompt: str, completion: str, test_setup: str, test: str):
+    """
+    Strategy:
+      1) If any snippet declares `public class X`, use X.java and main class X.
+      2) Else default to public class Main in Main.java.
+    """
+
+    PUB_CLASS_RE = re.compile(r"\bpublic\s+class\s+([A-Za-z_]\w*)")
+    blob = "\n".join([includes or "", prompt or "", completion or "", test_setup or "", test or ""])
+    m = PUB_CLASS_RE.search(blob)
+    if m:
+        cls = m.group(1)
+        return cls, f"{cls}.java"
+    else:
+        return "Main", "Main.java"
+
+def ensure_wrapped_classes_for_default(prompt: str, completion: str, test_setup: str, test: str) -> str:
+
+    parts = []
+    ANY_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)")
+    has_class_in_prompt = ANY_CLASS_RE.search(prompt or "") is not None
+    code_impl = (prompt or "").rstrip() + "\n" + (completion or "").strip()
+    if has_class_in_prompt:
+        code_impl = re.sub(r"\bpublic\s+class\b", "class", code_impl)
+        parts.append(code_impl.strip())
+    else:
+        body = code_impl.strip()
+        if not body:
+            body = ""
+        wrapped = "class Solution {\n" + indent_block(body) + "\n}"
+        parts.append(wrapped)
+
+    if test_setup and test_setup.strip():
+        ts = re.sub(r"\bpublic\s+class\b", "class", test_setup.strip())
+        parts.append(ts)
+
+    if test and test.strip():
+        t = test.strip()
+        if "class " in t:
+            t = re.sub(r"\bpublic\s+class\b", "class", t)
+            parts.append(t)
+        else:
+            main_wrapped = (
+                "public class Main {\n"
+                "    public static void main(String[] args) throws Exception {\n"
+                + indent_block(t, 2) + "\n"
+                "    }\n"
+                "}"
+            )
+            parts.append(main_wrapped)
+    else:
+        parts.append("public class Main { public static void main(String[] args) {} }")
+
+    return "\n\n".join(parts)
+
+def demote_other_public_classes(src: str, chosen: str) -> str:
+    """
+    Replace `public class X` with `class X` for all X != chosen.
+    """
+    def repl(m):
+        name = m.group(1)
+        if name == chosen:
+            return f"public class {name}"
+        else:
+            return f"class {name}"
+    return re.sub(r"\bpublic\s+class\s+([A-Za-z_]\w*)", repl, src)
+
+def write_solution_java(includes: str, prompt: str, completion: str, test_setup: str, test: str, out_dir: str) -> Tuple[str, str]:
+    
+    public_class, filename = choose_public_class_and_filename(includes, prompt, completion, test_setup, test)
+
+    PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z_][\w\.]*);", re.MULTILINE)
+    
+    def strip_package(s: str) -> str:
+        return PACKAGE_RE.sub("", s or "")
+
+    includes = strip_package(includes or "")
+    prompt   = strip_package(prompt or "")
+    completion = strip_package(completion or "")
+    test_setup = strip_package(test_setup or "")
+    test = strip_package(test or "")
+
+    if public_class == "Main":
+        src_body = []
+        if includes.strip():
+            src_body.append(includes.strip())
+        src_body.append(ensure_wrapped_classes_for_default(prompt, completion, test_setup, test))
+        source = "\n\n".join(src_body)
+    else:
+        concat = []
+        if includes.strip():
+            concat.append(includes.strip())
+        concat.append((prompt or "").rstrip() + "\n" + (completion or "").strip())
+        if test_setup.strip():
+            concat.append(test_setup.strip())
+        if test.strip():
+            concat.append(test.strip())
+
+        source = "\n\n".join(concat)
+        source = demote_other_public_classes(source, chosen=public_class)
+
+    out_path = os.path.join(out_dir, filename)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(source)
+    return public_class, out_path
+
+def compile_java(java_file: str, timeout_sec: int = 20) -> Tuple[bool, str]:
+    try:
+        cp = subprocess.run(
+            ["javac", "-J-Dfile.encoding=UTF-8", "-encoding", "UTF-8", os.path.basename(java_file)],
+            cwd=os.path.dirname(java_file),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            check=False,
+            text=True,
+        )
+        if cp.returncode == 0:
+            return True, ""
+        else:
+            err = (cp.stderr or "") + "\n" + (cp.stdout or "")
+            return False, err.strip()
+    except subprocess.TimeoutExpired as e:
+        return False, f"Compile timeout after {timeout_sec}s\n{str(e)}"
+
+def run_java(main_class: str, work_dir: str, timeout_sec: int = 5) -> Tuple[bool, str]:
+    try:
+        cp = subprocess.run(
+            ["java", "-Dfile.encoding=UTF-8", main_class],
+            cwd=work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            check=False,
+            text=True,
+        )
+        if cp.returncode == 0:
+            return True, (cp.stdout or "").strip()
+        else:
+            err = (cp.stderr or "") + "\n" + (cp.stdout or "")
+            return False, err.strip()
+    except subprocess.TimeoutExpired as e:
+        return False, f"Runtime timeout after {timeout_sec}s\n{str(e)}"

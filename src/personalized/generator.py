@@ -63,6 +63,17 @@ class TransformersGenerator(Generator):
                 "Fill in the function by writing correct, efficient Python. "
                 "Do not include explanations—only executable code that defines the function."
             )
+        elif lang == "java":
+            sys_inst = (
+                "You are a meticulous Java software engineer.\n"
+                "Complete the requested Java method/class so that it passes the provided tests.\n"
+                "Return ONLY valid Java code (no markdown fences, no explanations)."
+            )
+            user_inst = (
+                "Write correct, efficient Java 8+ (no external libs). "
+                "If the prompt declares a class, implement inside it; otherwise provide method implementation (and helpers) only. "
+                "Do NOT print debug logs."
+            )
         else:
             raise ValueError("Unsupported lang")
 
@@ -88,6 +99,8 @@ class TransformersGenerator(Generator):
         elif lang == "rust":
             repair_inst = "Language: Rust.\n" + repair_inst
         elif lang == "python":
+            repair_inst = "Language: Python.\n" + repair_inst
+        elif lang == "java":
             repair_inst = "Language: Python.\n" + repair_inst
 
         context = (

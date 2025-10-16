@@ -9,8 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from generator import Generator, TransformersGenerator
-from language_utils import write_solution_file_go, write_solution_file_js, write_solution_file_rust, write_solution_python
-from language_utils import run_node, compile_go, run_exe, compile_rust, run_with_timeout
+from language_utils import write_solution_file_go, write_solution_file_js, write_solution_file_rust, write_solution_python, write_solution_java
+from language_utils import run_node, compile_go, run_exe, compile_rust, run_with_timeout, compile_java, run_java
 from datasets import load_dataset
 
 def strip_non_code(text: str) -> str:
@@ -57,6 +57,7 @@ def main():
             break
         task_id = ex["task_id"]
         prompt = ex.get("prompt") or ex.get("declaration") or ""
+        includes = ex.get("import", "") or "" 
         imports = ex.get("import", "") or ""
         test_setup = ex.get("test_setup", "") or ""
         test = ex.get("test", "") or ""
@@ -114,6 +115,25 @@ def main():
                     continue
                 ok_run, msg = run_exe(exe_path, timeout_sec=args.timeout)
             
+            elif args.lang == "java":
+                main_class, java_path = write_solution_java(includes, prompt, completion, test_setup, test, work_dir)
+                print("source:", java_path, " main_class:", main_class)
+
+                # Compile
+                okc, cerr = compile_java(java_path, timeout_sec=args.compile_timeout)
+                if not okc:
+                    last_error = cerr[-2000:] if cerr else "Unknown compile error"
+                    print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if attempt < args.num_iter:
+                        completion = gen.repair(prompt, completion, last_error,
+                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        completion = strip_non_code(completion)
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    continue
+
+                # Run
+                ok_run, msg = run_java(main_class, work_dir, timeout_sec=args.timeout)
+
             if ok_run:
                 passed = True
                 print(f"  Passed on attempt {attempt}")

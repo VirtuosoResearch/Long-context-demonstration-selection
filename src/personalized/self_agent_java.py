@@ -1,12 +1,3 @@
-"""
-Agent-style evaluation loop for bigcode/humanevalpack (Java).
-- Loads Java tasks
-- Generates solution with an open-source HF model
-- Compiles with javac and runs with java under timeouts
-- Self-repairs using compiler/runtime output
-- Reports pass rate
-"""
-
 import argparse
 import json
 import os
@@ -123,9 +114,6 @@ class TransformersGenerator(Generator):
 # Java utilities
 # -----------------------------
 
-PUB_CLASS_RE = re.compile(r"\bpublic\s+class\s+([A-Za-z_]\w*)")
-ANY_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)")
-PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z_][\w\.]*);", re.MULTILINE)
 
 def choose_public_class_and_filename(includes: str, prompt: str, completion: str, test_setup: str, test: str):
     """
@@ -133,6 +121,8 @@ def choose_public_class_and_filename(includes: str, prompt: str, completion: str
       1) If any snippet declares `public class X`, use X.java and main class X.
       2) Else default to public class Main in Main.java.
     """
+
+    PUB_CLASS_RE = re.compile(r"\bpublic\s+class\s+([A-Za-z_]\w*)")
     blob = "\n".join([includes or "", prompt or "", completion or "", test_setup or "", test or ""])
     m = PUB_CLASS_RE.search(blob)
     if m:
@@ -142,47 +132,31 @@ def choose_public_class_and_filename(includes: str, prompt: str, completion: str
         return "Main", "Main.java"
 
 def ensure_wrapped_classes_for_default(prompt: str, completion: str, test_setup: str, test: str) -> str:
-    """
-    Build a single-file source with:
-      - optional imports
-      - class Solution { <prompt+completion> }  (if prompt doesn't already declare a class)
-      - test_setup as-is
-      - public class Main { public static void main(String[] args) { <test> } } if test没有类定义
-        or test中已包含类定义则直接拼接（确保只有一个public类：Main）
-    """
-    parts = []
 
-    # 处理 prompt + completion
+    parts = []
+    ANY_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)")
     has_class_in_prompt = ANY_CLASS_RE.search(prompt or "") is not None
     code_impl = (prompt or "").rstrip() + "\n" + (completion or "").strip()
     if has_class_in_prompt:
-        # 直接拼接（若出现 public class，仍然可放在与 Main 同个文件中；只有 Main 是 public）
-        # 如果 prompt 里含有 public class，我们把它的 "public" 去掉以避免多 public 冲突
         code_impl = re.sub(r"\bpublic\s+class\b", "class", code_impl)
         parts.append(code_impl.strip())
     else:
-        # 没有类的话，用 Solution 包一下
         body = code_impl.strip()
         if not body:
             body = ""
         wrapped = "class Solution {\n" + indent_block(body) + "\n}"
         parts.append(wrapped)
 
-    # 测试辅助
     if test_setup and test_setup.strip():
-        # 若出现 public class，同样去掉 public 避免冲突
         ts = re.sub(r"\bpublic\s+class\b", "class", test_setup.strip())
         parts.append(ts)
 
-    # 测试主体
     if test and test.strip():
         t = test.strip()
         if "class " in t:
-            # 如果已有类定义，确保没有多 public
             t = re.sub(r"\bpublic\s+class\b", "class", t)
             parts.append(t)
         else:
-            # 没有类定义，则包装成 Main.main()
             main_wrapped = (
                 "public class Main {\n"
                 "    public static void main(String[] args) throws Exception {\n"
@@ -192,7 +166,6 @@ def ensure_wrapped_classes_for_default(prompt: str, completion: str, test_setup:
             )
             parts.append(main_wrapped)
     else:
-        # 没有 test，就给一个空的 Main，认为通过
         parts.append("public class Main { public static void main(String[] args) {} }")
 
     return "\n\n".join(parts)
@@ -209,6 +182,7 @@ def write_solution_file_java(includes: str, prompt: str, completion: str, test_s
     """
     public_class, filename = choose_public_class_and_filename(includes, prompt, completion, test_setup, test)
 
+    PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z_][\w\.]*);", re.MULTILINE)
     # If a package statement exists anywhere, drop it (we compile in a flat temp dir)
     def strip_package(s: str) -> str:
         return PACKAGE_RE.sub("", s or "")
