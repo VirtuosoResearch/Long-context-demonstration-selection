@@ -253,9 +253,3 @@ def run_with_timeout(pyfile: str, timeout_sec: int = 5) -> Tuple[bool, str]:
             return False, err.strip()
     except subprocess.TimeoutExpired as e:
         return False, f"Timeout after {timeout_sec}s\n{str(e)}"
-
-def strip_non_code(text: str) -> str:
-    # Remove accidental markdown fences or extraneous prose
-    text = re.sub(r"^```(?:python)?\s*", "", text.strip())
-    text = re.sub(r"\s*```$", "", text.strip())
-    return text.strip()

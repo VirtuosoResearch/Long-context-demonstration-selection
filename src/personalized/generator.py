@@ -53,6 +53,16 @@ class TransformersGenerator(Generator):
                 "Write stable Rust (edition 2021). No external crates. "
                 "Provide function(s) and any helper functions required."
             )
+        elif lang == "python":
+            sys_inst = (
+                "You are a meticulous software engineer. "
+                "Complete the Python function below so that it passes the provided tests. "
+                "Return ONLY valid Python code. Do not use markdown fences."
+            )
+            user_inst = (
+                "Fill in the function by writing correct, efficient Python. "
+                "Do not include explanations—only executable code that defines the function."
+            )
         else:
             raise ValueError("Unsupported lang")
 
@@ -77,6 +87,8 @@ class TransformersGenerator(Generator):
             repair_inst = "Language: Go.\n" + repair_inst
         elif lang == "rust":
             repair_inst = "Language: Rust.\n" + repair_inst
+        elif lang == "python":
+            repair_inst = "Language: Python.\n" + repair_inst
 
         context = (
             f"### PROMPT\n{task_prompt}\n\n"
@@ -86,7 +98,7 @@ class TransformersGenerator(Generator):
         )
         if self.is_chat:
             messages = [
-                {"role": "system", "content": "You fix code using unit-test feedback."},
+                {"role": "system", "content": f"You are a senior {lang} engineer who fixes code using unit test feedback."},
                 {"role": "user", "content": repair_inst + "\n\n" + context},
             ]
             return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
