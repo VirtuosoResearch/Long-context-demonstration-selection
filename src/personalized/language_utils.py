@@ -403,3 +403,85 @@ def run_java(main_class: str, work_dir: str, timeout_sec: int = 5) -> Tuple[bool
             return False, err.strip()
     except subprocess.TimeoutExpired as e:
         return False, f"Runtime timeout after {timeout_sec}s\n{str(e)}"
+
+
+
+# -----------------------------
+# C++
+# -----------------------------
+
+
+def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_setup: str, test: str, out_path: str):
+    """
+    Compose a single runnable C++ source file:
+    [includes]
+    [prompt + completion]
+    [test_setup]
+    [test]
+    Assumptions:
+    - 'includes' contains necessary #include / using directives (if any).
+    - 'prompt' declares the function signature (e.g., `int foo(int x);` or a stub).
+    - 'completion' provides its definition/implementation (and helpers).
+    - 'test_setup' may define helpers, test harness utilities, etc.
+    - 'test' should contain either a main() or assertions in a harness main() we provide.
+    """
+    parts = []
+    if includes and includes.strip():
+        parts.append(includes.strip())
+
+    # Ensure tests can use standard lib; if dataset doesn't provide, we can default
+    default_includes = "#include <bits/stdc++.h>\nusing namespace std;"
+    if not re.search(r"#\s*include", "\n".join(parts), flags=re.IGNORECASE):
+        parts.append(default_includes)
+
+    parts.append(task_prompt.rstrip() + "\n" + completion.strip() + "\n")
+
+    if test_setup and test_setup.strip():
+        parts.append(test_setup.strip())
+
+    parts.append(test.strip())
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(parts))
+
+
+def compile_cpp(src_path: str, exe_path: str, timeout_sec: int = 15) -> Tuple[bool, str]:
+    """
+    Compile C++ with g++ -std=c++17. Return (ok, stderr_or_empty).
+    """
+    try:
+        cp = subprocess.run(
+            ["g++", "-std=c++17", "-O2", "-pipe", "-static-libstdc++", "-static-libgcc", src_path, "-o", exe_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            check=False,
+            text=True,
+        )
+        if cp.returncode == 0:
+            return True, ""
+        else:
+            err = (cp.stderr or "") + "\n" + (cp.stdout or "")
+            return False, err.strip()
+    except subprocess.TimeoutExpired as e:
+        return False, f"Compile timeout after {timeout_sec}s\n{str(e)}"
+
+
+def run_cpp_exe_with_timeout(exe_path: str, timeout_sec: int = 5) -> Tuple[bool, str]:
+    try:
+        cp = subprocess.run(
+            [exe_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            check=False,
+            text=True,
+        )
+        if cp.returncode == 0:
+            return True, (cp.stdout or "").strip()
+        else:
+            # include both stdout & stderr to give model richer feedback
+            err = (cp.stderr or "") + "\n" + (cp.stdout or "")
+            return False, err.strip()
+    except subprocess.TimeoutExpired as e:
+        return False, f"Runtime timeout after {timeout_sec}s\n{str(e)}"

@@ -1,11 +1,6 @@
-import argparse
 import json
 import os
 import re
-import shutil
-import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -74,6 +69,17 @@ class TransformersGenerator(Generator):
                 "If the prompt declares a class, implement inside it; otherwise provide method implementation (and helpers) only. "
                 "Do NOT print debug logs."
             )
+        elif lang == "cpp":
+            sys_inst = (
+                "You are a meticulous C++ software engineer.\n"
+                "Complete the requested C++ function so that it passes the provided tests.\n"
+                "Return ONLY valid C++ code for the function body (and any necessary helper functions), "
+                "without markdown fences or explanations."
+            )
+            user_inst = (
+                "Write correct, efficient, standard C++17 code. Do not print debug info. "
+                "Do not include a main() unless explicitly asked in the prompt."
+            )
         else:
             raise ValueError("Unsupported lang")
 
@@ -102,6 +108,8 @@ class TransformersGenerator(Generator):
             repair_inst = "Language: Python.\n" + repair_inst
         elif lang == "java":
             repair_inst = "Language: Python.\n" + repair_inst
+        elif lang == "cpp":
+            repair_inst = "Language: C++.\n" + repair_inst
 
         context = (
             f"### PROMPT\n{task_prompt}\n\n"
@@ -162,4 +170,3 @@ class TransformersGenerator(Generator):
         text = self.tokenizer.decode(out[0], skip_special_tokens=True)
         tail = self._tail_from_generated(input_ids, text)
         return self._strip_fences(tail)
-

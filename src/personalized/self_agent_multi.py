@@ -9,8 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from generator import Generator, TransformersGenerator
-from language_utils import write_solution_file_go, write_solution_file_js, write_solution_file_rust, write_solution_python, write_solution_java
-from language_utils import run_node, compile_go, run_exe, compile_rust, run_with_timeout, compile_java, run_java
+from language_utils import write_solution_file_go, write_solution_file_js, write_solution_file_rust, write_solution_python, write_solution_java, write_solution_cpp
+from language_utils import run_node, compile_go, run_exe, compile_rust, run_with_timeout, compile_java, run_java, compile_cpp, run_cpp_exe_with_timeout
 from datasets import load_dataset
 
 def strip_non_code(text: str) -> str:
@@ -117,6 +117,27 @@ def main(args):
                     continue
                 # Run
                 ok_run, msg = run_java(main_class, work_dir, timeout_sec=args.timeout)
+            
+            elif args.lang == "cpp":
+                src_cpp = os.path.join(work_dir, "main.cpp")
+                exe_path = os.path.join(work_dir, "a.out")
+
+                write_solution_cpp(prompt, completion, includes, test_setup, test, src_cpp)
+                print("source:", src_cpp)
+
+                ok_compile, compile_msg = compile_cpp(src_cpp, exe_path, timeout_sec=args.compile_timeout)
+                if not ok_compile:
+                    last_error = compile_msg[-2000:] if compile_msg else "Unknown compile error"
+                    print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if attempt < args.num_iter:
+                        completion = gen.repair(prompt, completion, last_error, args.lang,
+                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        completion = strip_non_code(completion)
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    continue
+
+                # Run
+                ok_run, msg = run_cpp_exe_with_timeout(exe_path, timeout_sec=args.timeout)
 
             if ok_run:
                 passed = True
