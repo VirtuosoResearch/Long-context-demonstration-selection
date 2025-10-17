@@ -25,23 +25,8 @@ class TaskResult:
     attempts: int
     last_error: Optional[str]
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--lang", type=str, choices=["js", "go", "rust", "python"], required=True, help="Target language")
-    ap.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
-    ap.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers")
-    ap.add_argument("--max_new_tokens", type=int, default=256)
-    ap.add_argument("--temp", type=float, default=0.2)
-    ap.add_argument("--top_p", type=float, default=0.95)
-    ap.add_argument("--num_iter", type=int, default=10, help="Max self-repair rounds per task (including first attempt).")
-    ap.add_argument("--compile_timeout", type=int, default=25, help="Seconds for compilation (Go/Rust).")
-    ap.add_argument("--timeout", type=int, default=5, help="Seconds per run attempt.")
-    ap.add_argument("--limit", type=int, default=0, help="If >0, only evaluate first N tasks.")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
-
+def main(args):
     cfg = args.lang
-
     print("Model:", args.model)
     ds = load_dataset("bigcode/humanevalpack", cfg, split="test")
     gen = TransformersGenerator(args.model)
@@ -125,12 +110,11 @@ def main():
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                     if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error,
+                        completion = gen.repair(prompt, completion, last_error, args.lang,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
-
                 # Run
                 ok_run, msg = run_java(main_class, work_dir, timeout_sec=args.timeout)
 
@@ -162,4 +146,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lang", type=str, choices=["js", "go", "rust", "python", "java", "cpp"], required=True, help="Target language")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+    parser.add_argument("--engine", type=str, choices=["transformers", "vllm"], default="transformers")
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--temp", type=float, default=0.2)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--num_iter", type=int, default=10, help="Max self-repair rounds per task (including first attempt).")
+    parser.add_argument("--compile_timeout", type=int, default=25, help="Seconds for compilation (Go/Rust).")
+    parser.add_argument("--timeout", type=int, default=5, help="Seconds per run attempt.")
+    parser.add_argument("--limit", type=int, default=0, help="If >0, only evaluate first N tasks.")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    main(args)
