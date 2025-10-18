@@ -79,7 +79,7 @@ def render_sample(ex: Dict[str, str], tokenizer: AutoTokenizer) -> str:
 def make_tokenize_fn(tokenizer: AutoTokenizer, max_len: int):
     def _fn(ex: Dict[str, str]):
         text = render_sample(ex, tokenizer)
-        return tokenizer(text, truncation=True, max_length=max_len, padding=False, return_attention_mask=True)
+        return tokenizer(text, truncation=True, max_length=max_len, padding=False)
     return _fn
 
 
@@ -89,7 +89,6 @@ def main(args):
 
     check_family(args.model_name)
 
-    # QLoRA config
     bnb_cfg = None
     if args.use_4bit:
         try:
@@ -116,7 +115,6 @@ def main(args):
         device_map="auto",
     )
 
-    # LoRA
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     lora_cfg = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                           bias="none", task_type="CAUSAL_LM", target_modules=target_modules)
@@ -174,7 +172,6 @@ def main(args):
 
     trainer.train()
 
-    # Save ONLY adapter state_dict
     try:
         sd = model.get_peft_model_state_dict()
     except AttributeError:

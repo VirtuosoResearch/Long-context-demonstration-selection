@@ -109,8 +109,14 @@ To accelerate the evaluation process, please run following commands to fetch off
 python ./notebooks/fetch_offline_image.py
 ```
 
-## Personalized agent loop
-We offer the option for users to build their own agent.
+## Evaluate HumanEvalPack
+Here is the script to evaluate HumanEvalPack dataset.
 ```bash
 bash ./src/personalized/self_agent.sh
 ```
+
+If you want to finetune your own model, please run:
+```bash
+bash ./src/personalized/sft_agent.sh
+```
+LoRA and QLoRA are both supported.
