@@ -1,21 +1,3 @@
-#!/usr/bin/env python
-"""
-Minimal SFT LoRA/QLoRA trainer for **HumanevalPack (70/30 split)**
-Restricted to: **Qwen-Coder**, **CodeLlama**, **CodeGemma** families.
-
-- Single batch size flag: `--batch_size` (used for train & eval)
-- QLoRA on by default (bitsandbytes); graceful fallback to fp16/bf16 LoRA
-- Saves **ONLY** LoRA adapter `state_dict` to `<output_dir>/adapter_state_dict.pt`
-- Transformers v5-ready (`dtype`, `eval_strategy`, `processing_class`)
-
-Usage
------
-python sft_min_qlora.py \
-  --model_name Qwen/Qwen2.5-Coder-1.5B \
-  --humaneval_language python \
-  --output_dir ./out/qwen-coder-qlora \
-  --batch_size 8 --grad_accum 2 --epochs 3 --lr 2e-4
-"""
 from __future__ import annotations
 import argparse
 import os
@@ -31,22 +13,16 @@ from transformers import (
     DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
+    EarlyStoppingCallback
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 ALLOWED_FAMILIES = ("Qwen2.5-Coder", "Qwen-Coder", "CodeLlama", "CodeGemma")
-
 
 def b(x: str) -> bool:
     return str(x).lower() in {"1", "true", "yes", "y", "t"}
 
 SYSTEM_PROMPT = "You are a helpful coding assistant."
-
-def check_family(model_name: str):
-    if not any(f in model_name for f in ALLOWED_FAMILIES):
-        warnings.warn(
-            f"Model '{model_name}' does not look like one of {ALLOWED_FAMILIES}. Proceeding anyway.")
-
 
 def extract_pair(ex: Dict[str, str]) -> Dict[str, str]:
     prompt = ex.get("prompt", "")
@@ -86,8 +62,6 @@ def make_tokenize_fn(tokenizer: AutoTokenizer, max_len: int):
 def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
-
-    check_family(args.model_name)
 
     bnb_cfg = None
     if args.use_4bit:
@@ -167,18 +141,13 @@ def main(args):
         train_dataset=ds_tr,
         eval_dataset=ds_ev,
         data_collator=collator,
-        processing_class=tokenizer,
+        processing_class=tokenizer
     )
 
     trainer.train()
 
-    try:
-        sd = model.get_peft_model_state_dict()
-    except AttributeError:
-        sd = model.state_dict()
-    out = os.path.join(args.output_dir, "adapter_state_dict.pt")
-    torch.save(sd, out)
-    tokenizer.save_pretrained(args.output_dir)
+    out = os.path.join(args.output_dir, "qwen-7b.pt")
+    torch.save(get_peft_model_state_dict(model), out)
     print(f"Saved adapter state_dict to: {out}")
 
 if __name__ == "__main__":
@@ -195,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accum", type=int, default=2)
     parser.add_argument("--epochs", type=float, default=3)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--max_seq_len", type=int, default=2048)
 
     parser.add_argument("--bf16", type=b, default=True)

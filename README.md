@@ -11,38 +11,34 @@ We provide the [environment file](./environment.yml) including the package versi
 The structure of our system is:
 
 ```bash
-./classified/ # classified mapping of the dataset, conclude in Json version
-
-./datasets/ # cache of different datasets
-
-./logs/run_evaluation # logs of each evaluation
-└── test_gold_all # we use gold test as an example
-    └── astropy__astropy-6938 # a single instance within the dataset
-        └── eval.sh # scripts to run the patch
-        └── patch.diff # generated patch
-        └── report.json # conclusion report of this single running
-        └── run_instance.log # logs of running the instance
-        └── test_output.txt # detailed running output in the terminal
-    ......
-    └── sympy__sympy-24909
-
-./outputs/ # location of generated patch
-└── swe-llama-7b # use swe-llama-7b as an example
-    └── princeton-nlp__SWE-bench_oracle__test__princeton-nlp__SWE-Llama-7b__temp-0.0__top-p-1.0.json # the generated patches are in Json version
-
-./results/ # conclusion report of the whole running
-
-./scripts/ # scripts to fetch offline image, generate patch, finetune, run agent, and test patch.
-
-./SWE-agent/ # source code for agent usage
-
-./swebench/ # source code for LLM usage
-
+./src/
+└── info_retrieve/ # HumanEvalPack agent
+    └── self_agent_multi.py
+    └── generator.py
+    └── language_utils.py
+    └── sft_agent.py
+    └── self_agent.sh
+└── swebench/ # SWE-bench LLM
+└── SWE-agent/ # SWE-bench agent
+└── mta/ # MultiTask Agent
 ```
 
-The soft evaluation and offline evaluation are enrolled in the source codes.
 
-## Run open-sourced model
+## HumanEvalPack agent usage
+Here is the script to evaluate HumanEvalPack dataset.
+```bash
+bash ./src/personalized/self_agent.sh
+```
+
+If you want to finetune your own model, please run:
+```bash
+bash ./src/personalized/sft_agent.sh
+```
+LoRA and QLoRA are both supported.
+
+## SWE-bench agent usage
+
+### Run open-sourced model
 
 1. Generate patch.
 ```bash
@@ -64,7 +60,7 @@ python -m swebench.harness.run_evaluation \
     --max_workers 3 \
     --run_id test_swe_agent_lm_7b
 ```
-## Finetune an open-sourced model
+### Finetune an open-sourced model
 
 ```bash
 python ./swebench/finetune_parallal.py \
@@ -74,7 +70,7 @@ python ./swebench/finetune_parallal.py \
     --output ./models
 ```
 
-## Run agent
+### Run agent
 
 1. Use open-sourced model to evaluate.
 ```bash
@@ -103,20 +99,8 @@ sweagent run-batch \
     --instances.shuffle=True
 ```
 
-## Utilize offline evaluation
+### Utilize offline evaluation
 To accelerate the evaluation process, please run following commands to fetch offline images.
 ```bash
 python ./notebooks/fetch_offline_image.py
 ```
-
-## Evaluate HumanEvalPack
-Here is the script to evaluate HumanEvalPack dataset.
-```bash
-bash ./src/personalized/self_agent.sh
-```
-
-If you want to finetune your own model, please run:
-```bash
-bash ./src/personalized/sft_agent.sh
-```
-LoRA and QLoRA are both supported.
