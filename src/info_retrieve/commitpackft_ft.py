@@ -187,6 +187,7 @@ def main(args):
     # 70/30 split
     ds_all = ds_all.shuffle(seed=args.shuffle_seed)
     n = len(ds_all)
+    print(f"total data points: {n}")
     n_train = int(0.7 * n)
     ds_tr_raw = ds_all.select(range(0, n_train))
     ds_ev_raw = ds_all.select(range(n_train, n))
@@ -276,13 +277,13 @@ def main(args):
     torch.save(get_peft_model_state_dict(model), pt_path)
     print(f"Saved LoRA state_dict to: {pt_path}")
 
-    model.save_pretrained(args.output_dir)
-    tok.save_pretrained(args.output_dir)
-    print(f"Also saved adapter folder (and tokenizer) to: {args.output_dir}")
+    # model.save_pretrained(args.output_dir)
+    # tok.save_pretrained(args.output_dir)
+    # print(f"Also saved adapter folder (and tokenizer) to: {args.output_dir}")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="QLoRA SFT with paper-style recipe (subset by language)")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--model_name", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
 
@@ -296,7 +297,7 @@ if __name__ == "__main__":
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--max_steps", type=int, default=0)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=0.05)
     ap.add_argument("--warmup_ratio", type=float, default=0.1)
     ap.add_argument("--lr_scheduler_type", type=str, default="cosine")
@@ -307,20 +308,15 @@ if __name__ == "__main__":
     ap.add_argument("--bf16", type=b, default=True)
     ap.add_argument("--use_4bit", type=b, default=True)
 
-    # LoRA
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.1)
 
-    # packing
+    ap.add_argument("--paper_recipe", type=bool, default=True)
     ap.add_argument("--packing", type=b, default=True)
-
-    # paper 风格开关
-    ap.add_argument("--paper_recipe", type=b, default=False)
     ap.add_argument("--paper_model", type=str, default="octocoder", choices=["octocoder", "octogeex"])
-    ap.add_argument("--override_hparams", type=b, default=False, help="true 时保留你的 lr/batch_size/max_steps，不被 paper 预设覆盖")
+    ap.add_argument("--override_hparams", type=b, default=False)
 
-    # 其它
     ap.add_argument("--early_stop", type=b, default=True)
 
     args = ap.parse_args()
