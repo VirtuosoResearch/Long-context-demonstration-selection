@@ -221,7 +221,7 @@ def main(args):
                 args.lr = 5e-4
                 args.batch_size = 32
                 args.grad_accum = max(1, args.grad_accum)
-                args.max_steps = 35
+                args.max_steps = 100
         elif args.paper_model == "octogeex":
             if args.override_hparams is False:
                 args.lr = 5e-5
