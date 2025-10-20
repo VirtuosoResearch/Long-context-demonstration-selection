@@ -93,7 +93,6 @@ class SimplePacker:
             blocks.append(chunk)
 
         if not blocks:
-            # 退化：按该 batch 内最长样本 pad，以保证可训练
             maxl = max(len(f["input_ids"]) for f in features)
             input_ids = torch.full((len(features), maxl), self.tok.pad_token_id, dtype=torch.long)
             attn = torch.zeros_like(input_ids)
@@ -125,32 +124,6 @@ def load_commitpackft_subset_v3(subset: str):
     files = _list_parquet_files(dataset_id, subset, revision="refs/convert/parquet")
     if files:
         return load_dataset("parquet", data_files={"train": files}, split="train")
-
-    warnings.warn(f"No parquet under refs/convert/parquet for subset={subset}; trying main ...")
-    files = _list_parquet_files(dataset_id, subset, revision="main")
-    if files:
-        return load_dataset("parquet", data_files={"train": files}, split="train")
-
-    all_files = list_repo_files(repo_id=dataset_id, repo_type="dataset", revision="refs/convert/parquet")
-    candidates = sorted(
-        {p.split("/")[0] for p in all_files if "/" in p and p.endswith(".parquet")}
-    )
-    raise RuntimeError(
-        f"Could not find any parquet files for subset='{subset}'. "
-        f"Available subsets under refs/convert/parquet: {candidates}. "
-        f"Try one of them, or install datasets<3 to use the dataset script."
-    )
-
-
-def load_commitpackft_subset(subset: str):
-    try:
-        return load_dataset("bigcode/commitpackft", subset, split="train")
-    except Exception as e:
-        msg = str(e)
-        if "Dataset scripts are no longer supported" not in msg:
-            warnings.warn(f"Falling back to parquet due to: {e}")
-        return load_commitpackft_subset_v3(subset)
-
 
 def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
@@ -203,7 +176,7 @@ def main(args):
         pass
 
     print(args.cp_subset)
-    ds_all = load_commitpackft_subset(args.cp_subset)
+    ds_all = load_commitpackft_subset_v3(args.cp_subset)
 
     ds_all = ds_all.map(cpft_to_pair_row, remove_columns=None)
     ds_all = ds_all.filter(sample_has_pair)
