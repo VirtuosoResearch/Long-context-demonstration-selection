@@ -1,7 +1,3 @@
-# Instruction
-
-Follow the setup instructions to launch the WebShop agent 
-
 # 🛒 WebShop
 
 [![Python version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/release/python-3813/)
