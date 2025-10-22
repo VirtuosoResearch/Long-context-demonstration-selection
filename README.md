@@ -12,7 +12,7 @@ The structure of our system is:
 
 ```bash
 ./src/
-└── info_retrieve/ # HumanEvalPack agent
+└── humanevalpack/ # HumanEvalPack agent
     └── self_agent_multi.py
     └── generator.py
     └── language_utils.py
@@ -20,19 +20,19 @@ The structure of our system is:
     └── self_agent.sh
 └── swebench/ # SWE-bench LLM
 └── SWE-agent/ # SWE-bench agent
-└── mta/ # MultiTask Agent
+└── webarena/ # WebAgent
 ```
 
 
 ## HumanEvalPack agent usage
 Here is the script to evaluate HumanEvalPack dataset.
 ```bash
-bash ./src/personalized/self_agent.sh
+bash ./src/humanevalpack/self_agent.sh
 ```
 
-If you want to finetune your own model, please run:
+If you want to finetune the model within the agent, please run:
 ```bash
-bash ./src/personalized/sft_agent.sh
+bash ./src/humanevalpack/commitpackft_ft.sh
 ```
 LoRA and QLoRA are both supported.
 
