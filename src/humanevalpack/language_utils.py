@@ -220,8 +220,6 @@ def write_solution_python(task_prompt: str, completion: str, imports: str, test_
     code = []
     if imports and imports.strip():
         code.append(imports.strip())
-    # If the model reproduced the signature, joining prompt+completion is fine.
-    # If it returned only a body, this still works because prompt ends with 'def ...:\n    ...'
     code.append(task_prompt.rstrip() + "\n" + completion.strip() + "\n")
     if test_setup and test_setup.strip():
         code.append(test_setup.strip())
