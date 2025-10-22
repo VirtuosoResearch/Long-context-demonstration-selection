@@ -1,4 +1,16 @@
 import os
+import sys
+
+# Parse device argument FIRST, before any CUDA initialization
+device_arg = "0"  # default
+for i, arg in enumerate(sys.argv):
+    if arg == "--device" and i + 1 < len(sys.argv):
+        device_arg = sys.argv[i + 1]
+        break
+
+# Set CUDA_VISIBLE_DEVICES before importing any libraries that use CUDA
+os.environ["CUDA_VISIBLE_DEVICES"] = device_arg
+
 import logging
 from datetime import datetime
 from webshop_env import WebshopEnv
@@ -88,18 +100,18 @@ class WebshopAgent:
 
 
 def main(args):
-    # Set GPU device
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+    # Device is already set at module import time
+    # (see top of file where CUDA_VISIBLE_DEVICES is set)
     
     # Setup logging
     log_file = setup_logging(log_dir=args.log_dir, args=args)
     logging.info(f"Starting evaluation with model: {args.model_name}")
-    logging.info(f"Using device: {args.device}")
+    logging.info(f"Using device: {args.device} (CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')})")
     logging.info(f"Number of episodes: {args.n_eval}")
     
     llm = HF_LLM(
         model_name=args.model_name,
-        max_new_tokens=160,
+        max_new_tokens=args.max_new_tokens,
         generation_kwargs={
             "temperature": 0.3,
             "top_p": 0.9,
@@ -120,6 +132,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Name of the language model to use.")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Maximum number of new tokens to generate.")
     
     parser.add_argument("--n_eval", type=int, default=500, help="Number of evaluation episodes.")
     

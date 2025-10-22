@@ -62,12 +62,17 @@ def index(session_id):
             )
         search_engine = init_search_engine(num_products=DEBUG_PROD_SIZE)
         goals = get_goals(all_products, product_prices)
+        print(f"[INFO] Loaded {len(goals)} goals from {len(all_products)} products")
         random.seed(233)
         random.shuffle(goals)
         weights = [goal['weight'] for goal in goals]
 
     if session_id not in user_sessions and 'fixed' in session_id:
         goal_dix = int(session_id.split('_')[-1])
+        # # Bounds check: wrap around if index is out of range
+        # if goal_dix >= len(goals):
+        #     print(f"[WARNING] Session {session_id} requested goal index {goal_dix}, but only {len(goals)} goals available. Using modulo.")
+        #     goal_dix = goal_dix % len(goals)
         goal = goals[goal_dix]
         instruction_text = goal['instruction_text']
         user_sessions[session_id] = {'goal': goal, 'done': False}
