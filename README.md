@@ -27,7 +27,7 @@ The structure of our system is:
 ## HumanEvalPack agent usage
 Here is the script to evaluate HumanEvalPack dataset.
 ```bash
-bash ./src/humanevalpack/self_agent.sh
+bash ./src/humanevalpack/eval_agent.sh
 ```
 
 If you want to finetune the model within the agent, please run:
