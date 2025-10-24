@@ -74,3 +74,32 @@ To run the same workflow entirely locally with Hugging Face weights::
   e.g. `--env-extra='{"verbose": true}'`.
 
 Refer to `mta/scripts/run_sweagent_vllm.py --help` for the full list of options.
+
+## HumanEval agent evaluation
+
+The same execution engine now supports HumanEval-style problems through a lightweight agent scaffold.
+
+Make sure the bundled `human-eval` package (or any equivalent installation providing `human_eval.execution`) is available on your `PYTHONPATH`, e.g.:
+
+```bash
+pip install -e human-eval
+```
+
+1. (Optional) materialise the dataset into the local registry to inspect it later::
+
+   ```bash
+   python -m mta.scripts.prepare_humaneval_data
+   ```
+
+2. Launch evaluation via the bundled CLI (OpenAI/vLLM endpoint) ::
+
+   ```bash
+   python -m mta.scripts.run_humaneval_agent \
+       --model your-model-name \
+       --base-url http://localhost:8000/v1 \
+       --limit 10
+   ```
+
+   To run entirely locally with Hugging Face weights, swap `--engine transformers` and provide `--device` / `--model-kwargs` as needed.
+
+Pass `--help` to either script for the exhaustive set of flags (custom prompts, attempt limits, dataset path overrides, etc.).

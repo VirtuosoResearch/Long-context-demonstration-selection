@@ -6,15 +6,24 @@ a focused surface tailored for SWE-agent style inference pipelines backed by
 vLLM.
 """
 
-from .agents import SWEAgent
+from .agents import HumanEvalAgent, SWEAgent
 from .data import Dataset, DatasetRegistry
-from .engine import AgentExecutionEngine
+from .engine import AgentExecutionEngine, HumanEvalAgentRunner, WebArenaRunner
 from .engine.sweagent_vllm import SweAgentVLLMRunner
+from .environments import BrowserGymEnv, ConfigurableSWEEnv, HumanEvalEnv, SWEEnv
 
 __all__ = [
+    "HumanEvalAgent",
     "SWEAgent",
+    "WebArenaAgent",
     "SweAgentVLLMRunner",
+    "WebArenaRunner",
+    "HumanEvalAgentRunner",
     "AgentExecutionEngine",
     "Dataset",
     "DatasetRegistry",
+    "BrowserGymEnv",
+    "SWEEnv",
+    "ConfigurableSWEEnv",
+    "HumanEvalEnv",
 ]

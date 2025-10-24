@@ -118,10 +118,32 @@ class SWEAgent(BaseAgent):
 
     def update_from_model(self, response: str, **kwargs):
         self._trajectory.steps.append(self.cur_step)
-        if self.use_fn_calling:
-            thought, action = parse_oai_response(response)
+        is_fn_calling = self.use_fn_calling
+        chat_completion_message = None
+
+        raw_response_str = response if isinstance(response, str) else str(response)
+        if is_fn_calling:
+            try:
+                thought, action = parse_oai_response(response)
+                chat_completion_message = response.choices[0].message if hasattr(response, "choices") else None
+            except AttributeError:
+                logger.warning("Expected ChatCompletion response when function calling is enabled, received %s", type(response))
+                is_fn_calling = False
+                thought, action = parse_xml_response(raw_response_str)
         else:
-            thought, action = parse_xml_response(response)
+            thought, action = parse_xml_response(raw_response_str)
+
+        if is_fn_calling and chat_completion_message is not None and not getattr(action, "function_name", ""):
+            content_to_parse = chat_completion_message.content or ""
+            if content_to_parse:
+                try:
+                    parsed_thought, parsed_action = parse_xml_response(content_to_parse)
+                    if getattr(parsed_action, "function_name", ""):
+                        thought = parsed_thought
+                        action = parsed_action
+                except Exception:
+                    logger.debug("Fallback XML parsing failed for chat completion content", exc_info=True)
+
         action_str = action.to_xml_string()
         assert self._trajectory.steps, "Trajectory should not be empty when update_from_model is called."
 
@@ -130,10 +152,38 @@ class SWEAgent(BaseAgent):
         cur_step.action = action_str
         cur_step.model_response = response
 
-        if self.format_model_response:
+        assistant_message_payload = None
+        if is_fn_calling and chat_completion_message is not None:
+            assistant_message_payload = {
+                "role": chat_completion_message.role or "assistant",
+                "content": chat_completion_message.content or "",
+            }
+            tool_calls = getattr(chat_completion_message, "tool_calls", None)
+            if tool_calls:
+                formatted_tool_calls = []
+                for tool_call in tool_calls:
+                    if getattr(tool_call, "type", None) != "function":
+                        continue
+                    function_obj = getattr(tool_call, "function", None)
+                    formatted_tool_calls.append(
+                        {
+                            "id": getattr(tool_call, "id", None),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(function_obj, "name", ""),
+                                "arguments": getattr(function_obj, "arguments", ""),
+                            },
+                        }
+                    )
+                if formatted_tool_calls:
+                    assistant_message_payload["tool_calls"] = formatted_tool_calls
+
+        if assistant_message_payload is not None:
+            self.messages.append(assistant_message_payload)
+        elif self.format_model_response:
             self.messages.append({"role": "assistant", "content": f"{thought}\n\n{action_str}"})
         else:
-            self.messages.append({"role": "assistant", "content": response})
+            self.messages.append({"role": "assistant", "content": raw_response_str})
         self.step += 1
         return Action(action=cur_step.action)
 

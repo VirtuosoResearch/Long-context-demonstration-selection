@@ -14,12 +14,17 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:  # pragma: no cover - optional dependency for API-only users
+    AutoModelForCausalLM = None  # type: ignore[assignment]
+    AutoTokenizer = None  # type: ignore[assignment]
 
 from mta.agents import SWEAgent
 from mta.data import DatasetRegistry
 from mta.engine import AgentExecutionEngine
 from mta.environments import ConfigurableSWEEnv, ENV_KWARGS_KEY
+from mta.openai_chat_tokenizer import OpenAIChatTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +110,21 @@ class SweAgentVLLMRunner:
         self.device = device
         self.model_kwargs = model_kwargs.copy() if model_kwargs else {}
 
-        tokenizer_settings = tokenizer_kwargs.copy() if tokenizer_kwargs else {}
-        tokenizer_settings.setdefault("trust_remote_code", trust_remote_code)
-
-        tokenizer_id = tokenizer_name or connection.model
-        logger.info("Loading tokenizer %s (trust_remote_code=%s)", tokenizer_id, tokenizer_settings["trust_remote_code"])
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **tokenizer_settings)
+        if self.engine_name == "openai":
+            if tokenizer_name:
+                logger.warning(
+                    "Tokenizer '%s' was provided but --engine openai is using the HTTP API; skipping Hugging Face download.",
+                    tokenizer_name,
+                )
+            self.tokenizer = OpenAIChatTokenizer(model_name=connection.model)
+        else:
+            if AutoTokenizer is None:
+                raise ImportError("transformers must be installed to use the local transformers engine")
+            tokenizer_settings = tokenizer_kwargs.copy() if tokenizer_kwargs else {}
+            tokenizer_settings.setdefault("trust_remote_code", trust_remote_code)
+            tokenizer_id = tokenizer_name or connection.model
+            logger.info("Loading tokenizer %s (trust_remote_code=%s)", tokenizer_id, tokenizer_settings["trust_remote_code"])
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **tokenizer_settings)
 
         sampling_params = self._build_sampling_params()
         rollout_engine_args: dict[str, Any] = {}
@@ -122,6 +136,8 @@ class SweAgentVLLMRunner:
                 "api_key": connection.api_key,
             }
         elif self.engine_name == "transformers":
+            if AutoModelForCausalLM is None:
+                raise ImportError("transformers must be installed to use the local transformers engine")
             model_load_kwargs = self.model_kwargs.copy()
             if self.device:
                 if self.device == "auto":

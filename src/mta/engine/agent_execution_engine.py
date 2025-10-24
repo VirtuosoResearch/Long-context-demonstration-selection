@@ -1,10 +1,18 @@
 import asyncio
 import concurrent.futures
+import json
 import logging
 import time
+from pathlib import Path
+
 import openai
 import torch
 from openai.types import Completion
+from openai.types.chat import ChatCompletion
+try:
+    from openai.types.responses import Response
+except ImportError:  # pragma: no cover - fallback for older SDKs
+    Response = None  # type: ignore[assignment]
 
 from mta.agents.base import Action, BaseAgent, Trajectory
 from mta.agents.utils import convert_messages_to_tokens_and_masks, get_recent_assistant_user_messages
@@ -62,9 +70,14 @@ class AgentExecutionEngine:
         self.max_response_length = max_response_length
         self.max_prompt_length = max_prompt_length
         self.enforce_max_prompt_length = enforce_max_prompt_length
+        self.openai_completion_limit = kwargs.get("openai_completion_limit")
 
         self.agent_class = agent_class
         self.agent_args = agent_args
+        if isinstance(self.agent_args, dict):
+            self.return_raw_openai_response = bool(self.agent_args.get("use_fn_calling"))
+        else:
+            self.return_raw_openai_response = False
         self.env_class = env_class
         self.env_args = env_args
 
@@ -83,6 +96,12 @@ class AgentExecutionEngine:
         self.client = None
         self.local_model = None
         self.generation_device = None
+
+        self.write_step_logs = kwargs.get("write_step_logs", True)
+        logs_dir = kwargs.get("step_logs_dir", "trajectory_logs")
+        self.step_logs_dir = Path(logs_dir) if self.write_step_logs else None
+        if self.write_step_logs and self.step_logs_dir is not None:
+            self.step_logs_dir.mkdir(parents=True, exist_ok=True)
 
         if self.engine_name == "openai":
             from openai import AsyncOpenAI
@@ -126,35 +145,171 @@ class AgentExecutionEngine:
         self.n_parallel_agents = len(envs)
 
     async def _get_openai_async(self, prompt, _, **kwargs):
-        async def get_response(prompt_text: str):
-            retries = self.api_retries
-            while retries > 0:
-                try:
-                    response = await self.client.completions.create(
-                        prompt=prompt_text,
-                        timeout=3600,
-                        **self.sampling_params,
-                        **kwargs,
-                    )
-                    return response
-                except openai.RateLimitError:
-                    retries -= 1
-                    if retries == 0:
-                        return "Error: Rate limit reached and retries exhausted."
-                    logger.info("Sleep for 5 seconds for API limit.")
-                    await asyncio.sleep(5)
-                except Exception as e:
-                    logger.error("Error: %s", e)
-                    return f"Error processing content: {e}"
+        is_chat_prompt = isinstance(prompt, list) and all(isinstance(msg, dict) for msg in prompt)
+        retries = self.api_retries
+        last_error: Exception | None = None
+
+        disallow_max_tokens = False
+
+        while retries > 0:
+            request_params = dict(self.sampling_params)
+            request_params.update(kwargs)
+            request_params["timeout"] = 3600
+
+            if not disallow_max_tokens:
+                max_tokens = request_params.get("max_tokens")
+                if self.openai_completion_limit is not None and max_tokens is not None:
+                    if max_tokens > self.openai_completion_limit:
+                        logger.warning(
+                            "Clamping max_tokens from %s to service limit %s",
+                            max_tokens,
+                            self.openai_completion_limit,
+                        )
+                    clamped = min(max_tokens, self.openai_completion_limit)
+                    request_params["max_tokens"] = clamped
+                    request_params["max_completion_tokens"] = clamped
+            else:
+                request_params.pop("max_tokens", None)
+                if self.openai_completion_limit is not None:
+                    request_params.setdefault("max_completion_tokens", self.openai_completion_limit)
+
+            try:
+                response = await self._attempt_openai_chat_or_completion(prompt, request_params, is_chat_prompt)
+                return self._format_openai_response(response)
+            except openai.RateLimitError:
+                retries -= 1
+                if retries == 0:
+                    return "Error: Rate limit reached and retries exhausted."
+                logger.info("Sleep for 5 seconds for API limit.")
+                await asyncio.sleep(5)
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = exc
+                if self._is_max_tokens_unsupported(exc) and not disallow_max_tokens:
+                    disallow_max_tokens = True
+                    continue
+                if Response is not None and self._should_fallback_to_responses(exc):
+                    try:
+                        response = await self._call_openai_responses(prompt, request_params, is_chat_prompt)
+                        return self._format_openai_response(response)
+                    except Exception as resp_exc:  # pragma: no cover - network dependency
+                        logger.error("Responses API fallback failed: %s", resp_exc)
+                        return f"Error processing content: {resp_exc}"
+                logger.error("Error: %s", exc)
+                return f"Error processing content: {exc}"
+
+        if last_error is not None:
+            return f"Error processing content: {last_error}"
+        return "Error: Unable to obtain response from OpenAI."
+
+    async def _attempt_openai_chat_or_completion(self, prompt, request_params, is_chat_prompt):
+        params = request_params.copy()
+        if is_chat_prompt:
+            params.pop("prompt", None)
+            params["messages"] = prompt
+            return await self.client.chat.completions.create(**params)
 
         prompt_text = prompt
-        if isinstance(prompt, list) and all(isinstance(msg, dict) for msg in prompt):
+        if isinstance(prompt, list):
             prompt_text = self.chat_parser.parse(prompt, add_generation_prompt=True, is_first_msg=True)
+        params["prompt"] = prompt_text
+        return await self.client.completions.create(**params)
 
-        response = await get_response(prompt_text)
+    async def _call_openai_responses(self, prompt, request_params, is_chat_prompt):
+        if Response is None:  # pragma: no cover - compatibility fallback
+            raise RuntimeError("OpenAI responses API is not available in the installed openai package.")
+
+        params = request_params.copy()
+        max_tokens = params.pop("max_tokens", None)
+        if max_tokens is None:
+            max_tokens = params.pop("max_completion_tokens", None)
+        if max_tokens is not None:
+            params["max_output_tokens"] = max_tokens
+        params.pop("prompt", None)
+        params.pop("messages", None)
+
+        if is_chat_prompt and isinstance(prompt, list):
+            responses_input = [
+                {"role": msg.get("role", "user"), "content": msg.get("content", "")} for msg in prompt
+            ]
+        else:
+            if isinstance(prompt, list):
+                prompt_text = self.chat_parser.parse(prompt, add_generation_prompt=True, is_first_msg=True)
+            else:
+                prompt_text = prompt
+            responses_input = [{"role": "user", "content": prompt_text}]
+
+        params["input"] = responses_input
+        return await self.client.responses.create(**params)
+
+    def _should_fallback_to_responses(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        fallback_markers = [
+            "not supported in the v1/completions endpoint",
+            "use the responses api",
+            "unknown parameter",
+            "only supported in v1/responses",
+        ]
+        return any(marker in message for marker in fallback_markers)
+
+    def _is_max_tokens_unsupported(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "use 'max_completion_tokens'" in message or "unsupported parameter: 'max_tokens'" in message
+
+    def _format_openai_response(self, response):
         if isinstance(response, Completion):
-            response = response.choices[0].text
+            return response.choices[0].text
+        if isinstance(response, ChatCompletion):
+            if self.return_raw_openai_response:
+                return response
+            return response.choices[0].message.content or ""
+        if Response is not None and isinstance(response, Response):
+            if self.return_raw_openai_response:
+                logger.warning("Responses API does not support returning raw ChatCompletion; returning text output instead.")
+            if hasattr(response, "output_text") and response.output_text:
+                return response.output_text
+
+            text_chunks: list[str] = []
+            output = getattr(response, "output", None) or []
+            for block in output:
+                content_items = getattr(block, "content", []) or []
+                for item in content_items:
+                    text_obj = getattr(item, "text", None)
+                    if text_obj is None:
+                        continue
+                    if isinstance(text_obj, str):
+                        text_chunks.append(text_obj)
+                    else:
+                        value = getattr(text_obj, "value", None)
+                        if value:
+                            text_chunks.append(value)
+            return "\n".join(text_chunks)
         return response
+
+    def _get_response_display_text(self, response):
+        if isinstance(response, ChatCompletion):
+            try:
+                message = response.choices[0].message
+            except (AttributeError, IndexError):
+                return str(response)
+            text = getattr(message, "content", "") or ""
+            if text:
+                return text
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls:
+                tool_call = tool_calls[0]
+                function_obj = getattr(tool_call, "function", None)
+                name = getattr(function_obj, "name", "") if function_obj else ""
+                arguments = getattr(function_obj, "arguments", "") if function_obj else ""
+                return f"<function={name}>\n{arguments}\n</function>"
+            return ""
+        if isinstance(response, Completion):
+            try:
+                return response.choices[0].text
+            except (AttributeError, IndexError):
+                return str(response)
+        if Response is not None and isinstance(response, Response):
+            return self._format_openai_response(response)
+        return response if isinstance(response, str) else str(response)
 
     async def _get_transformers_async(self, prompt, _=None, **kwargs):
         if isinstance(prompt, list) and all(isinstance(msg, dict) for msg in prompt):
@@ -219,6 +374,7 @@ class AgentExecutionEngine:
         reward = 0.0
 
         episode_steps = []
+        step_logs = [] if self.write_step_logs else None
 
         loop = asyncio.get_event_loop()
         observation, info = await loop.run_in_executor(self.executor, env.reset)
@@ -246,6 +402,17 @@ class AgentExecutionEngine:
 
         for step_idx in range(self.max_steps):
             prompt_messages = agent.chat_completions.copy()
+
+            env_message_content = None
+            env_message_str = None
+            for message in reversed(prompt_messages):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    env_message_content = message.get("content")
+                    break
+            if env_message_content is not None:
+                env_message_str = str(env_message_content)
+                colorful_print(f"[Trajectory {idx} | Step {step_idx}] Environment Input:\n{env_message_str}", "magenta")
+
             if not self.enforce_max_prompt_length:
                 max_tokens = self.max_response_length - response_token_len
             else:
@@ -258,20 +425,46 @@ class AgentExecutionEngine:
                     break
 
             kwargs["max_tokens"] = max_tokens
+            if self.engine_name == "openai" and self.openai_completion_limit is not None:
+                if kwargs["max_tokens"] > self.openai_completion_limit:
+                    logger.warning(
+                        "Clamping max_tokens from %s to service limit %s",
+                        kwargs["max_tokens"],
+                        self.openai_completion_limit,
+                    )
+                kwargs["max_tokens"] = min(kwargs["max_tokens"], self.openai_completion_limit)
 
             start_time = time.time()
             response = await self.get_model_response(prompt_messages, application_id, **kwargs)
             delta_time = time.time() - start_time
             llm_time += delta_time
+            response_display = self._get_response_display_text(response)
+            colorful_print(f"[Trajectory {idx} | Step {step_idx}] LLM Output:\n{response_display}", "blue")
             total_time += delta_time
             prompt_response_pair = {
                 "prompt": self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True),
-                "response": response,
+                "response": response_display,
             }
             episode_steps.append(prompt_response_pair)
 
             action: Action = agent.update_from_model(response)
             action = action.action
+            current_step = agent.get_current_state()
+            thought_str = str(getattr(current_step, "thought", "")) if current_step else ""
+            action_str = str(getattr(current_step, "action", "")) if current_step else ""
+            colorful_print(f"[Trajectory {idx} | Step {step_idx}] Thought:\n{thought_str}", "cyan")
+            colorful_print(f"[Trajectory {idx} | Step {step_idx}] Action:\n{action_str}", "green")
+
+            if step_logs is not None:
+                step_logs.append(
+                    {
+                        "step": step_idx,
+                        "environment_input": env_message_str,
+                        "llm_output": response_display,
+                        "thought": thought_str,
+                        "action": action_str,
+                    }
+                )
 
             start_time = time.time()
 
@@ -382,6 +575,22 @@ class AgentExecutionEngine:
             reward_time = time.time() - start_time
             cur_step.reward = reward
         await loop.run_in_executor(self.executor, env.close)
+
+        if step_logs is not None:
+            log_payload = {
+                "trajectory_index": idx,
+                "application_id": str(application_id),
+                "termination_reason": termination_reason,
+                "reward": reward,
+                "steps": step_logs,
+            }
+            log_filename = self.step_logs_dir / f"trajectory_{application_id}.json" if self.step_logs_dir is not None else Path(f"trajectory_{application_id}.json")
+            try:
+                with log_filename.open("w", encoding="utf-8") as log_file:
+                    json.dump(log_payload, log_file, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                colorful_print(f"Failed to write trajectory log for {application_id}: {exc}", "red")
+
         if termination_reason:
             color = "green" if reward > 0 else "yellow"
             colorful_print(
