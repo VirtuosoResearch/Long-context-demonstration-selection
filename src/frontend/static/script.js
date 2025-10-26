@@ -26,7 +26,7 @@
 
     if (!taskData || !taskData.params || taskData.params.length === 0) {
       paramsContainer.innerHTML =
-        '<div class="empty-hint">该任务没有可配置的参数</div>';
+        '<div class="empty-hint">No configurable parameters for this task</div>';
       return;
     }
 
@@ -62,7 +62,7 @@
     if (Array.isArray(taskData.staticFlags) && taskData.staticFlags.length) {
       const hint = document.createElement("div");
       hint.className = "empty-hint";
-      hint.textContent = `固定启用的标志：${taskData.staticFlags.join(" ")}`;
+      hint.textContent = `Static flags: ${taskData.staticFlags.join(" ")}`;
       paramsContainer.appendChild(hint);
     }
   };
@@ -75,7 +75,7 @@
       }
       tasks = await response.json();
       taskSelect.innerHTML =
-        '<option value="">请选择任务</option>' +
+        '<option value="">Select a task</option>' +
         Object.entries(tasks)
           .map(
             ([name, info]) =>
@@ -83,12 +83,12 @@
           )
           .join("");
       taskSelect.disabled = false;
-      setStatus("请选择任务");
+      setStatus("Please select a task");
     } catch (error) {
       console.error(error);
       taskSelect.innerHTML =
-        '<option value="">加载失败，请刷新页面重试</option>';
-      setStatus("任务列表加载失败", "error");
+        '<option value="">Failed to load tasks, refresh to retry</option>';
+      setStatus("Failed to load task list", "error");
     }
   };
 
@@ -96,21 +96,21 @@
     const selected = taskSelect.value;
     if (!selected || !tasks[selected]) {
       paramsContainer.innerHTML =
-        '<div class="empty-hint">请选择任务以查看并编辑参数</div>';
+        '<div class="empty-hint">Select a task to view and edit parameters</div>';
       paramInputs = [];
       runButton.disabled = true;
-      setStatus("请选择任务");
+      setStatus("Please select a task");
       return;
     }
     renderParams(tasks[selected]);
     runButton.disabled = false;
-    setStatus(`已选择任务：${tasks[selected].label}`);
+    setStatus(`Selected task: ${tasks[selected].label}`);
   };
 
   const runTask = async () => {
     const task = taskSelect.value;
     if (!task || !tasks[task]) {
-      setStatus("请选择任务", "error");
+      setStatus("Please select a task", "error");
       return;
     }
 
@@ -121,7 +121,7 @@
 
     runButton.disabled = true;
     taskSelect.disabled = true;
-    setStatus("任务运行中…");
+    setStatus("Task running...");
     outputArea.value = "";
 
     try {
@@ -138,16 +138,16 @@
 
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const message = data.error || `请求失败 (HTTP ${response.status})`;
+        const message = data.error || `Request failed (HTTP ${response.status})`;
         throw new Error(message);
       }
 
       const header = data.command ? `> ${data.command}\n\n` : "";
       outputArea.value = `${header}${data.output || ""}`;
-      setStatus(`完成，退出码 ${data.exitCode}`, "success");
+      setStatus(`Completed, exit code ${data.exitCode}`, "success");
     } catch (error) {
       outputArea.value = "";
-      setStatus(`运行失败：${error.message}`, "error");
+      setStatus(`Task failed: ${error.message}`, "error");
     } finally {
       runButton.disabled = false;
       taskSelect.disabled = false;
