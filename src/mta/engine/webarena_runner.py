@@ -5,15 +5,20 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:  # pragma: no cover - optional dependency for API-only runs
+    AutoModelForCausalLM = None  # type: ignore[assignment]
+    AutoTokenizer = None  # type: ignore[assignment]
 
 from mta.agents import WebArenaAgent
 from mta.engine import AgentExecutionEngine
 from mta.engine.sweagent_vllm import VLLMConnectionConfig
 from mta.environments import BrowserGymEnv
+from mta.openai_chat_tokenizer import OpenAIChatTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +53,36 @@ class WebArenaRunner:
         self.model_kwargs = model_kwargs.copy() if model_kwargs else {}
         self.device = device
 
-        tokenizer_settings = tokenizer_kwargs.copy() if tokenizer_kwargs else {}
-        tokenizer_settings.setdefault("trust_remote_code", trust_remote_code)
-
-        tokenizer_id = tokenizer_name or connection.model
-        logger.info("Loading tokenizer %s (trust_remote_code=%s)", tokenizer_id, tokenizer_settings.get("trust_remote_code"))
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **tokenizer_settings)
-
         sampling_params = self._build_sampling_params()
         rollout_engine_args: dict[str, Any] = {}
         rollout_engine = None
 
         if engine_name == "openai":
+            if tokenizer_name:
+                logger.warning(
+                    "Tokenizer '%s' provided but engine 'openai' delegates to an HTTP API; skipping Hugging Face download.",
+                    tokenizer_name,
+                )
+            if tokenizer_kwargs:
+                logger.warning(
+                    "tokenizer_kwargs provided but engine 'openai' delegates to an HTTP API; skipping Hugging Face download."
+                )
+            self.tokenizer = OpenAIChatTokenizer(model_name=connection.model)
             rollout_engine_args = {
                 "base_url": connection.base_url.rstrip("/"),
                 "api_key": connection.api_key,
             }
         elif engine_name == "transformers":
+            if AutoTokenizer is None or AutoModelForCausalLM is None:
+                raise ImportError("transformers must be installed to use the local transformers engine.")
+
+            tokenizer_settings = tokenizer_kwargs.copy() if tokenizer_kwargs else {}
+            tokenizer_settings.setdefault("trust_remote_code", trust_remote_code)
+
+            tokenizer_id = tokenizer_name or connection.model
+            logger.info("Loading tokenizer %s (trust_remote_code=%s)", tokenizer_id, tokenizer_settings.get("trust_remote_code"))
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **tokenizer_settings)
+
             local_kwargs = self.model_kwargs.copy()
             if self.device:
                 if self.device == "auto":

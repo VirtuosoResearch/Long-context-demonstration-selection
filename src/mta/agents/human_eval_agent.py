@@ -57,6 +57,7 @@ class HumanEvalAgent(BaseAgent):
         observation_text = str(observation)
         self._ensure_language_prompt(observation_text, info)
         if info is not None and self._detected_language:
+            info.setdefault("language", self._detected_language)
             info.setdefault("detected_language", self._detected_language)
             if self._detected_language_source:
                 info.setdefault("detected_language_source", self._detected_language_source)
@@ -177,6 +178,12 @@ class HumanEvalAgent(BaseAgent):
         self._language_prompt_inserted = True
 
     def _detect_language(self, observation: str, info: dict | None) -> tuple[str, str]:
+        if info:
+            info_language = info.get("language") or info.get("detected_language")
+            if info_language:
+                language_str = str(info_language).lower()
+                return language_str, "environment"
+
         if self.language_detector is None:
             return self.default_language, "default"
 
@@ -186,7 +193,7 @@ class HumanEvalAgent(BaseAgent):
                 source = getattr(self.language_detector, "get_last_source", lambda: "unknown")()
                 if not source:
                     source = "unknown"
-                return language, source
+                return str(language).lower(), source
         except Exception:
             pass
 

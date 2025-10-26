@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - optional dependency
     AutoTokenizer = None  # type: ignore[assignment]
 
 from human_eval.data import HUMAN_EVAL, read_problems
+from datasets import load_dataset
 
 from mta.agents import HumanEvalAgent
 from mta.engine.agent_execution_engine import AgentExecutionEngine
@@ -40,9 +41,16 @@ class HumanEvalAgentConfig:
 class HumanEvalDatasetConfig:
     """Dataset loading options for HumanEval."""
 
-    path: str = HUMAN_EVAL
+    dataset_name: str = "bigcode/humanevalpack"
+    split: str = "test"
+    language: str | None = None
+    languages: Sequence[str] | None = None
+    path: str | None = None
     limit: int | None = None
     task_ids: Sequence[str] | None = None
+    runtime_timeout: float | None = None
+    compile_timeout: float | None = None
+    max_attempts: int | None = None
 
 
 class HumanEvalAgentRunner:
@@ -178,7 +186,13 @@ class HumanEvalAgentRunner:
 
     def load_dataset(self, config: HumanEvalDatasetConfig | None = None) -> list[dict[str, Any]]:
         cfg = config or HumanEvalDatasetConfig()
-        problem_map = read_problems(cfg.path)
+        if cfg.path:
+            return self._load_local_humaneval(cfg)
+        return self._load_humanevalpack(cfg)
+
+    def _load_local_humaneval(self, cfg: HumanEvalDatasetConfig) -> list[dict[str, Any]]:
+        dataset_path = cfg.path or HUMAN_EVAL
+        problem_map = read_problems(dataset_path)
 
         if cfg.task_ids:
             missing = [task_id for task_id in cfg.task_ids if task_id not in problem_map]
@@ -191,8 +205,95 @@ class HumanEvalAgentRunner:
         if cfg.limit is not None:
             selected = selected[: cfg.limit]
 
-        logger.info("Loaded %s HumanEval task(s) from %s", len(selected), cfg.path)
+        logger.info("Loaded %s HumanEval task(s) from %s", len(selected), dataset_path)
         return self.build_tasks(selected)
+
+    def _load_humanevalpack(self, cfg: HumanEvalDatasetConfig) -> list[dict[str, Any]]:
+        languages: list[str] = []
+        if cfg.languages:
+            languages.extend([str(lang).lower() for lang in cfg.languages])
+        if cfg.language:
+            languages.append(cfg.language.lower())
+        if languages:
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for lang in languages:
+                if lang not in seen:
+                    deduped.append(lang)
+                    seen.add(lang)
+            languages = deduped
+        else:
+            languages = ["python"]
+
+        tasks: list[dict[str, Any]] = []
+        requested_ids = set(cfg.task_ids or [])
+        filtered_ids: set[str] = set()
+
+        for language in languages:
+            try:
+                dataset = load_dataset(cfg.dataset_name, language, split=cfg.split)
+            except Exception as exc:  # pragma: no cover - network/dataset dependency
+                logger.error("Failed to load HumanEvalPack dataset '%s' (language=%s, split=%s): %s", cfg.dataset_name, language, cfg.split, exc)
+                raise
+
+            per_language: list[dict[str, Any]] = []
+            for record in dataset:
+                task = self._convert_pack_record(record, language, cfg)
+                if requested_ids and task["task_id"] not in requested_ids:
+                    continue
+                filtered_ids.add(task["task_id"])
+                per_language.append(task)
+
+            logger.info(
+                "Loaded %s HumanEvalPack task(s) for language '%s' from %s (split=%s)",
+                len(per_language),
+                language,
+                cfg.dataset_name,
+                cfg.split,
+            )
+            tasks.extend(per_language)
+            if cfg.limit is not None and not requested_ids and len(tasks) >= cfg.limit:
+                tasks = tasks[: cfg.limit]
+                break
+
+        if requested_ids:
+            missing = requested_ids - filtered_ids
+            if missing:
+                logger.warning("Task id(s) not found in HumanEvalPack: %s", ", ".join(sorted(missing)))
+
+        if cfg.limit is not None and not requested_ids:
+            tasks = tasks[: cfg.limit]
+
+        return self.build_tasks(tasks)
+
+    def _convert_pack_record(self, record: dict[str, Any], language: str, cfg: HumanEvalDatasetConfig) -> dict[str, Any]:
+        target_language = (record.get("language") or language or "python").lower()
+        prompt = record.get("prompt") or record.get("declaration") or ""
+        imports = record.get("import") or ""
+        includes = record.get("includes") or imports
+        test_setup = record.get("test_setup") or ""
+        test = record.get("test") or ""
+
+        task: dict[str, Any] = {
+            "task_id": record.get("task_id") or f"{target_language}_{record.get('entry_point', 'unknown')}",
+            "prompt": prompt,
+            "entry_point": record.get("entry_point"),
+            "imports": imports,
+            "import": imports,
+            "includes": includes,
+            "test_setup": test_setup,
+            "test": test,
+            "instructions": record.get("instructions"),
+            "language": target_language,
+            "timeout": record.get("timeout") or cfg.runtime_timeout,
+            "compile_timeout": record.get("compile_timeout") or cfg.compile_timeout,
+            "max_attempts": record.get("max_attempts") or cfg.max_attempts,
+            "canonical_solution": record.get("canonical_solution"),
+        }
+
+        # Remove None values to keep downstream payload compact
+        compact_task = {key: value for key, value in task.items() if value is not None}
+        return compact_task
 
     # ------------------------------------------------------------------ #
     # Execution helpers

@@ -19,6 +19,9 @@ def run_humaneval_agent(
     dataset_path: str | None = None,
     task_ids: list[str] | None = None,
     limit: int | None = None,
+    languages: list[str] | None = None,
+    dataset_name: str | None = None,
+    dataset_split: str = "test",
     runner_kwargs: dict[str, Any] | None = None,
 ) -> list:
     """
@@ -37,6 +40,17 @@ def run_humaneval_agent(
     dataset_cfg = HumanEvalDatasetConfig()
     if dataset_path:
         dataset_cfg.path = dataset_path
+    else:
+        if dataset_name:
+            dataset_cfg.dataset_name = dataset_name
+        dataset_cfg.split = dataset_split
+        if languages:
+            if len(languages) == 1:
+                dataset_cfg.language = languages[0]
+                dataset_cfg.languages = None
+            else:
+                dataset_cfg.languages = languages
+                dataset_cfg.language = None
     if limit is not None:
         dataset_cfg.limit = limit
     if task_ids:

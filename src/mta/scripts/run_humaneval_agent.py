@@ -71,7 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=32, help="Thread pool size used for environment interactions.")
 
     # Dataset options
-    parser.add_argument("--dataset-path", default=None, help="Path to a HumanEval jsonl(.gz) file. Defaults to bundled dataset.")
+    parser.add_argument("--dataset-path", default=None, help="Path to a HumanEval jsonl(.gz) file. If omitted, the HuggingFace dataset is used.")
+    parser.add_argument("--dataset-name", default="bigcode/humanevalpack", help="HuggingFace dataset identifier to load when no dataset path is provided.")
+    parser.add_argument("--dataset-split", default="test", help="Dataset split to load from the HuggingFace dataset.")
+    parser.add_argument("--language", action="append", dest="languages", default=None, help="Dataset language configuration (repeatable).")
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of tasks processed.")
     parser.add_argument("--task-id", action="append", dest="task_ids", default=None, help="Specific HumanEval task_id to run (repeatable).")
 
@@ -149,6 +152,16 @@ def main() -> None:
         dataset_cfg.limit = args.limit
     if args.task_ids:
         dataset_cfg.task_ids = args.task_ids
+    if not args.dataset_path:
+        dataset_cfg.dataset_name = args.dataset_name
+        dataset_cfg.split = args.dataset_split
+        if args.languages:
+            if len(args.languages) == 1:
+                dataset_cfg.language = args.languages[0]
+                dataset_cfg.languages = None
+            else:
+                dataset_cfg.languages = args.languages
+                dataset_cfg.language = None
 
     try:
         trajectories = runner.run_dataset(dataset_cfg)

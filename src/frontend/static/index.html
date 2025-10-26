@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MTA 前端</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <h1>Multi-task Agent 控制台</h1>
+
+      <section class="panel">
+        <label class="input-label" for="task-select">选择任务</label>
+        <select id="task-select" class="input-field" disabled>
+          <option value="">加载中...</option>
+        </select>
+      </section>
+
+      <section class="panel">
+        <label class="input-label">参数设置</label>
+        <div id="params-container" class="params-grid">
+          <div class="empty-hint">请选择任务以查看并编辑参数</div>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="run-button" class="primary-button" disabled>Run</button>
+        <span id="status-text" class="status-text">请选择任务</span>
+      </section>
+
+      <section class="panel">
+        <label class="input-label" for="output-area">输出</label>
+        <textarea
+          id="output-area"
+          class="output-area"
+          rows="16"
+          readonly
+        ></textarea>
+      </section>
+    </main>
+  </body>
+</html>
