@@ -33,12 +33,11 @@ class HF_LLM:
             top_p=self.generation_kwargs.get("top_p", 0.9),
             do_sample=self.generation_kwargs.get("do_sample", True)
         )
-        self.stop_sequence = self.generation_kwargs.get("stop", "\n")
         self.format_guard = self.generation_kwargs.get(
             "format_guard", "" # empty by default
         )
 
-    def __call__(self, prompt: str) -> str:
+    def __call__(self, prompt: str,  stop: str="\n") -> str:
         """
         Completes from your existing ReAct prompt and returns exactly two lines:
         'Thought: ...' and 'Action: ...'
@@ -57,8 +56,8 @@ class HF_LLM:
         completion = self.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
         # Stop
-        if self.stop_sequence in completion:
-            completion = completion.split(self.stop_sequence)[0]
+        if stop in completion:
+            completion = completion.split(stop)[0]
 
         return completion
 

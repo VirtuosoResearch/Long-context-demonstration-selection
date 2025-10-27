@@ -13,7 +13,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = device_arg
 
 import logging
 from datetime import datetime
-from webshop_env import WebshopEnv
+from envs.webshop_env import WebshopEnv
 from llm_utils.prompts_webshop import prompt1, prompt1_actonly
 from llm_utils.language_models import HF_LLM
 

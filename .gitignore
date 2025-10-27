@@ -180,3 +180,5 @@ datasets/
 *.txt
 ./notebooks/samples
 ReAct/
+data/
+prompts/
