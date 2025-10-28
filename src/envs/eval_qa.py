@@ -27,7 +27,7 @@ def setup_logging(log_dir="logs", args=None):
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_name_str = args.model_name.replace("/", "_") if args else "default_model"
-    log_file = os.path.join(log_dir, f"webshop_eval_model_{model_name_str}_{timestamp}.log")
+    log_file = os.path.join(log_dir, f"{args.task_name}_eval_model_{model_name_str}_{timestamp}.log")
 
     # Configure logging to write to both file and console
     logging.basicConfig(
