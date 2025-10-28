@@ -8,7 +8,11 @@ from bs4 import BeautifulSoup
 # import wikipedia
 
 def clean_str(p):
-  return p.encode().decode("unicode-escape").encode("latin1").decode("utf-8")
+  try:
+    return p.encode().decode("unicode-escape").encode("latin1").decode("utf-8")
+  except Exception as e:
+    print(f"[DEBUG] clean_str failed with error: {e}, returning original string")
+    return p  # Return original if encoding fails
 
 
 class textSpace(gym.spaces.Space):
@@ -89,17 +93,30 @@ class WikiEnv(gym.Env):
   def search_step(self, entity):
     entity_ = entity.replace(" ", "+")
     search_url = f"https://en.wikipedia.org/w/index.php?search={entity_}"
+    print(f"[DEBUG] Searching for entity: '{entity}' at URL: {search_url}")
+    
+    # Set User-Agent header as required by Wikipedia
+    headers = {
+        'User-Agent': 'WikiEnvBot/1.0 (Educational Research Project; Python/requests)'
+    }
+    
     old_time = time.time()
-    response_text = requests.get(search_url).text
+    response = requests.get(search_url, headers=headers, timeout=10)
+    response_text = response.text
+    print(f"[DEBUG] Response status: {response.status_code}")
     self.search_time += time.time() - old_time
     self.num_searches += 1
+    print(f"[DEBUG] Response received (length={len(response_text)})")
     soup = BeautifulSoup(response_text, features="html.parser")
     result_divs = soup.find_all("div", {"class": "mw-search-result-heading"})
+    print(f"[DEBUG] Found {len(result_divs)} search result divs")
     if result_divs:  # mismatch
       self.result_titles = [clean_str(div.get_text().strip()) for div in result_divs]
       self.obs = f"Could not find {entity}. Similar: {self.result_titles[:5]}."
+      print(f"[DEBUG] Set obs (mismatch case): {self.obs}")
     else:
       page = [p.get_text().strip() for p in soup.find_all("p") + soup.find_all("ul")]
+      print(f"[DEBUG] Found {len(page)} paragraphs/lists")
       if any("may refer to:" in p for p in page):
         self.search_step("[" + entity + "]")
       else:
@@ -109,7 +126,18 @@ class WikiEnv(gym.Env):
             self.page += clean_str(p)
             if not p.endswith("\n"):
               self.page += "\n"
+        print(f"[DEBUG] Page content length: {len(self.page)}")
+        if len(self.page.strip()) == 0:
+          print(f"[DEBUG] WARNING: Page is empty! Found {len(page)} paragraphs but none had >2 words")
+          # Add all paragraphs regardless of length
+          for p in page[:10]:  # Take first 10 to avoid too much noise
+            if p.strip():
+              self.page += clean_str(p) + "\n"
+          print(f"[DEBUG] After fallback, page length: {len(self.page)}")
         self.obs = self.get_page_obs(self.page)
+        if len(self.obs.strip()) == 0:
+          self.obs = f"Found page for {entity} but it appears to be empty or improperly formatted."
+        print(f"[DEBUG] Set obs (success case): {self.obs[:100]}..." if len(self.obs) > 100 else f"[DEBUG] Set obs (success case): {self.obs}")
         self.lookup_keyword = self.lookup_list = self.lookup_cnt = None
   
   def step(self, action):
