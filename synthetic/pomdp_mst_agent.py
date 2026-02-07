@@ -41,6 +41,7 @@ class POMDPMSTAgent:
         self.print_io = print_io
 
     def action(self, state: AgentState) -> Action:
+        self._log_step_start(state)
         prompt = self._build_prompt(state)
         llm_output = self.llm(prompt) if self.llm is not None else ""
         parsed = self._parse_action(llm_output)
@@ -56,30 +57,74 @@ class POMDPMSTAgent:
                     "chosen_action": chosen,
                 }
             )
-        if self.print_io:
-            print(f"\n=== task {state.task_id} step {state.steps} ===")
-            print("PROMPT:")
-            print(prompt)
-            print("OUTPUT:")
-            print(llm_output)
-            print(f"PARSED: {parsed}")
-            print(f"CHOSEN: {chosen}")
+        self._log_llm(prompt, llm_output, parsed, chosen)
         if parsed is not None:
             return parsed
         return chosen
 
+    def log_transition(self, info: dict) -> None:
+        if not self.print_io:
+            return
+        print("TRANSITION:")
+        print(json.dumps(info, ensure_ascii=True))
+
+    def log_done(self, reward: float, state: AgentState) -> None:
+        if not self.print_io:
+            return
+        print("DONE:")
+        print(json.dumps({"reward": reward, "steps": state.steps}, ensure_ascii=True))
+
+    def _log_step_start(self, state: AgentState) -> None:
+        if not self.print_io:
+            return
+        print(f"\n=== task {state.task_id} step {state.steps} ===")
+        print("STATE:")
+        print(
+            json.dumps(
+                {
+                    "observation": state.observation,
+                    "history": state.history,
+                    "selected_edges": state.selected_edges,
+                    "known_endpoints": {str(k): list(v) for k, v in state.known_endpoints.items()},
+                },
+                ensure_ascii=True,
+            )
+        )
+
+    def _log_llm(
+        self,
+        prompt: str,
+        llm_output: str,
+        parsed: Action | None,
+        chosen: Action,
+    ) -> None:
+        if not self.print_io:
+            return
+        print("PROMPT:")
+        print(prompt)
+        print("OUTPUT:")
+        print(llm_output)
+        print(f"PARSED: {parsed}")
+        print(f"ACTION: {chosen}")
+
     def _build_prompt(self, state: AgentState) -> str:
         obs = state.observation
-        payload = {
-            "num_nodes": obs["num_nodes"],
-            "num_edges": obs["num_edges"],
-            "edge_weights": obs["edge_weights"],
-            "selected_edges": state.selected_edges,
-            "known_endpoints": {str(k): list(v) for k, v in state.known_endpoints.items()},
-            "history_tail": state.history[-5:],
-            "instruction": "Return one action: query_edge(<idx>) or select_edge(<idx>).",
-        }
-        return json.dumps(payload, ensure_ascii=True)
+        known_endpoints = {str(k): list(v) for k, v in state.known_endpoints.items()}
+        history_tail = state.history[-5:]
+        lines = [
+            "You are solving a hidden-graph MST task.",
+            f"Nodes: {obs['num_nodes']}",
+            f"Edges: {obs['num_edges']}",
+            f"Edge weights (by index 0..{obs['num_edges'] - 1}): {obs['edge_weights']}",
+            f"Selected edges: {state.selected_edges}",
+            f"Known endpoints (edge_index -> [u,v]): {known_endpoints}",
+            f"Recent history: {history_tail}",
+            "Choose one action:",
+            "- query_edge(<idx>)",
+            "- select_edge(<idx>)",
+            "Return ONLY one action in that exact format.",
+        ]
+        return "\n".join(lines)
 
     def _parse_action(self, text: str) -> Action | None:
         if not text:
@@ -195,13 +240,14 @@ class POMDPMSTEnvironment:
 def run_episode(entry: dict, agent: POMDPMSTAgent, max_steps: int = 30) -> dict:
     env = POMDPMSTEnvironment(entry)
     state = env.initial_state()
-
     while True:
         action = agent.action(state)
-        state, _ = env.transition(state, action)
+        state, info = env.transition(state, action)
+        agent.log_transition(info)
         done = env.is_done(state, max_steps)
         if done:
             reward = env.reward(state, done=True)
+            agent.log_done(reward, state)
             return {
                 "task_id": entry["task_id"],
                 "selected_edges": state.selected_edges,
