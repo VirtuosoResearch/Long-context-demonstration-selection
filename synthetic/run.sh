@@ -1,0 +1,1 @@
+python run_pomdp_mst_agent.py --print-io --limit 100 --model-name Qwen/Qwen2.5-3B-Instruct

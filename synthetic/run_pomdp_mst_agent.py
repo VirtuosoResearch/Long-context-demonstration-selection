@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-"""
-Run the POMDP MST agent on a JSON dataset.
-"""
 
 from __future__ import annotations
 
@@ -91,35 +87,15 @@ def run_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run POMDP MST agent on a JSON dataset.")
-    parser.add_argument(
-        "--dataset-path",
-        default=os.path.join("..", "notebooks", "pomdp_mst_synthetic.json"),
-        help="Path to the JSON dataset.",
-    )
-    parser.add_argument(
-        "--output-path",
-        default="pomdp_mst_agent_results.json",
-        help="Path to write per-episode results.",
-    )
-    parser.add_argument("--max-steps", type=int, default=30, help="Maximum steps per episode.")
-    parser.add_argument(
-        "--model-name",
-        default="Qwen/Qwen2.5-1.5B",
-        help="HuggingFace model name or local path.",
-    )
-    parser.add_argument("--max-new-tokens", type=int, default=32, help="Max new tokens per step.")
+    parser.add_argument("--dataset-path", default=os.path.join("..", "notebooks", "pomdp_mst_synthetic.json"), help="Path to the JSON dataset.")
+    parser.add_argument("--output-path", default="pomdp_mst_agent_results.json", help="Path to write per-episode results.")
+    parser.add_argument("--max-steps", type=int, default=50, help="Maximum steps per episode.")
+    parser.add_argument("--model-name", default="Qwen/Qwen2.5-1.5B", help="HuggingFace model name or local path.")
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N entries.")
-    parser.add_argument(
-        "--trace-path",
-        default=None,
-        help="Write per-step LLM inputs/outputs to this JSONL file.",
-    )
-    parser.add_argument(
-        "--print-io",
-        action="store_true",
-        help="Print LLM prompt/output to stdout each step.",
-    )
+    parser.add_argument("--trace-path", default=None, help="Write per-step LLM inputs/outputs to this JSONL file.")
+    parser.add_argument("--print-io", action="store_true", help="Print LLM prompt/output to stdout each step.")
     parser.add_argument("--log-level", default="INFO", help="Root logging level.")
+    parser.add_argument("--max-new-tokens", type=int, default=500, help="Max new tokens per step.")
     return parser.parse_args()
 
 
