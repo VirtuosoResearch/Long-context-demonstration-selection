@@ -164,16 +164,12 @@ def format_dataset(records: list[dict]) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a synthetic POMDP MST dataset for K5 graphs.")
     parser.add_argument("--num-samples", type=int, default=500, help="Number of graph instances to generate.")
-    parser.add_argument("--min-nodes", type=int, default=5, help="Minimum nodes per complete graph.")
-    parser.add_argument("--max-nodes", type=int, default=7, help="Maximum nodes per complete graph.")
+    parser.add_argument("--min-nodes", type=int, default=4, help="Minimum nodes per complete graph.")
+    parser.add_argument("--max-nodes", type=int, default=5, help="Maximum nodes per complete graph.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducibility.")
     parser.add_argument("--weight-min", type=int, default=1, help="Minimum integer edge weight.")
     parser.add_argument("--weight-max", type=int, default=9, help="Maximum integer edge weight.")
-    parser.add_argument(
-        "--output-path",
-        default="pomdp_mst_synthetic.json",
-        help="Output JSON file path.",
-    )
+    parser.add_argument("--output-path", default="pomdp_mst_synthetic.json", help="Output JSON file path.")
     parser.add_argument("--log-level", default="INFO", help="Root logging level.")
     return parser.parse_args()
 

@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import random
 from typing import Callable
 
 import torch
@@ -21,6 +22,68 @@ def load_dataset(path: str) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError("Dataset JSON must be a list of entries.")
     return data
+
+
+def _describe_trajectory(record: dict) -> str:
+    obs = record.get("observation", {})
+    weights = obs.get("edge_weights", [])
+    reward = record.get("reward")
+    parts = [f"Example with edge weights {weights}"]
+    steps = record.get("trajectory", [])
+    for step in steps:
+        action = step.get("action")
+        result = step.get("result", {})
+        if not action or not isinstance(action, list) or len(action) != 2:
+            continue
+        verb, idx = action[0], action[1]
+        if verb == "query_edge":
+            endpoints = result.get("endpoints")
+            if isinstance(endpoints, list) and len(endpoints) == 2:
+                parts.append(f"action: query_edge({idx}), result: endpoints {tuple(endpoints)}")
+            else:
+                parts.append(f"action: query_edge({idx}), result: endpoints unknown")
+        elif verb == "select_edge":
+            ok = result.get("ok")
+            reason = result.get("reason")
+            if ok is True:
+                parts.append(f"action: select_edge({idx}), result: added")
+            else:
+                reason_str = reason if reason is not None else "unknown"
+                parts.append(f"action: select_edge({idx}), result: failed ({reason_str})")
+    if isinstance(reward, (int, float)):
+        parts.append(f"reward {reward:.3f}")
+    return "; ".join(parts) + "."
+
+
+def _load_trajectory_examples(
+    success_path: str | None,
+    suboptimal_path: str | None,
+    ratio: float,
+    count: int,
+    seed: int,
+) -> list[str]:
+    rng = random.Random(seed)
+    success_records: list[dict] = []
+    suboptimal_records: list[dict] = []
+    if success_path:
+        with open(success_path, encoding="utf-8") as f:
+            success_records = json.load(f)
+    if suboptimal_path:
+        with open(suboptimal_path, encoding="utf-8") as f:
+            suboptimal_records = json.load(f)
+
+    ratio = min(max(ratio, 0.0), 1.0)
+    num_success = int(round(count * ratio))
+    num_suboptimal = max(count - num_success, 0)
+
+    examples: list[str] = []
+    if success_records and num_success > 0:
+        picks = rng.sample(success_records, k=min(num_success, len(success_records)))
+        examples.extend(_describe_trajectory(rec) for rec in picks)
+    if suboptimal_records and num_suboptimal > 0:
+        picks = rng.sample(suboptimal_records, k=min(num_suboptimal, len(suboptimal_records)))
+        examples.extend(_describe_trajectory(rec) for rec in picks)
+    return examples
 
 
 def build_llm(model_name: str, max_new_tokens: int) -> Callable[[str], str]:
@@ -73,8 +136,11 @@ def run_dataset(
     limit: int | None,
     trace: list[dict] | None,
     print_io: bool,
+    trajectory_examples: list[str] | None,
 ) -> list[dict]:
-    agent = POMDPMSTAgent(llm=llm, trace=trace, print_io=print_io)
+    agent = POMDPMSTAgent(
+        llm=llm, trace=trace, print_io=print_io, trajectory_examples=trajectory_examples
+    )
     print("Successfully built agent")
     if limit is not None:
         dataset = dataset[:limit]
@@ -96,6 +162,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-io", action="store_true", help="Print LLM prompt/output to stdout each step.")
     parser.add_argument("--log-level", default="INFO", help="Root logging level.")
     parser.add_argument("--max-new-tokens", type=int, default=500, help="Max new tokens per step.")
+    parser.add_argument("--trajectory-success-path", default=None, help="Path to successful trajectory JSON.")
+    parser.add_argument("--trajectory-suboptimal-path", default=None, help="Path to suboptimal trajectory JSON.")
+    parser.add_argument("--trajectory-success-ratio", type=float, default=1.0, help="Ratio of successful trajectories in prompt examples (1.0=all success, 0.0=all suboptimal).",)
+    parser.add_argument("--trajectory-count", type=int, default=10, help="Number of trajectories to include.")
+    parser.add_argument("--trajectory-seed", type=int, default=7, help="Random seed for sampling trajectories.")
     return parser.parse_args()
 
 
@@ -110,6 +181,13 @@ def main() -> None:
     llm = build_llm(args.model_name, args.max_new_tokens)
     print("Successfully built LLM: ", args.model_name)
     trace: list[dict] | None = [] if args.trace_path else None
+    trajectory_examples = _load_trajectory_examples(
+        args.trajectory_success_path,
+        args.trajectory_suboptimal_path,
+        args.trajectory_success_ratio,
+        args.trajectory_count,
+        args.trajectory_seed,
+    )
     results = run_dataset(
         dataset,
         llm=llm,
@@ -117,6 +195,7 @@ def main() -> None:
         limit=args.limit,
         trace=trace,
         print_io=args.print_io,
+        trajectory_examples=trajectory_examples,
     )
 
     with open(output_path, "w", encoding="utf-8") as f:

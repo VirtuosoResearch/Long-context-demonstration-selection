@@ -28,12 +28,14 @@ class POMDPMSTAgent:
         seed: int = 7,
         trace: list[dict] | None = None,
         print_io: bool = False,
+        trajectory_examples: list[str] | None = None,
     ) -> None:
         self.llm = llm
         self.rng = random.Random(seed)
         self.trace = trace
         self.print_io = print_io
         self.last_output: str | None = None
+        self.trajectory_examples = trajectory_examples or []
 
     def action(self, state: AgentState) -> Action:
         self._log_step_start(state)
@@ -141,17 +143,12 @@ class POMDPMSTAgent:
             "- Note: any edge index not listed in known endpoints is still unknown.",
             f"- History (actions/results): {state.history}",
             f"- Previous step output: {self.last_output}",
-            # "Example (4 nodes, 6 edges):",
-            # "Step 0 state: Nodes=4, Edges=6, Weights=[1,4,3,2,5,6], Known endpoints={}.",
-            # "Step 0 action: query_edge(0) -> endpoints [0,1]",
-            # "Step 1 action: query_edge(1) -> endpoints [0,2]",
-            # "Step 2 action: query_edge(2) -> endpoints [0,3]",
-            # "Step 3 action: query_edge(3) -> endpoints [1,2]",
-            # "Step 4 action: query_edge(4) -> endpoints [1,3]",
-            # "Step 5 action: query_edge(5) -> endpoints [2,3]",
-            # "Now all edges are known. Sort by weight: idx0(1), idx3(2), idx2(3), idx1(4), idx4(5), idx5(6).",
-            # "Kruskal selections: select_edge(0) (adds 0-1), select_edge(3) (adds 1-2), skip select_edge(2) (would form cycle 0-1-2-0), select_edge(4) (adds 1-3).",
-            # "MST complete when 3 edges selected.",
+        ]
+        if self.trajectory_examples:
+            lines.append("Trajectory demonstrations:")
+            for idx, example in enumerate(self.trajectory_examples, start=1):
+                lines.append(f"{idx}. {example}")
+        lines += [
             "Rule: You mustn't repeat an action that already appears in the history!!!",
             "Let's think step by step. Show your thinking process in the response and include the action you choose in 500 tokens. You should go through all previous steps and actions to make sure you don't repeat an action that already appears in the history.",
             "Choose one action:",
