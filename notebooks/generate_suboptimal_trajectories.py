@@ -62,6 +62,16 @@ def generate_weights(
     return [rng.randint(weight_min, weight_max) for _ in range(num_edges)]
 
 
+def snapshot_state(
+    selected_edges: list[int], known_endpoints: dict[int, tuple[int, int]], steps: int
+) -> dict:
+    return {
+        "selected_edges": list(selected_edges),
+        "known_endpoints": {str(k): [u, v] for k, (u, v) in known_endpoints.items()},
+        "steps": steps,
+    }
+
+
 def build_suboptimal_trajectory(
     num_nodes: int,
     edges: list[tuple[int, int]],
@@ -75,6 +85,7 @@ def build_suboptimal_trajectory(
     trajectory: list[dict] = []
     selected_edges: list[int] = []
     steps = 0
+    known_endpoints: dict[int, tuple[int, int]] = {}
 
     for edge_idx in ordered_edges:
         if steps >= max_steps or len(selected_edges) == num_nodes - 1:
@@ -82,18 +93,27 @@ def build_suboptimal_trajectory(
 
         u, v = edges[edge_idx]
         trajectory.append(
-            {"action": ["query_edge", edge_idx], "result": {"ok": True, "endpoints": [u, v]}}
+            {
+                "state": snapshot_state(selected_edges, known_endpoints, steps),
+                "action": ["query_edge", edge_idx],
+                "result": {"ok": True, "endpoints": [u, v]},
+            }
         )
         steps += 1
+        known_endpoints[edge_idx] = (u, v)
         if steps >= max_steps:
             break
 
         if uf.union(u, v):
-            selected_edges.append(edge_idx)
             trajectory.append(
-                {"action": ["select_edge", edge_idx], "result": {"ok": True, "reason": "added"}}
+                {
+                    "state": snapshot_state(selected_edges, known_endpoints, steps),
+                    "action": ["select_edge", edge_idx],
+                    "result": {"ok": True, "reason": "added"},
+                }
             )
             steps += 1
+            selected_edges.append(edge_idx)
 
     return trajectory
 

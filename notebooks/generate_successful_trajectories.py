@@ -64,6 +64,16 @@ def generate_weights(
     return [rng.randint(weight_min, weight_max) for _ in range(num_edges)]
 
 
+def snapshot_state(
+    selected_edges: list[int], known_endpoints: dict[int, tuple[int, int]], steps: int
+) -> dict:
+    return {
+        "selected_edges": list(selected_edges),
+        "known_endpoints": {str(k): [u, v] for k, (u, v) in known_endpoints.items()},
+        "steps": steps,
+    }
+
+
 def build_successful_trajectory(
     num_nodes: int, edges: list[tuple[int, int]], weights: list[int]
 ) -> list[dict]:
@@ -74,6 +84,8 @@ def build_successful_trajectory(
     trajectory: list[dict] = []
     selected_edges: list[int] = []
     queried: set[int] = set()
+    known_endpoints: dict[int, tuple[int, int]] = {}
+    steps = 0
 
     for edge_idx in ordered_edges:
         if len(selected_edges) == num_nodes - 1:
@@ -83,13 +95,24 @@ def build_successful_trajectory(
         queried.add(edge_idx)
         u, v = edges[edge_idx]
         trajectory.append(
-            {"action": ["query_edge", edge_idx], "result": {"ok": True, "endpoints": [u, v]}}
+            {
+                "state": snapshot_state(selected_edges, known_endpoints, steps),
+                "action": ["query_edge", edge_idx],
+                "result": {"ok": True, "endpoints": [u, v]},
+            }
         )
+        steps += 1
+        known_endpoints[edge_idx] = (u, v)
         if uf.union(u, v):
-            selected_edges.append(edge_idx)
             trajectory.append(
-                {"action": ["select_edge", edge_idx], "result": {"ok": True, "reason": "added"}}
+                {
+                    "state": snapshot_state(selected_edges, known_endpoints, steps),
+                    "action": ["select_edge", edge_idx],
+                    "result": {"ok": True, "reason": "added"},
+                }
             )
+            steps += 1
+            selected_edges.append(edge_idx)
 
     return trajectory
 
