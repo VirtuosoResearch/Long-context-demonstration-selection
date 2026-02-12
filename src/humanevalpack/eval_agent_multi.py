@@ -18,6 +18,93 @@ def strip_non_code(text: str) -> str:
     text = re.sub(r"\s*```$", "", text.strip())
     return text.strip()
 
+def print_input_token_attribution(
+    gen: TransformersGenerator,
+    input_text: str,
+    completion_text: str,
+    method: str = "grad_x_input",
+    ig_steps: int = 20,
+) -> None:
+    import torch
+    import torch.nn.functional as F
+
+    model = gen.model
+    tokenizer = gen.tokenizer
+    device = model.device
+
+    model.eval()
+    with torch.enable_grad():
+        input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
+        completion_ids = tokenizer(
+            completion_text, return_tensors="pt", add_special_tokens=False
+        ).input_ids.to(device)
+
+        max_pos = getattr(model.config, "max_position_embeddings", None)
+        if max_pos is not None:
+            allowed = max_pos - input_ids.shape[1]
+            if allowed <= 0:
+                print("  Attribution skipped: input too long for model context.")
+                return
+            if completion_ids.shape[1] > allowed:
+                completion_ids = completion_ids[:, :allowed]
+
+        full_ids = torch.cat([input_ids, completion_ids], dim=1)
+        attention_mask = torch.ones_like(full_ids)
+
+        model.zero_grad(set_to_none=True)
+        inputs_embeds = model.get_input_embeddings()(full_ids)
+        inputs_embeds.requires_grad_(True)
+
+        def compute_loss(embeds: torch.Tensor) -> torch.Tensor:
+            outputs = model(inputs_embeds=embeds, attention_mask=attention_mask)
+            logits = outputs.logits
+            labels = full_ids.clone()
+            labels[:, : input_ids.shape[1]] = -100
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            return F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+
+        if method == "integrated_gradients":
+            baseline = torch.zeros_like(inputs_embeds)
+            total_grads = torch.zeros_like(inputs_embeds)
+            steps = max(1, ig_steps)
+            for step in range(1, steps + 1):
+                alpha = step / steps
+                scaled = (baseline + alpha * (inputs_embeds - baseline)).detach().requires_grad_(True)
+                model.zero_grad(set_to_none=True)
+                loss = compute_loss(scaled)
+                loss.backward()
+                if scaled.grad is not None:
+                    total_grads += scaled.grad.detach()
+            avg_grads = total_grads / steps
+            attributions = ((inputs_embeds - baseline) * avg_grads).sum(dim=-1)[0, : input_ids.shape[1]].detach().cpu().tolist()
+        else:
+            model.zero_grad(set_to_none=True)
+            inputs_embeds.retain_grad()
+            loss = compute_loss(inputs_embeds)
+            loss.backward()
+            grads = inputs_embeds.grad
+            attributions = (grads * inputs_embeds).sum(dim=-1)[0, : input_ids.shape[1]].detach().cpu().tolist()
+        token_ids = input_ids[0].detach().cpu().tolist()
+        decoded = [tokenizer.decode([tid]) for tid in token_ids]
+
+        print("  Input text:")
+        print(input_text)
+        top_k = min(30, len(attributions))
+        top_indices = sorted(range(len(attributions)), key=lambda i: attributions[i], reverse=True)[:top_k]
+        print(f"  Top {top_k} input tokens by influence:")
+        for idx in top_indices:
+            print(f" {idx:04d} | text={decoded[idx]!r} | influence={attributions[idx]:.6f}")
+
+        print(f"  Input token attribution (text + influence) [{method}]:")
+        for idx, (dec, score) in enumerate(zip(decoded, attributions)):
+            print(f" {idx:04d} | text={dec!r} | influence={score:.6f}")
+
 @dataclass
 class TaskResult:
     task_id: str
@@ -52,6 +139,7 @@ def main(args):
         print(f"[{i+1}/{total}] {task_id}")
 
         # First attempt
+        input_text_for_completion = gen._make_inputs(prompt, args.lang)
         completion = gen.generate(prompt, args.lang, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
         completion = strip_non_code(completion)
 
@@ -87,6 +175,7 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
+                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
                         completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
@@ -108,6 +197,7 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
+                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
                         completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
@@ -131,6 +221,7 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
+                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
                         completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
@@ -157,6 +248,7 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
+                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
                         completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
@@ -169,6 +261,14 @@ def main(args):
             if ok_run:
                 passed = True
                 print(f"  Passed on attempt {attempt}")
+                if args.print_attribution:
+                    print_input_token_attribution(
+                        gen,
+                        input_text_for_completion,
+                        completion,
+                        method=args.attribution_method,
+                        ig_steps=args.ig_steps,
+                    )
                 shutil.rmtree(work_dir, ignore_errors=True)
                 break
             else:
@@ -181,6 +281,7 @@ def main(args):
                         f"Feedback:\n{last_error}"
                     )
                     history_text = "\n\n".join(attempt_history)
+                    input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
                     completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                             max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                     completion = strip_non_code(completion)
@@ -212,5 +313,8 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=5, help="Seconds per run attempt.")
     parser.add_argument("--limit", type=int, default=0, help="If >0, only evaluate first N tasks.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--print_attribution", action="store_true", help="Print input token attribution after a pass.")
+    parser.add_argument("--attribution_method", type=str, choices=["grad_x_input", "integrated_gradients"], default="grad_x_input")
+    parser.add_argument("--ig_steps", type=int, default=20, help="Steps for Integrated Gradients.")
     args = parser.parse_args()
     main(args)
