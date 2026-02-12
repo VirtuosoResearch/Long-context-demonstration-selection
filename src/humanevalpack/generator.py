@@ -92,7 +92,7 @@ class TransformersGenerator(Generator):
         else:
             return sys_inst + "\n\n" + user_inst + "\n\n" + task_prompt
 
-    def _make_repair_inputs(self, task_prompt: str, prev_code: str, error_msg: str, lang: str) -> str:
+    def _make_repair_inputs(self, task_prompt: str, prev_code: str, error_msg: str, lang: str, history: str = "") -> str:
         repair_inst = (
             "The previous attempt failed to compile or failed tests. Read the error/trace and output a corrected version.\n"
             "Return ONLY valid code; no comments; no markdown fences."
@@ -107,12 +107,14 @@ class TransformersGenerator(Generator):
         elif lang == "python":
             repair_inst = "Language: Python.\n" + repair_inst
         elif lang == "java":
-            repair_inst = "Language: Python.\n" + repair_inst
+            repair_inst = "Language: Java.\n" + repair_inst
         elif lang == "cpp":
             repair_inst = "Language: C++.\n" + repair_inst
 
+        history_block = f"### ATTEMPT HISTORY\n{history.strip()}\n\n" if history and history.strip() else ""
         context = (
             f"### PROMPT\n{task_prompt}\n\n"
+            f"{history_block}"
             f"### PREVIOUS CODE\n{prev_code}\n\n"
             f"### COMPILER/RUNTIME OUTPUT\n{error_msg}\n\n"
             f"### FIXED CODE"
@@ -153,10 +155,10 @@ class TransformersGenerator(Generator):
         tail = self._tail_from_generated(input_ids, text)
         return self._strip_fences(tail)
 
-    def repair(self, task_prompt: str, prev_code: str, error_msg: str, lang: str,
+    def repair(self, task_prompt: str, prev_code: str, error_msg: str, lang: str, history: str = "",
                max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
         import torch
-        inputs = self._make_repair_inputs(task_prompt, prev_code, error_msg, lang)
+        inputs = self._make_repair_inputs(task_prompt, prev_code, error_msg, lang, history)
         input_ids = self.tokenizer(inputs, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(

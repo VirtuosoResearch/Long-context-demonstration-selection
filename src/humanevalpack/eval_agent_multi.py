@@ -30,7 +30,9 @@ def main(args):
     print("Model:", args.model)
     ds = load_dataset("bigcode/humanevalpack", cfg, split="test")
     gen = TransformersGenerator(args.model)
-    tmp_root = tempfile.mkdtemp(prefix=f"humanevalpack_{args.lang}_eval_")
+    cache_root = os.path.join(os.path.dirname(__file__), "cache")
+    os.makedirs(cache_root, exist_ok=True)
+    tmp_root = tempfile.mkdtemp(prefix=f"humanevalpack_{args.lang}_eval_", dir=cache_root)
     results: List[TaskResult] = []
 
     total = len(ds) if args.limit <= 0 else min(args.limit, len(ds))
@@ -56,6 +58,7 @@ def main(args):
         passed = False
         attempts = 0
         last_error = ""
+        attempt_history: List[str] = []
 
         for attempt in range(1, args.num_iter + 1):
             attempts = attempt
@@ -78,7 +81,13 @@ def main(args):
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                     if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error, args.lang,
+                        attempt_history.append(
+                            f"Attempt {attempt}\n"
+                            f"Code:\n{completion}\n\n"
+                            f"Feedback:\n{last_error}"
+                        )
+                        history_text = "\n\n".join(attempt_history)
+                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -93,7 +102,13 @@ def main(args):
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                     if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error, args.lang,
+                        attempt_history.append(
+                            f"Attempt {attempt}\n"
+                            f"Code:\n{completion}\n\n"
+                            f"Feedback:\n{last_error}"
+                        )
+                        history_text = "\n\n".join(attempt_history)
+                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -110,7 +125,13 @@ def main(args):
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                     if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error, args.lang,
+                        attempt_history.append(
+                            f"Attempt {attempt}\n"
+                            f"Code:\n{completion}\n\n"
+                            f"Feedback:\n{last_error}"
+                        )
+                        history_text = "\n\n".join(attempt_history)
+                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -130,7 +151,13 @@ def main(args):
                     last_error = compile_msg[-2000:] if compile_msg else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                     if attempt < args.num_iter:
-                        completion = gen.repair(prompt, completion, last_error, args.lang,
+                        attempt_history.append(
+                            f"Attempt {attempt}\n"
+                            f"Code:\n{completion}\n\n"
+                            f"Feedback:\n{last_error}"
+                        )
+                        history_text = "\n\n".join(attempt_history)
+                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -148,7 +175,13 @@ def main(args):
                 last_error = msg[-2000:] if msg else ""
                 print(f"  Failed attempt {attempt}." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
                 if attempt < args.num_iter:
-                    completion = gen.repair(prompt, completion, last_error, args.lang,
+                    attempt_history.append(
+                        f"Attempt {attempt}\n"
+                        f"Code:\n{completion}\n\n"
+                        f"Feedback:\n{last_error}"
+                    )
+                    history_text = "\n\n".join(attempt_history)
+                    completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
                                             max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                     completion = strip_non_code(completion)
             shutil.rmtree(work_dir, ignore_errors=True)
