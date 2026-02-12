@@ -18,6 +18,63 @@ def strip_non_code(text: str) -> str:
     text = re.sub(r"\s*```$", "", text.strip())
     return text.strip()
 
+
+def _safe_task_dirname(task_id: str, index: int) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_id).strip("_")
+    if not safe:
+        safe = f"task_{index:03d}"
+    return f"{index:03d}_{safe}"
+
+
+def _lang_extension(lang: str) -> str:
+    return {
+        "python": "py",
+        "js": "js",
+        "go": "go",
+        "rust": "rs",
+        "java": "java",
+        "cpp": "cpp",
+    }.get(lang, "txt")
+
+def build_demonstrations(lang_counts: dict) -> Tuple[str, List[Tuple[int, int, str]]]:
+    demo_text = ""
+    demo_spans: List[Tuple[int, int, str]] = []
+    order = ["python", "cpp", "java", "go"]
+    demo_index = 1
+    for lang in order:
+        count = min(lang_counts.get(lang, 0), 10)
+        if count <= 0:
+            continue
+        ds = load_dataset("bigcode/humanevalpack", lang, split="test")
+        total = len(ds)
+        start = max(0, total - 10)
+        candidates = [ds[i] for i in range(start, total)]
+        chosen = candidates[-count:]
+        for ex in chosen:
+            task_id = ex.get("task_id", "")
+            prompt = ex.get("prompt") or ex.get("declaration") or ""
+            solution = ex.get("canonical_solution", "") or ""
+            block = (
+                f"### DEMONSTRATION {demo_index} ({lang}) {task_id}\n"
+                f"{prompt}\n"
+                f"### SOLUTION\n"
+                f"{solution}\n"
+            )
+            start_pos = len(demo_text)
+            demo_text += block + "\n"
+            end_pos = len(demo_text)
+            demo_spans.append((start_pos, end_pos, f"demo_{demo_index}_{lang}_{task_id}".strip("_")))
+            demo_index += 1
+    return demo_text.strip(), demo_spans
+
+def map_demo_spans_to_input(input_text: str, demo_text: str, demo_spans: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
+    if not demo_text or not demo_spans:
+        return []
+    base = input_text.find(demo_text)
+    if base < 0:
+        return []
+    return [(base + start, base + end, label) for start, end, label in demo_spans]
+
 def print_input_token_attribution(
     gen: TransformersGenerator,
     input_text: str,
@@ -25,6 +82,7 @@ def print_input_token_attribution(
     method: str = "grad_x_input",
     ig_steps: int = 20,
     show_sentence_level: bool = False,
+    demo_spans: Optional[List[Tuple[int, int, str]]] = None,
 ) -> None:
     import torch
     import torch.nn.functional as F
@@ -106,6 +164,33 @@ def print_input_token_attribution(
 
         print("  Input text:")
         print(input_text)
+        offsets = None
+        if show_sentence_level or demo_spans:
+            try:
+                offsets = tokenizer(input_text, return_offsets_mapping=True).offset_mapping
+            except Exception:
+                offsets = None
+
+        if demo_spans:
+            print("  Demonstration-level attribution:")
+            if offsets is None:
+                print("    (offset mapping unavailable; demo-level attribution skipped)")
+            else:
+                demo_scores = [0.0 for _ in demo_spans]
+                for idx, (tok_start, tok_end) in enumerate(offsets):
+                    if tok_end <= tok_start:
+                        continue
+                    for d_idx, (d_start, d_end, _) in enumerate(demo_spans):
+                        if tok_start >= d_end or tok_end <= d_start:
+                            continue
+                        demo_scores[d_idx] += attributions[idx]
+                        break
+                order = sorted(range(len(demo_spans)), key=lambda i: demo_scores[i], reverse=True)
+                for rank, d_idx in enumerate(order, start=1):
+                    label = demo_spans[d_idx][2]
+                    print(f"    {rank:03d} | influence={demo_scores[d_idx]:.6f} | label={label}")
+            return
+
         if show_sentence_level:
             print("  Sentence-level attribution:")
             sentence_units = []
@@ -132,11 +217,6 @@ def print_input_token_attribution(
                         sentence_units.append((cursor, cursor + len(line), line))
                 cursor += len(line)
 
-            try:
-                offsets = tokenizer(input_text, return_offsets_mapping=True).offset_mapping
-            except Exception:
-                offsets = None
-
             if offsets is None:
                 print("    (offset mapping unavailable; sentence-level attribution skipped)")
             else:
@@ -149,10 +229,10 @@ def print_input_token_attribution(
                             continue
                         sent_scores[s_idx] += attributions[idx]
                         break
-            order = sorted(range(len(sentence_units)), key=lambda i: sent_scores[i], reverse=True)
-            for rank, s_idx in enumerate(order, start=1):
-                sent = sentence_units[s_idx][2]
-                print(f"    {rank:03d} | influence={sent_scores[s_idx]:.6f} | text={sent!r}")
+                order = sorted(range(len(sentence_units)), key=lambda i: sent_scores[i], reverse=True)
+                for rank, s_idx in enumerate(order, start=1):
+                    sent = sentence_units[s_idx][2]
+                    print(f"    {rank:03d} | influence={sent_scores[s_idx]:.6f} | text={sent!r}")
 
         if not show_sentence_level:
             top_k = min(30, len(attributions))
@@ -177,6 +257,14 @@ def main(args):
     print("Model:", args.model)
     ds = load_dataset("bigcode/humanevalpack", cfg, split="test")
     gen = TransformersGenerator(args.model)
+    demo_text, demo_spans = build_demonstrations(
+        {
+            "python": args.demo_python,
+            "cpp": args.demo_cpp,
+            "java": args.demo_java,
+            "go": args.demo_go,
+        }
+    )
     cache_root = os.path.join(os.path.dirname(__file__), "cache")
     os.makedirs(cache_root, exist_ok=True)
     tmp_root = tempfile.mkdtemp(prefix=f"humanevalpack_{args.lang}_eval_", dir=cache_root)
@@ -191,6 +279,7 @@ def main(args):
             break
         task_id = ex["task_id"]
         prompt = ex.get("prompt") or ex.get("declaration") or ""
+        prompt_with_demos = f"{demo_text}\n\n{prompt}" if demo_text else prompt
         includes = ex.get("import", "") or "" 
         imports = ex.get("import", "") or ""
         test_setup = ex.get("test_setup", "") or ""
@@ -199,8 +288,8 @@ def main(args):
         print(f"[{i+1}/{total}] {task_id}")
 
         # First attempt
-        input_text_for_completion = gen._make_inputs(prompt, args.lang)
-        completion = gen.generate(prompt, args.lang, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+        input_text_for_completion = gen._make_inputs(prompt_with_demos, args.lang)
+        completion = gen.generate(prompt_with_demos, args.lang, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
         completion = strip_non_code(completion)
 
         passed = False
@@ -235,8 +324,8 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
+                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
+                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -257,8 +346,8 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
+                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
+                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -281,8 +370,8 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
+                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
+                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -308,8 +397,8 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
+                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
+                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
                                                 max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
@@ -322,6 +411,7 @@ def main(args):
                 passed = True
                 print(f"  Passed on attempt {attempt}")
                 if args.print_attribution:
+                    mapped_spans = map_demo_spans_to_input(input_text_for_completion, demo_text, demo_spans)
                     print_input_token_attribution(
                         gen,
                         input_text_for_completion,
@@ -329,6 +419,7 @@ def main(args):
                         method=args.attribution_method,
                         ig_steps=args.ig_steps,
                         show_sentence_level=args.sentence_level,
+                        demo_spans=mapped_spans,
                     )
                 shutil.rmtree(work_dir, ignore_errors=True)
                 break
@@ -342,11 +433,17 @@ def main(args):
                         f"Feedback:\n{last_error}"
                     )
                     history_text = "\n\n".join(attempt_history)
-                    input_text_for_completion = gen._make_repair_inputs(prompt, completion, last_error, args.lang, history=history_text)
-                    completion = gen.repair(prompt, completion, last_error, args.lang, history=history_text,
+                    input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
+                    completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
                                             max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
                     completion = strip_non_code(completion)
             shutil.rmtree(work_dir, ignore_errors=True)
+
+        task_cache_dir = os.path.join(tmp_root, _safe_task_dirname(task_id, i))
+        os.makedirs(task_cache_dir, exist_ok=True)
+        final_code_path = os.path.join(task_cache_dir, f"final_code.{_lang_extension(args.lang)}")
+        with open(final_code_path, "w", encoding="utf-8") as f:
+            f.write(completion)
 
         results.append(TaskResult(task_id=task_id, passed=passed, attempts=attempts, last_error=None if passed else last_error))
 
@@ -378,5 +475,9 @@ if __name__ == "__main__":
     parser.add_argument("--sentence_level", action="store_true", help="Also print sentence-level attribution.")
     parser.add_argument("--attribution_method", type=str, choices=["grad_x_input", "integrated_gradients"], default="grad_x_input")
     parser.add_argument("--ig_steps", type=int, default=20, help="Steps for Integrated Gradients.")
+    parser.add_argument("--demo_python", type=int, default=0, help="Number of Python demonstrations to add (from last 10).")
+    parser.add_argument("--demo_cpp", type=int, default=0, help="Number of C++ demonstrations to add (from last 10).")
+    parser.add_argument("--demo_java", type=int, default=0, help="Number of Java demonstrations to add (from last 10).")
+    parser.add_argument("--demo_go", type=int, default=0, help="Number of Go demonstrations to add (from last 10).")
     args = parser.parse_args()
     main(args)

@@ -112,11 +112,16 @@ class TransformersGenerator(Generator):
             repair_inst = "Language: C++.\n" + repair_inst
 
         history_block = f"### ATTEMPT HISTORY\n{history.strip()}\n\n" if history and history.strip() else ""
+        prev_code_block = ""
+        compiler_output_block = ""
+        if not history_block:
+            prev_code_block = f"### PREVIOUS CODE\n{prev_code}\n\n"
+            compiler_output_block = f"### COMPILER/RUNTIME OUTPUT\n{error_msg}\n\n"
         context = (
             f"### PROMPT\n{task_prompt}\n\n"
             f"{history_block}"
-            f"### PREVIOUS CODE\n{prev_code}\n\n"
-            f"### COMPILER/RUNTIME OUTPUT\n{error_msg}\n\n"
+            f"{prev_code_block}"
+            f"{compiler_output_block}"
             f"### FIXED CODE"
         )
         if self.is_chat:
