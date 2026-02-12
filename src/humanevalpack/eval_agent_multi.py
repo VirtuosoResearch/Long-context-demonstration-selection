@@ -24,6 +24,7 @@ def print_input_token_attribution(
     completion_text: str,
     method: str = "grad_x_input",
     ig_steps: int = 20,
+    show_sentence_level: bool = False,
 ) -> None:
     import torch
     import torch.nn.functional as F
@@ -51,9 +52,9 @@ def print_input_token_attribution(
         full_ids = torch.cat([input_ids, completion_ids], dim=1)
         attention_mask = torch.ones_like(full_ids)
 
-        model.zero_grad(set_to_none=True)
-        inputs_embeds = model.get_input_embeddings()(full_ids)
-        inputs_embeds.requires_grad_(True)
+        embed_layer = model.get_input_embeddings()
+        input_embeds = embed_layer(input_ids).detach()
+        completion_embeds = embed_layer(completion_ids).detach()
 
         def compute_loss(embeds: torch.Tensor) -> torch.Tensor:
             outputs = model(inputs_embeds=embeds, attention_mask=attention_mask)
@@ -70,40 +71,99 @@ def print_input_token_attribution(
             )
 
         if method == "integrated_gradients":
-            baseline = torch.zeros_like(inputs_embeds)
-            total_grads = torch.zeros_like(inputs_embeds)
+            # Keep completion embeddings fixed at true values; interpolate input only.
+            baseline_input = torch.zeros_like(input_embeds)
+            total_grads_input = torch.zeros_like(input_embeds)
             steps = max(1, ig_steps)
             for step in range(1, steps + 1):
                 alpha = step / steps
-                scaled = (baseline + alpha * (inputs_embeds - baseline)).detach().requires_grad_(True)
+                scaled_input = (
+                    baseline_input + alpha * (input_embeds - baseline_input)
+                ).detach().requires_grad_(True)
+                full_embeds = torch.cat([scaled_input, completion_embeds], dim=1)
                 model.zero_grad(set_to_none=True)
-                loss = compute_loss(scaled)
+                loss = compute_loss(full_embeds)
                 loss.backward()
-                if scaled.grad is not None:
-                    total_grads += scaled.grad.detach()
-            avg_grads = total_grads / steps
-            attributions = ((inputs_embeds - baseline) * avg_grads).sum(dim=-1)[0, : input_ids.shape[1]].detach().cpu().tolist()
+                if scaled_input.grad is not None:
+                    total_grads_input += scaled_input.grad.detach()
+            avg_grads_input = total_grads_input / steps
+            attributions = (
+                (input_embeds - baseline_input) * avg_grads_input
+            ).sum(dim=-1)[0].detach().cpu().tolist()
         else:
             model.zero_grad(set_to_none=True)
-            inputs_embeds.retain_grad()
-            loss = compute_loss(inputs_embeds)
+            full_embeds = torch.cat([input_embeds, completion_embeds], dim=1)
+            full_embeds.requires_grad_(True)
+            full_embeds.retain_grad()
+            loss = compute_loss(full_embeds)
             loss.backward()
-            grads = inputs_embeds.grad
-            attributions = (grads * inputs_embeds).sum(dim=-1)[0, : input_ids.shape[1]].detach().cpu().tolist()
+            grads = full_embeds.grad[:, : input_ids.shape[1], :]
+            attributions = (
+                grads * full_embeds[:, : input_ids.shape[1], :]
+            ).sum(dim=-1)[0].detach().cpu().tolist()
         token_ids = input_ids[0].detach().cpu().tolist()
         decoded = [tokenizer.decode([tid]) for tid in token_ids]
 
         print("  Input text:")
         print(input_text)
-        top_k = min(30, len(attributions))
-        top_indices = sorted(range(len(attributions)), key=lambda i: attributions[i], reverse=True)[:top_k]
-        print(f"  Top {top_k} input tokens by influence:")
-        for idx in top_indices:
-            print(f" {idx:04d} | text={decoded[idx]!r} | influence={attributions[idx]:.6f}")
+        if show_sentence_level:
+            print("  Sentence-level attribution:")
+            sentence_units = []
+            cursor = 0
+            for line in input_text.splitlines(keepends=True):
+                stripped = line.strip()
+                is_code_like = (
+                    stripped.startswith(("def ", "class ", "from ", "import ", ">>>"))
+                    or line.startswith((" ", "\t"))
+                )
+                if "." in line and not is_code_like:
+                    start = 0
+                    for match in re.finditer(r"(?<!\d)\.(?!\d)", line):
+                        end = match.start() + 1
+                        sent = line[start:end]
+                        if sent.strip():
+                            sentence_units.append((cursor + start, cursor + end, sent))
+                        start = end
+                    tail = line[start:]
+                    if tail.strip():
+                        sentence_units.append((cursor + start, cursor + len(line), tail))
+                else:
+                    if stripped:
+                        sentence_units.append((cursor, cursor + len(line), line))
+                cursor += len(line)
 
-        print(f"  Input token attribution (text + influence) [{method}]:")
-        for idx, (dec, score) in enumerate(zip(decoded, attributions)):
-            print(f" {idx:04d} | text={dec!r} | influence={score:.6f}")
+            try:
+                offsets = tokenizer(input_text, return_offsets_mapping=True).offset_mapping
+            except Exception:
+                offsets = None
+
+            if offsets is None:
+                print("    (offset mapping unavailable; sentence-level attribution skipped)")
+            else:
+                sent_scores = [0.0 for _ in sentence_units]
+                for idx, (tok_start, tok_end) in enumerate(offsets):
+                    if tok_end <= tok_start:
+                        continue
+                    for s_idx, (s_start, s_end, _) in enumerate(sentence_units):
+                        if tok_start >= s_end or tok_end <= s_start:
+                            continue
+                        sent_scores[s_idx] += attributions[idx]
+                        break
+            order = sorted(range(len(sentence_units)), key=lambda i: sent_scores[i], reverse=True)
+            for rank, s_idx in enumerate(order, start=1):
+                sent = sentence_units[s_idx][2]
+                print(f"    {rank:03d} | influence={sent_scores[s_idx]:.6f} | text={sent!r}")
+
+        if not show_sentence_level:
+            top_k = min(30, len(attributions))
+            top_indices = sorted(range(len(attributions)), key=lambda i: attributions[i], reverse=True)[:top_k]
+            print(f"  Top {top_k} input tokens by influence:")
+            for idx in top_indices:
+                print(f" {idx:04d} | text={decoded[idx]!r} | influence={attributions[idx]:.6f}")
+
+            print(f"  Input token attribution (text + influence) [{method}]:")
+            for idx, (dec, score) in enumerate(zip(decoded, attributions)):
+                print(f" {idx:04d} | text={dec!r} | influence={score:.6f}")
 
 @dataclass
 class TaskResult:
@@ -268,6 +328,7 @@ def main(args):
                         completion,
                         method=args.attribution_method,
                         ig_steps=args.ig_steps,
+                        show_sentence_level=args.sentence_level,
                     )
                 shutil.rmtree(work_dir, ignore_errors=True)
                 break
@@ -314,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=0, help="If >0, only evaluate first N tasks.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print_attribution", action="store_true", help="Print input token attribution after a pass.")
+    parser.add_argument("--sentence_level", action="store_true", help="Also print sentence-level attribution.")
     parser.add_argument("--attribution_method", type=str, choices=["grad_x_input", "integrated_gradients"], default="grad_x_input")
     parser.add_argument("--ig_steps", type=int, default=20, help="Steps for Integrated Gradients.")
     args = parser.parse_args()
