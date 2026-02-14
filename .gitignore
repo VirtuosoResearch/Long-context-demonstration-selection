@@ -179,3 +179,5 @@ datasets/
 
 *.txt
 ./notebooks/samples
+
+*.tar
