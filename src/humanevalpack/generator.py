@@ -5,7 +5,15 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 class Generator:
-    def generate(self, prompt: str, max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temp: float = 0.2,
+        top_p: float = 0.95,
+        history: str = "",
+        latest_error: str = "",
+    ) -> str:
         raise NotImplementedError
 
 
@@ -16,7 +24,7 @@ class TransformersGenerator(Generator):
         self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
         self.is_chat = getattr(self.tokenizer, "chat_template", None) not in (None, "", False)
 
-    def _make_inputs(self, task_prompt: str, lang: str) -> str:
+    def _make_inputs(self, task_prompt: str, lang: str, history: str = "", latest_error: str = "") -> str:
         # Language-specific system/user instructions
         if lang == "js":
             sys_inst = (
@@ -83,55 +91,37 @@ class TransformersGenerator(Generator):
         else:
             raise ValueError("Unsupported lang")
 
+        history_text = history.strip() if history else ""
+        error_text = latest_error.strip() if latest_error else ""
+        if history_text:
+            user_inst = (
+                user_inst
+                + "\n\n"
+            )
+            prompt_parts = [
+                f"### ORIGINAL TASK\n{task_prompt}",
+                f"You previously produced an incorrect solution for this same task. "
+                f"Read the full attempt history and fix the bug in the next answer. "
+                f"Return only corrected code.",
+                f"### ATTEMPT HISTORY (STEP 1 TO PREVIOUS STEP)\n{history_text}",
+            ]
+            history_lower = history_text.lower()
+            has_feedback = ("feedback:" in history_lower) or ("compiler output" in history_lower) or ("runtime output" in history_lower)
+            if error_text and not has_feedback:
+                prompt_parts.append(f"### LATEST FEEDBACK\n{error_text}")
+            prompt_parts.append("### FIX THE BUG\nOutput only corrected code.")
+            final_prompt = "\n\n".join(prompt_parts)
+        else:
+            final_prompt = task_prompt
+
         if self.is_chat:
             messages = [
                 {"role": "system", "content": sys_inst},
-                {"role": "user", "content": f"{user_inst}\n\n{task_prompt}"},
+                {"role": "user", "content": f"{user_inst}\n\n{final_prompt}"},
             ]
             return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
-            return sys_inst + "\n\n" + user_inst + "\n\n" + task_prompt
-
-    def _make_repair_inputs(self, task_prompt: str, prev_code: str, error_msg: str, lang: str, history: str = "") -> str:
-        repair_inst = (
-            "The previous attempt failed to compile or failed tests. Read the error/trace and output a corrected version.\n"
-            "Return ONLY valid code; no comments; no markdown fences."
-        )
-        # add a tiny hint to keep language context
-        if lang == "js":
-            repair_inst = "Language: JavaScript (Node.js).\n" + repair_inst
-        elif lang == "go":
-            repair_inst = "Language: Go.\n" + repair_inst
-        elif lang == "rust":
-            repair_inst = "Language: Rust.\n" + repair_inst
-        elif lang == "python":
-            repair_inst = "Language: Python.\n" + repair_inst
-        elif lang == "java":
-            repair_inst = "Language: Java.\n" + repair_inst
-        elif lang == "cpp":
-            repair_inst = "Language: C++.\n" + repair_inst
-
-        history_block = f"### ATTEMPT HISTORY\n{history.strip()}\n\n" if history and history.strip() else ""
-        prev_code_block = ""
-        compiler_output_block = ""
-        if not history_block:
-            prev_code_block = f"### PREVIOUS CODE\n{prev_code}\n\n"
-            compiler_output_block = f"### COMPILER/RUNTIME OUTPUT\n{error_msg}\n\n"
-        context = (
-            f"### PROMPT\n{task_prompt}\n\n"
-            f"{history_block}"
-            f"{prev_code_block}"
-            f"{compiler_output_block}"
-            f"### FIXED CODE"
-        )
-        if self.is_chat:
-            messages = [
-                {"role": "system", "content": f"You are a senior {lang} engineer who fixes code using unit test feedback."},
-                {"role": "user", "content": repair_inst + "\n\n" + context},
-            ]
-            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            return repair_inst + "\n\n" + context + "\n"
+            return sys_inst + "\n\n" + user_inst + "\n\n" + final_prompt
 
     @staticmethod
     def _strip_fences(s: str) -> str:
@@ -143,27 +133,18 @@ class TransformersGenerator(Generator):
         prompt_text = self.tokenizer.decode(inputs_ids["input_ids"][0], skip_special_tokens=True)
         return full_text[len(prompt_text):]
 
-    def generate(self, prompt: str, lang: str, max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
+    def generate(
+        self,
+        prompt: str,
+        lang: str,
+        max_new_tokens: int = 256,
+        temp: float = 0.2,
+        top_p: float = 0.95,
+        history: str = "",
+        latest_error: str = "",
+    ) -> str:
         import torch
-        inputs = self._make_inputs(prompt, lang)
-        input_ids = self.tokenizer(inputs, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **input_ids,
-                do_sample=True if temp > 0 else False,
-                temperature=temp,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
-        tail = self._tail_from_generated(input_ids, text)
-        return self._strip_fences(tail)
-
-    def repair(self, task_prompt: str, prev_code: str, error_msg: str, lang: str, history: str = "",
-               max_new_tokens: int = 256, temp: float = 0.2, top_p: float = 0.95) -> str:
-        import torch
-        inputs = self._make_repair_inputs(task_prompt, prev_code, error_msg, lang, history)
+        inputs = self._make_inputs(prompt, lang, history=history, latest_error=latest_error)
         input_ids = self.tokenizer(inputs, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(

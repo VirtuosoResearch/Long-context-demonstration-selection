@@ -67,6 +67,14 @@ def build_demonstrations(lang_counts: dict) -> Tuple[str, List[Tuple[int, int, s
             demo_index += 1
     return demo_text.strip(), demo_spans
 
+
+def build_demo_instruction() -> str:
+    return (
+        "Below are solved reference examples from related tasks. "
+        "Use them only as guidance for style, decomposition, and edge-case handling. "
+        "Do not copy them verbatim; prioritize correctness for the current task."
+    )
+
 def map_demo_spans_to_input(input_text: str, demo_text: str, demo_spans: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
     if not demo_text or not demo_spans:
         return []
@@ -279,7 +287,11 @@ def main(args):
             break
         task_id = ex["task_id"]
         prompt = ex.get("prompt") or ex.get("declaration") or ""
-        prompt_with_demos = f"{demo_text}\n\n{prompt}" if demo_text else prompt
+        if demo_text:
+            demo_instruction = build_demo_instruction()
+            prompt_with_demos = f"{demo_instruction}\n\n{demo_text}\n\n{prompt}"
+        else:
+            prompt_with_demos = prompt
         includes = ex.get("import", "") or "" 
         imports = ex.get("import", "") or ""
         test_setup = ex.get("test_setup", "") or ""
@@ -324,9 +336,18 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
-                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        input_text_for_completion = gen._make_inputs(
+                            prompt_with_demos, args.lang, history=history_text, latest_error=last_error
+                        )
+                        completion = gen.generate(
+                            prompt_with_demos,
+                            args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temp=args.temp,
+                            top_p=args.top_p,
+                            history=history_text,
+                            latest_error=last_error,
+                        )
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
@@ -346,9 +367,18 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
-                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        input_text_for_completion = gen._make_inputs(
+                            prompt_with_demos, args.lang, history=history_text, latest_error=last_error
+                        )
+                        completion = gen.generate(
+                            prompt_with_demos,
+                            args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temp=args.temp,
+                            top_p=args.top_p,
+                            history=history_text,
+                            latest_error=last_error,
+                        )
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
@@ -370,9 +400,18 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
-                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        input_text_for_completion = gen._make_inputs(
+                            prompt_with_demos, args.lang, history=history_text, latest_error=last_error
+                        )
+                        completion = gen.generate(
+                            prompt_with_demos,
+                            args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temp=args.temp,
+                            top_p=args.top_p,
+                            history=history_text,
+                            latest_error=last_error,
+                        )
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
@@ -397,9 +436,18 @@ def main(args):
                             f"Feedback:\n{last_error}"
                         )
                         history_text = "\n\n".join(attempt_history)
-                        input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
-                        completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
-                                                max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                        input_text_for_completion = gen._make_inputs(
+                            prompt_with_demos, args.lang, history=history_text, latest_error=last_error
+                        )
+                        completion = gen.generate(
+                            prompt_with_demos,
+                            args.lang,
+                            max_new_tokens=args.max_new_tokens,
+                            temp=args.temp,
+                            top_p=args.top_p,
+                            history=history_text,
+                            latest_error=last_error,
+                        )
                         completion = strip_non_code(completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
@@ -433,9 +481,18 @@ def main(args):
                         f"Feedback:\n{last_error}"
                     )
                     history_text = "\n\n".join(attempt_history)
-                    input_text_for_completion = gen._make_repair_inputs(prompt_with_demos, completion, last_error, args.lang, history=history_text)
-                    completion = gen.repair(prompt_with_demos, completion, last_error, args.lang, history=history_text,
-                                            max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
+                    input_text_for_completion = gen._make_inputs(
+                        prompt_with_demos, args.lang, history=history_text, latest_error=last_error
+                    )
+                    completion = gen.generate(
+                        prompt_with_demos,
+                        args.lang,
+                        max_new_tokens=args.max_new_tokens,
+                        temp=args.temp,
+                        top_p=args.top_p,
+                        history=history_text,
+                        latest_error=last_error,
+                    )
                     completion = strip_non_code(completion)
             shutil.rmtree(work_dir, ignore_errors=True)
 
