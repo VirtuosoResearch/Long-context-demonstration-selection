@@ -135,21 +135,120 @@ def print_input_token_attribution(
     tokenizer = gen.tokenizer
     device = model.device
 
-    model.eval()
-    with torch.enable_grad():
-        input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
-        completion_ids = tokenizer(
-            completion_text, return_tensors="pt", add_special_tokens=False
-        ).input_ids.to(device)
+    def build_sentence_units(text: str) -> List[Tuple[int, int, str]]:
+        sentence_units: List[Tuple[int, int, str]] = []
+        cursor = 0
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            is_code_like = (
+                stripped.startswith(("def ", "class ", "from ", "import ", ">>>"))
+                or line.startswith((" ", "\t"))
+            )
+            if "." in line and not is_code_like:
+                start = 0
+                for match in re.finditer(r"(?<!\d)\.(?!\d)", line):
+                    end = match.start() + 1
+                    sent = line[start:end]
+                    if sent.strip():
+                        sentence_units.append((cursor + start, cursor + end, sent))
+                    start = end
+                tail = line[start:]
+                if tail.strip():
+                    sentence_units.append((cursor + start, cursor + len(line), tail))
+            else:
+                if stripped:
+                    sentence_units.append((cursor, cursor + len(line), line))
+            cursor += len(line)
+        return sentence_units
 
-        max_pos = getattr(model.config, "max_position_embeddings", None)
-        if max_pos is not None:
-            allowed = max_pos - input_ids.shape[1]
-            if allowed <= 0:
-                print("  Attribution skipped: input too long for model context.")
+    model.eval()
+    input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
+    completion_ids = tokenizer(
+        completion_text, return_tensors="pt", add_special_tokens=False
+    ).input_ids.to(device)
+
+    max_pos = getattr(model.config, "max_position_embeddings", None)
+    if max_pos is not None:
+        allowed = max_pos - input_ids.shape[1]
+        if allowed <= 0:
+            print("  Attribution skipped: input too long for model context.")
+            return
+        if completion_ids.shape[1] > allowed:
+            completion_ids = completion_ids[:, :allowed]
+
+    if completion_ids.shape[1] == 0:
+        print("  Attribution skipped: completion is empty after truncation.")
+        return
+
+    if method == "loo":
+        with torch.no_grad():
+            mask_placeholder = getattr(tokenizer, "mask_token", None) or "[MASK]"
+
+            def compute_score(curr_input_text: str) -> float:
+                curr_input_ids = tokenizer(curr_input_text, return_tensors="pt").input_ids.to(device)
+                full_ids = torch.cat([curr_input_ids, completion_ids], dim=1)
+                attention_mask = torch.ones_like(full_ids)
+                outputs = model(input_ids=full_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                labels = full_ids.clone()
+                labels[:, : curr_input_ids.shape[1]] = -100
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                # Score S(x): higher is better.
+                return -float(loss.item())
+
+            def replace_span_with_mask(text: str, start: int, end: int) -> str:
+                left = text[:start]
+                right = text[end:]
+                left_sep = "" if not left or left[-1].isspace() else " "
+                right_sep = "" if not right or right[0].isspace() else " "
+                return f"{left}{left_sep}{mask_placeholder}{right_sep}{right}"
+
+            def loo_for_spans(spans: List[Tuple[int, int, str]]) -> List[float]:
+                scores: List[float] = []
+                for start, end, _ in spans:
+                    if start < 0 or end > len(input_text) or end <= start:
+                        scores.append(float("-inf"))
+                        continue
+                    text_with_mask = replace_span_with_mask(input_text, start, end)
+                    s_drop = compute_score(text_with_mask)
+                    scores.append(base_score - s_drop)
+                return scores
+
+            base_score = compute_score(input_text)
+            print("  Input text:")
+            print(input_text)
+            print(f"  Base score S(x): {base_score:.6f}")
+
+            # Keep original call pattern: if demos exist, report demo-level; else sentence-level.
+            if demo_spans:
+                print("  Demonstration-level LOO attribution:")
+                demo_scores = loo_for_spans(demo_spans)
+                order = sorted(range(len(demo_spans)), key=lambda i: demo_scores[i], reverse=True)
+                for rank, d_idx in enumerate(order, start=1):
+                    label = demo_spans[d_idx][2]
+                    print(f"    {rank:03d} | delta={demo_scores[d_idx]:.6f} | label={label}")
                 return
-            if completion_ids.shape[1] > allowed:
-                completion_ids = completion_ids[:, :allowed]
+
+            print("  Sentence-level LOO attribution:")
+            sentence_units = build_sentence_units(input_text)
+            if not sentence_units:
+                print("    (no sentence spans found)")
+                return
+            sent_scores = loo_for_spans(sentence_units)
+            order = sorted(range(len(sentence_units)), key=lambda i: sent_scores[i], reverse=True)
+            for rank, s_idx in enumerate(order, start=1):
+                sent = sentence_units[s_idx][2]
+                print(f"    {rank:03d} | delta={sent_scores[s_idx]:.6f} | text={sent!r}")
+            return
+
+    with torch.enable_grad():
 
         full_ids = torch.cat([input_ids, completion_ids], dim=1)
         attention_mask = torch.ones_like(full_ids)
@@ -237,29 +336,7 @@ def print_input_token_attribution(
 
         if show_sentence_level:
             print("  Sentence-level attribution:")
-            sentence_units = []
-            cursor = 0
-            for line in input_text.splitlines(keepends=True):
-                stripped = line.strip()
-                is_code_like = (
-                    stripped.startswith(("def ", "class ", "from ", "import ", ">>>"))
-                    or line.startswith((" ", "\t"))
-                )
-                if "." in line and not is_code_like:
-                    start = 0
-                    for match in re.finditer(r"(?<!\d)\.(?!\d)", line):
-                        end = match.start() + 1
-                        sent = line[start:end]
-                        if sent.strip():
-                            sentence_units.append((cursor + start, cursor + end, sent))
-                        start = end
-                    tail = line[start:]
-                    if tail.strip():
-                        sentence_units.append((cursor + start, cursor + len(line), tail))
-                else:
-                    if stripped:
-                        sentence_units.append((cursor, cursor + len(line), line))
-                cursor += len(line)
+            sentence_units = build_sentence_units(input_text)
 
             if offsets is None:
                 print("    (offset mapping unavailable; sentence-level attribution skipped)")
@@ -591,7 +668,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print_attribution", action="store_true", help="Print input token attribution after a pass.")
     parser.add_argument("--sentence_level", action="store_true", help="Also print sentence-level attribution.")
-    parser.add_argument("--attribution_method", type=str, choices=["grad_x_input", "integrated_gradients"], default="grad_x_input")
+    parser.add_argument("--attribution_method", type=str, choices=["grad_x_input", "integrated_gradients", "loo"], default="grad_x_input")
     parser.add_argument("--ig_steps", type=int, default=20, help="Steps for Integrated Gradients.")
     parser.add_argument("--demo_python", type=int, default=0, help="Number of Python demonstrations to add (from last 10).")
     parser.add_argument("--demo_cpp", type=int, default=0, help="Number of C++ demonstrations to add (from last 10).")
