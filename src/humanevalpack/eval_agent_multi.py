@@ -1,13 +1,16 @@
 import argparse
 import json
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from generator import Generator, TransformersGenerator
 from language_utils import write_solution_file_go, write_solution_file_js, write_solution_file_rust, write_solution_python, write_solution_java, write_solution_cpp
 from language_utils import run_node, compile_go, run_exe, compile_rust, run_with_timeout, compile_java, run_java, compile_cpp, run_cpp_exe_with_timeout
@@ -36,23 +39,56 @@ def _lang_extension(lang: str) -> str:
         "cpp": "cpp",
     }.get(lang, "txt")
 
-def build_demonstrations(lang_counts: dict) -> Tuple[str, List[Tuple[int, int, str]]]:
+def _prompt_from_example(ex: dict) -> str:
+    return ex.get("prompt") or ex.get("declaration") or ""
+
+
+def _token_counts(text: str) -> Counter:
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text.lower())
+    return Counter(toks)
+
+
+def _cosine_similarity(a: str, b: str) -> float:
+    ca = _token_counts(a)
+    cb = _token_counts(b)
+    if not ca or not cb:
+        return 0.0
+    dot = sum(ca[t] * cb.get(t, 0) for t in ca)
+    na = math.sqrt(sum(v * v for v in ca.values()))
+    nb = math.sqrt(sum(v * v for v in cb.values()))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def build_demonstrations_for_task(
+    task_prompt: str,
+    target_lang: str,
+    lang_counts: Dict[str, int],
+    candidate_pools: Dict[str, List[dict]],
+    rng: random.Random,
+) -> Tuple[str, List[Tuple[int, int, str]]]:
     demo_text = ""
     demo_spans: List[Tuple[int, int, str]] = []
     order = ["python", "cpp", "java", "go"]
     demo_index = 1
     for lang in order:
-        count = min(lang_counts.get(lang, 0), 10)
+        pool = candidate_pools.get(lang, [])
+        count = min(lang_counts.get(lang, 0), len(pool))
         if count <= 0:
             continue
-        ds = load_dataset("bigcode/humanevalpack", lang, split="test")
-        total = len(ds)
-        start = max(0, total - 10)
-        candidates = [ds[i] for i in range(start, total)]
-        chosen = candidates[-count:]
+        if lang == target_lang:
+            ranked = sorted(
+                pool,
+                key=lambda ex: _cosine_similarity(task_prompt, _prompt_from_example(ex)),
+                reverse=True,
+            )
+            chosen = ranked[:count]
+        else:
+            chosen = rng.sample(pool, count) if count < len(pool) else list(pool)
         for ex in chosen:
             task_id = ex.get("task_id", "")
-            prompt = ex.get("prompt") or ex.get("declaration") or ""
+            prompt = _prompt_from_example(ex)
             solution = ex.get("canonical_solution", "") or ""
             block = (
                 f"### DEMONSTRATION {demo_index} ({lang}) {task_id}\n"
@@ -265,28 +301,53 @@ def main(args):
     print("Model:", args.model)
     ds = load_dataset("bigcode/humanevalpack", cfg, split="test")
     gen = TransformersGenerator(args.model)
-    demo_text, demo_spans = build_demonstrations(
-        {
-            "python": args.demo_python,
-            "cpp": args.demo_cpp,
-            "java": args.demo_java,
-            "go": args.demo_go,
-        }
-    )
+    holdout_count = min(30, len(ds))
+    if len(ds) <= holdout_count:
+        raise ValueError(f"Not enough test samples in {cfg}: total={len(ds)}, holdout={holdout_count}.")
+
+    eval_ds = ds.select(range(0, len(ds) - holdout_count))
+    target_lang_candidates = [ds[i] for i in range(len(ds) - holdout_count, len(ds))]
+    demo_counts: Dict[str, int] = {
+        "python": args.demo_python,
+        "cpp": args.demo_cpp,
+        "java": args.demo_java,
+        "go": args.demo_go,
+    }
+    active_demo_langs = [lang for lang, cnt in demo_counts.items() if cnt > 0]
+    candidate_pools: Dict[str, List[dict]] = {}
+    if active_demo_langs:
+        for lang in active_demo_langs:
+            if lang == cfg:
+                candidate_pools[lang] = target_lang_candidates
+            else:
+                ds_lang = load_dataset("bigcode/humanevalpack", lang, split="test")
+                lang_holdout = min(30, len(ds_lang))
+                candidate_pools[lang] = [
+                    ds_lang[i] for i in range(len(ds_lang) - lang_holdout, len(ds_lang))
+                ]
+    rng = random.Random(args.seed)
     cache_root = os.path.join(os.path.dirname(__file__), "cache")
     os.makedirs(cache_root, exist_ok=True)
     tmp_root = tempfile.mkdtemp(prefix=f"humanevalpack_{args.lang}_eval_", dir=cache_root)
     results: List[TaskResult] = []
 
-    total = len(ds) if args.limit <= 0 else min(args.limit, len(ds))
+    total = len(eval_ds) if args.limit <= 0 else min(args.limit, len(eval_ds))
     print(f"Running {total} HumanEvalPack({cfg}) tasks with {args.model} ({args.engine})")
+    print(f"Excluded last {holdout_count} {cfg} test tasks as demonstration candidate set.")
     print(f"Max iters per task: {args.num_iter}, run-timeout: {args.timeout}s, compile-timeout: {args.compile_timeout}s\n")
 
-    for i, ex in enumerate(ds):
+    for i, ex in enumerate(eval_ds):
         if i >= total:
             break
         task_id = ex["task_id"]
-        prompt = ex.get("prompt") or ex.get("declaration") or ""
+        prompt = _prompt_from_example(ex)
+        demo_text, demo_spans = build_demonstrations_for_task(
+            task_prompt=prompt,
+            target_lang=cfg,
+            lang_counts=demo_counts,
+            candidate_pools=candidate_pools,
+            rng=rng,
+        )
         if demo_text:
             demo_instruction = build_demo_instruction()
             prompt_with_demos = f"{demo_instruction}\n\n{demo_text}\n\n{prompt}"
