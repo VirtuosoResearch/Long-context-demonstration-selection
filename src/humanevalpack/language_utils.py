@@ -423,6 +423,19 @@ def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_se
     - 'test_setup' may define helpers, test harness utilities, etc.
     - 'test' should contain either a main() or assertions in a harness main() we provide.
     """
+    def _extract_stub_fn_name(prompt_text: str) -> Optional[str]:
+        # Match the last open function header like: `ret_type fn(args){`
+        matches = re.findall(
+            r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{\s*$",
+            prompt_text,
+            flags=re.MULTILINE,
+        )
+        return matches[-1] if matches else None
+
+    def _completion_has_full_definition(completion_text: str, fn_name: str) -> bool:
+        pattern = rf"\b{re.escape(fn_name)}\s*\([^;{{}}]*\)\s*\{{"
+        return re.search(pattern, completion_text) is not None
+
     parts = []
     if includes and includes.strip():
         parts.append(includes.strip())
@@ -432,7 +445,20 @@ def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_se
     if not re.search(r"#\s*include", "\n".join(parts), flags=re.IGNORECASE):
         parts.append(default_includes)
 
-    parts.append(task_prompt.rstrip() + "\n" + completion.strip() + "\n")
+    prompt_text = (task_prompt or "").rstrip()
+    completion_text = (completion or "").strip()
+
+    # If prompt is an open stub and completion already contains a full definition
+    # of the same function, do not append both (which creates nested definitions).
+    fn_name = _extract_stub_fn_name(prompt_text)
+    prompt_looks_open_stub = prompt_text.endswith("{")
+    completion_has_full_def = bool(
+        fn_name and _completion_has_full_definition(completion_text, fn_name)
+    )
+    if prompt_looks_open_stub and completion_has_full_def:
+        parts.append(completion_text + "\n")
+    else:
+        parts.append(prompt_text + "\n" + completion_text + "\n")
 
     if test_setup and test_setup.strip():
         parts.append(test_setup.strip())

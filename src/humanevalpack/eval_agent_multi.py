@@ -413,6 +413,16 @@ def main(args):
     print(f"Excluded last {holdout_count} {cfg} test tasks as demonstration candidate set.")
     print(f"Max iters per task: {args.num_iter}, run-timeout: {args.timeout}s, compile-timeout: {args.compile_timeout}s\n")
 
+    def print_attempt_io(task_id: str, attempt_no: int, input_prompt: str, output_code: str) -> None:
+        print(f"  ===== LLM I/O | task={task_id} | attempt={attempt_no} =====")
+        print("  [INPUT PROMPT BEGIN]")
+        print(input_prompt)
+        print("  [INPUT PROMPT END]")
+        print("  [OUTPUT BEGIN]")
+        print(output_code)
+        print("  [OUTPUT END]")
+        print("  ===== END LLM I/O =====")
+
     for i, ex in enumerate(eval_ds):
         if i >= total:
             break
@@ -441,6 +451,7 @@ def main(args):
         input_text_for_completion = gen._make_inputs(prompt_with_demos, args.lang)
         completion = gen.generate(prompt_with_demos, args.lang, max_new_tokens=args.max_new_tokens, temp=args.temp, top_p=args.top_p)
         completion = strip_non_code(completion)
+        print_attempt_io(task_id, 1, input_text_for_completion, completion)
 
         passed = False
         attempts = 0
@@ -487,6 +498,7 @@ def main(args):
                             latest_error=last_error,
                         )
                         completion = strip_non_code(completion)
+                        print_attempt_io(task_id, attempt + 1, input_text_for_completion, completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
                 ok_run, msg = run_exe(exe_path, timeout_sec=args.timeout)
@@ -518,6 +530,7 @@ def main(args):
                             latest_error=last_error,
                         )
                         completion = strip_non_code(completion)
+                        print_attempt_io(task_id, attempt + 1, input_text_for_completion, completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
                 ok_run, msg = run_exe(exe_path, timeout_sec=args.timeout)
@@ -551,6 +564,7 @@ def main(args):
                             latest_error=last_error,
                         )
                         completion = strip_non_code(completion)
+                        print_attempt_io(task_id, attempt + 1, input_text_for_completion, completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
                 # Run
@@ -567,6 +581,9 @@ def main(args):
                 if not ok_compile:
                     last_error = compile_msg[-2000:] if compile_msg else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if last_error:
+                        print("  Compiler output:")
+                        print(last_error)
                     if attempt < args.num_iter:
                         attempt_history.append(
                             f"Attempt {attempt}\n"
@@ -587,6 +604,7 @@ def main(args):
                             latest_error=last_error,
                         )
                         completion = strip_non_code(completion)
+                        print_attempt_io(task_id, attempt + 1, input_text_for_completion, completion)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     continue
 
@@ -632,6 +650,7 @@ def main(args):
                         latest_error=last_error,
                     )
                     completion = strip_non_code(completion)
+                    print_attempt_io(task_id, attempt + 1, input_text_for_completion, completion)
             shutil.rmtree(work_dir, ignore_errors=True)
 
         task_cache_dir = os.path.join(tmp_root, _safe_task_dirname(task_id, i))
