@@ -423,6 +423,25 @@ def main(args):
         print("  [OUTPUT END]")
         print("  ===== END LLM I/O =====")
 
+    def print_giveup_snapshot(
+        task_id: str,
+        attempt_no: int,
+        input_prompt: str,
+        output_code: str,
+        tested_code: str,
+    ) -> None:
+        print(f"  ===== GIVE UP SNAPSHOT | task={task_id} | attempt={attempt_no} =====")
+        print("  [FINAL INPUT PROMPT BEGIN]")
+        print(input_prompt)
+        print("  [FINAL INPUT PROMPT END]")
+        print("  [FINAL LLM OUTPUT BEGIN]")
+        print(output_code)
+        print("  [FINAL LLM OUTPUT END]")
+        print("  [FINAL TESTED CODE BEGIN]")
+        print(tested_code)
+        print("  [FINAL TESTED CODE END]")
+        print("  ===== END GIVE UP SNAPSHOT =====")
+
     for i, ex in enumerate(eval_ds):
         if i >= total:
             break
@@ -465,19 +484,27 @@ def main(args):
                 main_py = os.path.join(work_dir, "main.py")
                 write_solution_python(prompt, completion, imports, test_setup, test, main_py)
                 print("main: ",main_py)
+                with open(main_py, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
                 ok_run, msg = run_with_timeout(main_py, timeout_sec=args.timeout)
 
             elif args.lang == "js":
                 src_path = write_solution_file_js(imports, prompt, completion, test_setup, test, work_dir)
+                with open(src_path, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
                 ok_run, msg = run_node(src_path, timeout_sec=args.timeout)
 
             elif args.lang == "go":
                 src_path = write_solution_file_go(imports, prompt, completion, test_setup, test, work_dir)
+                with open(src_path, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
                 exe_path = os.path.join(work_dir, "main_go_exec")
                 okc, cerr = compile_go(src_path, exe_path, timeout_sec=args.compile_timeout)
                 if not okc:
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if attempt == args.num_iter:
+                        print_giveup_snapshot(task_id, attempt, input_text_for_completion, completion, tested_code_text)
                     if attempt < args.num_iter:
                         attempt_history.append(
                             f"Attempt {attempt}\n"
@@ -505,11 +532,15 @@ def main(args):
 
             elif args.lang == "rust":
                 src_path = write_solution_file_rust(imports, prompt, completion, test_setup, test, work_dir)
+                with open(src_path, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
                 exe_path = os.path.join(work_dir, "main_rs_exec")
                 okc, cerr = compile_rust(src_path, exe_path, timeout_sec=args.compile_timeout)
                 if not okc:
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if attempt == args.num_iter:
+                        print_giveup_snapshot(task_id, attempt, input_text_for_completion, completion, tested_code_text)
                     if attempt < args.num_iter:
                         attempt_history.append(
                             f"Attempt {attempt}\n"
@@ -538,12 +569,16 @@ def main(args):
             elif args.lang == "java":
                 main_class, java_path = write_solution_java(includes, prompt, completion, test_setup, test, work_dir)
                 print("source:", java_path, " main_class:", main_class)
+                with open(java_path, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
 
                 # Compile
                 okc, cerr = compile_java(java_path, timeout_sec=args.compile_timeout)
                 if not okc:
                     last_error = cerr[-2000:] if cerr else "Unknown compile error"
                     print(f"  Compile failed (attempt {attempt})." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                    if attempt == args.num_iter:
+                        print_giveup_snapshot(task_id, attempt, input_text_for_completion, completion, tested_code_text)
                     if attempt < args.num_iter:
                         attempt_history.append(
                             f"Attempt {attempt}\n"
@@ -576,6 +611,8 @@ def main(args):
 
                 write_solution_cpp(prompt, completion, includes, test_setup, test, src_cpp)
                 print("source:", src_cpp)
+                with open(src_cpp, "r", encoding="utf-8") as f:
+                    tested_code_text = f.read()
 
                 ok_compile, compile_msg = compile_cpp(src_cpp, exe_path, timeout_sec=args.compile_timeout)
                 if not ok_compile:
@@ -584,6 +621,8 @@ def main(args):
                     if last_error:
                         print("  Compiler output:")
                         print(last_error)
+                    if attempt == args.num_iter:
+                        print_giveup_snapshot(task_id, attempt, input_text_for_completion, completion, tested_code_text)
                     if attempt < args.num_iter:
                         attempt_history.append(
                             f"Attempt {attempt}\n"
@@ -630,6 +669,8 @@ def main(args):
             else:
                 last_error = msg[-2000:] if msg else ""
                 print(f"  Failed attempt {attempt}." + (" Retrying…" if attempt < args.num_iter else " Giving up."))
+                if attempt == args.num_iter:
+                    print_giveup_snapshot(task_id, attempt, input_text_for_completion, completion, tested_code_text)
                 if attempt < args.num_iter:
                     attempt_history.append(
                         f"Attempt {attempt}\n"

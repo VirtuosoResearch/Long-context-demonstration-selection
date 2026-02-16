@@ -436,6 +436,77 @@ def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_se
         pattern = rf"\b{re.escape(fn_name)}\s*\([^;{{}}]*\)\s*\{{"
         return re.search(pattern, completion_text) is not None
 
+    def _strip_top_includes_and_using(text: str) -> str:
+        # Model outputs often include full-file boilerplate; keep only implementation body.
+        cleaned_lines = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("#include"):
+                continue
+            if s in ("using namespace std;", "using std::vector;", "using std::string;"):
+                continue
+            cleaned_lines.append(line)
+        return "\n".join(cleaned_lines).strip()
+
+    def _find_matching_brace_span(text: str, open_brace_pos: int) -> Optional[int]:
+        # Return index of matching '}' for text[open_brace_pos] == '{'
+        depth = 0
+        i = open_brace_pos
+        in_string = False
+        in_char = False
+        escape = False
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if in_char:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == "'":
+                    in_char = False
+                i += 1
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "'":
+                in_char = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    def _strip_main_functions(text: str) -> str:
+        # Remove any top-level main() implementations from model output.
+        # This avoids duplicate-main compile failures when benchmark tests provide main().
+        main_pat = re.compile(r"\b(?:int|auto)\s+main\s*\([^)]*\)\s*\{")
+        out = text
+        while True:
+            m = main_pat.search(out)
+            if not m:
+                break
+            open_pos = out.find("{", m.start())
+            if open_pos < 0:
+                break
+            close_pos = _find_matching_brace_span(out, open_pos)
+            if close_pos is None:
+                break
+            out = out[:m.start()] + out[close_pos + 1 :]
+        return out.strip()
+
     parts = []
     if includes and includes.strip():
         parts.append(includes.strip())
@@ -446,7 +517,12 @@ def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_se
         parts.append(default_includes)
 
     prompt_text = (task_prompt or "").rstrip()
-    completion_text = (completion or "").strip()
+    completion_text = _strip_top_includes_and_using((completion or "").strip())
+    test_text = (test or "").strip()
+
+    test_has_main = re.search(r"\b(?:int|auto)\s+main\s*\(", test_text) is not None
+    if test_has_main:
+        completion_text = _strip_main_functions(completion_text)
 
     # If prompt is an open stub and completion already contains a full definition
     # of the same function, do not append both (which creates nested definitions).
@@ -463,7 +539,7 @@ def write_solution_cpp(task_prompt: str, completion: str, includes: str, test_se
     if test_setup and test_setup.strip():
         parts.append(test_setup.strip())
 
-    parts.append(test.strip())
+    parts.append(test_text)
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n\n".join(parts))
