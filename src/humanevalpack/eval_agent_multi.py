@@ -182,7 +182,26 @@ def print_input_token_attribution(
 
     if method == "loo":
         with torch.no_grad():
-            mask_placeholder = getattr(tokenizer, "mask_token", None) or "[MASK]"
+            def resolve_mask_token_text() -> Optional[str]:
+                tok = getattr(tokenizer, "mask_token", None)
+                if tok:
+                    return tok
+                special_map = getattr(tokenizer, "special_tokens_map", None)
+                if isinstance(special_map, dict):
+                    tok = special_map.get("mask_token")
+                    if isinstance(tok, str) and tok:
+                        return tok
+                tok_id = getattr(tokenizer, "mask_token_id", None)
+                if tok_id is not None:
+                    try:
+                        tok = tokenizer.convert_ids_to_tokens(int(tok_id))
+                        if isinstance(tok, str) and tok:
+                            return tok
+                    except Exception:
+                        pass
+                return None
+
+            mask_placeholder = resolve_mask_token_text()
 
             def compute_score(curr_input_text: str) -> float:
                 curr_input_ids = tokenizer(curr_input_text, return_tensors="pt").input_ids.to(device)
@@ -206,9 +225,13 @@ def print_input_token_attribution(
             def replace_span_with_mask(text: str, start: int, end: int) -> str:
                 left = text[:start]
                 right = text[end:]
-                left_sep = "" if not left or left[-1].isspace() else " "
-                right_sep = "" if not right or right[0].isspace() else " "
-                return f"{left}{left_sep}{mask_placeholder}{right_sep}{right}"
+                # Prefer the model's real mask token; if unavailable, fall back to a single space.
+                if mask_placeholder:
+                    left_sep = "" if not left or left[-1].isspace() else " "
+                    right_sep = "" if not right or right[0].isspace() else " "
+                    return f"{left}{left_sep}{mask_placeholder}{right_sep}{right}"
+                sep = "" if (not left or left[-1].isspace() or not right or right[0].isspace()) else " "
+                return f"{left}{sep}{right}"
 
             def loo_for_spans(spans: List[Tuple[int, int, str]]) -> List[float]:
                 scores: List[float] = []
@@ -225,6 +248,10 @@ def print_input_token_attribution(
             print("  Input text:")
             print(input_text)
             print(f"  Base score S(x): {base_score:.6f}")
+            if mask_placeholder:
+                print(f"  LOO replacement token: {mask_placeholder!r}")
+            else:
+                print("  LOO replacement token: <space>")
 
             # Keep original call pattern: if demos exist, report demo-level; else sentence-level.
             if demo_spans:
