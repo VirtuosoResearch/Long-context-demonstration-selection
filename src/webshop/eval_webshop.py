@@ -1,5 +1,8 @@
 import os
 import sys
+import json
+import glob
+import random
 
 # Parse device argument FIRST, before any CUDA initialization
 device_arg = "0"  # default
@@ -36,12 +39,84 @@ def setup_logging(log_dir="logs", args=None):
     logging.info(f"Logging to {log_file}")
     return log_file
 
+
+def _load_dialog_trajectory(path):
+    turns = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            turns.append(
+                {
+                    "generated_action": obj.get("generated_action", "").strip(),
+                    "action": obj.get("action", "").strip(),
+                    "observation": obj.get("observation", "").strip(),
+                }
+            )
+    return turns
+
+
+def _format_demo_turns(turns):
+    chunks = []
+    for turn in turns:
+        obs = turn["observation"]
+        gen_act = turn["generated_action"]
+        act = turn["action"]
+        chunks.append(
+            "\n".join(
+                [
+                    f"Observation: {obs}",
+                    f"Generated action: {gen_act}",
+                    f"Action: {act}",
+                ]
+            )
+        )
+    return "\n\n".join(chunks)
+
+
+def build_few_shot_prompt(k, trajectories_dir, seed):
+    # Keep existing behavior for 1-shot.
+    if k <= 1:
+        return prompt1
+
+    all_files = sorted(glob.glob(os.path.join(trajectories_dir, "*.jsonl")))
+    if not all_files:
+        logging.warning(
+            f"No trajectory files found under {trajectories_dir}. Falling back to prompt1."
+        )
+        return prompt1
+
+    # k includes prompt1; we add k-1 extra demonstrations from trajectory files.
+    n_extra = min(k - 1, len(all_files))
+    random.seed(seed)
+    selected_files = random.sample(all_files, n_extra)
+
+    demo_blocks = []
+    for i, path in enumerate(selected_files, start=1):
+        turns = _load_dialog_trajectory(path)
+        if not turns:
+            continue
+        demo_text = _format_demo_turns(turns)
+        demo_blocks.append(f"Demo {i}:\n{demo_text}")
+
+    if not demo_blocks:
+        return prompt1
+
+    few_shot_prefix = "\n\n".join(demo_blocks) + "\n\n"
+    logging.info(
+        f"Using few-shot prompt: k={k} (prompt1 + {len(demo_blocks)} sampled trajectories)"
+    )
+    return few_shot_prefix + prompt1
+
 class WebshopAgent:   
     def __init__(self, env, llm):
         self.env = env
         self.llm = llm
 
     def run_one_example(self, idx, prompt, to_print=True):
+        logging.info(f'Initial prompt: {prompt}')
         action = 'reset'
         init_prompt = prompt
         prompt = ''
@@ -68,7 +143,7 @@ class WebshopAgent:
                 return res[1]
 
             action = self.llm(
-                init_prompt + prompt[-(6400-len(init_prompt)):]).lstrip(' ')
+                init_prompt + prompt[-(12800-len(init_prompt)):]).lstrip(' ')
             logging.info("===============================")
             logging.info(f'Generated action: {action}')
             logging.info("===============================")
@@ -108,6 +183,7 @@ def main(args):
     logging.info(f"Starting evaluation with model: {args.model_name}")
     logging.info(f"Using device: {args.device} (CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')})")
     logging.info(f"Number of episodes: {args.n_eval}")
+    logging.info(f"Few-shot k: {args.k}")
     
     llm = HF_LLM(
         model_name=args.model_name,
@@ -123,7 +199,12 @@ def main(args):
 
     env = WebshopEnv()
     agent = WebshopAgent(env, llm)
-    rewards = agent.evaluate(prompt1, n=args.n_eval)
+    eval_prompt = build_few_shot_prompt(
+        k=args.k,
+        trajectories_dir=args.trajectories_dir,
+        seed=args.few_shot_seed,
+    )
+    rewards = agent.evaluate(eval_prompt, n=args.n_eval)
     
     logging.info(f"Evaluation complete. Results saved to {log_file}") 
 
@@ -139,6 +220,19 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory to save log files.")
     
     parser.add_argument("--device", type=str, default="0", help="CUDA device ID to use (e.g., '0', '1', '2', or '0,1' for multiple GPUs).")
+    parser.add_argument("--k", type=int, default=1, help="Number of few-shot demonstrations. k=1 uses only prompt1; k>1 adds k-1 sampled trajectories.")
+    parser.add_argument(
+        "--trajectories_dir",
+        type=str,
+        default="cmd_results/scored_trajectories",
+        help="Directory containing extracted trajectory jsonl files for few-shot prompting.",
+    )
+    parser.add_argument(
+        "--few_shot_seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling few-shot trajectories.",
+    )
     
     args = parser.parse_args()
     
