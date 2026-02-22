@@ -178,7 +178,9 @@ cmd_results/
 README_SWE.md
 datasets/
 
-*.txt
+
 ./notebooks/samples
 
 *.tar
+
+*/search_engine/
