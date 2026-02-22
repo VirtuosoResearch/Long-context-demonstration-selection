@@ -78,9 +78,10 @@ def _format_demo_turns(turns):
 
 def build_few_shot_prompt(k, trajectories_dir, seed):
     # Keep existing behavior for 1-shot.
-    if k <= 1:
+    if k == 1:
         return prompt1
-
+    if k == 0:
+        return 'You are a helpful assistant that can answer questions about the webshop.'
     all_files = sorted(glob.glob(os.path.join(trajectories_dir, "*.jsonl")))
     if not all_files:
         logging.warning(
@@ -88,8 +89,8 @@ def build_few_shot_prompt(k, trajectories_dir, seed):
         )
         return prompt1
 
-    # k includes prompt1; we add k-1 extra demonstrations from trajectory files.
-    n_extra = min(k - 1, len(all_files))
+    # we add k extra demonstrations from trajectory files.
+    n_extra = min(k-1, len(all_files))
     random.seed(seed)
     selected_files = random.sample(all_files, n_extra)
 
@@ -108,7 +109,7 @@ def build_few_shot_prompt(k, trajectories_dir, seed):
     logging.info(
         f"Using few-shot prompt: k={k} (prompt1 + {len(demo_blocks)} sampled trajectories)"
     )
-    return few_shot_prefix + prompt1
+    return few_shot_prefix+prompt1
 
 class WebshopAgent:   
     def __init__(self, env, llm):
