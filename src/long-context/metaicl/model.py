@@ -14,7 +14,6 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 from transformers import BitsAndBytesConfig, AutoTokenizer
 
-from thop import profile
 from utils.utils import get_checkpoint_id, download_file
 
 class MetaICLModel(object):
@@ -136,11 +135,9 @@ class MetaICLModel(object):
             torch.save(model_state_dict, os.path.join(self.out_dir, "model-{}.pt".format(step)))
             self.logger.info("Saving model parameters at step=%d" % step)
 
-    def do_inference(self, data, batch_size=1, verbose=False, is_flops=False):
+    def do_inference(self, data, batch_size=1, verbose=False):
         dataloader = data.get_dataloader(batch_size, is_training=False)
         losses = []
-        n = 0
-        total_flops =0
         for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             input_ids=batch[0].cuda()
             attention_mask=batch[1].cuda()
@@ -152,14 +149,11 @@ class MetaICLModel(object):
             input_ids = input_ids.to(self.device)
             attention_mask = attention_mask.to(self.device)
             token_type_ids = token_type_ids.to(self.device)
-            text = data.tokenizer.decode(input_ids[0])
-            flops=0
             with torch.no_grad():
-                loss, flops = self.run_model(input_ids, attention_mask, token_type_ids, labels=labels, is_flops=is_flops)
-            total_flops+=flops
+                loss = self.run_model(input_ids, attention_mask, token_type_ids, labels=labels)
             losses += loss.cpu().detach().numpy().tolist()
 
-        return losses,flops
+        return losses
 
     def do_predict(self, data, batch_size=4, losses=None, verbose=False):
         if losses is None:
@@ -172,18 +166,14 @@ class MetaICLModel(object):
             curr_label_losses = [np.sum(losses[indices]) for indices in dp["indices"]]
             prediction_idx = sorted(enumerate(curr_label_losses), key=lambda x: x[1])[0][0]
             prediction = dp["options"][prediction_idx]
-            print(prediction)
             predictions.append(prediction.strip())
         return predictions
 
-    def run_model(self, input_ids, attention_mask, token_type_ids, labels=None, is_flops=False):
+    def run_model(self, input_ids, attention_mask, token_type_ids, labels=None):
         # print("self.tokenizer: ",self.tokenizer)
         # print("input_ids: ", input_ids[0])
         # print("input_ids_text: ", self.tokenizer.decode(input_ids[0]))
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        flops=0
-        if is_flops:
-            flops, params = profile(self.model, inputs=(input_ids,))
         logits = outputs.logits[..., :-1, :].contiguous()
         if labels is None:
             labels = input_ids
@@ -202,7 +192,7 @@ class MetaICLModel(object):
         # print("losses: ",losses)
 
         losses = losses.view(logits.size(0), logits.size(1)) * label_mask
-        return torch.sum(losses, axis=1) / torch.sum(label_mask, axis=1), flops
+        return torch.sum(losses, axis=1) / torch.sum(label_mask, axis=1)
 
 
 

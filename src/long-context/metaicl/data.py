@@ -21,10 +21,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, OPTForCausalLM
 from tqdm import tqdm
-from thop import profile
 
 from rank_bm25 import BM25Okapi
-logging.getLogger("thop").setLevel(logging.WARNING)
 
 # import sys
 # import os
@@ -63,7 +61,7 @@ class OpenLLMEvaluator:
         self.model.generation_config = GenerationConfig.from_pretrained(model_name)
         self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
 
-    def query(self, question: str, examples: list = [], is_flops=False) -> str:
+    def query(self, question: str, examples: list = []) -> str:
         messages = []
         messages_text = ""
         for inp, out in examples:
@@ -77,15 +75,11 @@ class OpenLLMEvaluator:
         ).to(self.model.device)
 
         input_ids = self.tokenizer(messages_text)["input_ids"]
-        flops=0
-        if is_flops:
-            flops, params = profile(self.model, inputs=(input_ids,))
-
         outputs = self.model.generate(input_tensor, max_new_tokens=100)
         result = self.tokenizer.decode(outputs[0][input_tensor.shape[1]:], skip_special_tokens=True)
-        return result.strip(), flops
+        return result.strip()
 
-def _get_embedding_loss(model, tokenizer, input_texts, pad_to_length, is_flops=False):
+def _get_embedding_loss(model, tokenizer, input_texts, pad_to_length):
     model = model.model
     tokenizer.padding_side = "right"
 
@@ -113,11 +107,7 @@ def _get_embedding_loss(model, tokenizer, input_texts, pad_to_length, is_flops=F
 
     effective_embedding_grad = embedding_grad[:, :-1, :]
 
-    flops=0
-    if is_flops:
-        flops, params = profile(model, inputs=(inputs['input_ids'],))
-
-    return ce_loss, effective_embedding_grad, flops
+    return ce_loss, effective_embedding_grad
 
 def _get_embedding_loss_(model, tokenizer, input_texts, pad_to_length):
     model = model.model
@@ -155,7 +145,7 @@ class MetaICLData(object):
 
     def __init__(self, device=0, logger=None, tokenizer=None, method="channel", use_demonstrations=True, k=16,
                  max_length=1024, max_length_per_example=256,
-                 do_tensorize=False, tensorize_dir=None, seed=0, n_process=None, n_gpu=None, local_rank=-1, is_flops=False):
+                 do_tensorize=False, tensorize_dir=None, seed=0, n_process=None, n_gpu=None, local_rank=-1):
 
         self.logger = logger
         self.tokenizer = tokenizer
@@ -175,9 +165,7 @@ class MetaICLData(object):
         self.metadata = None
         self.device = device
         self.is_null = False
-        self.is_flops = is_flops
         self.seed =seed
-        self.total_flops=0
 
 
         #print(tokenizer)
@@ -190,6 +178,12 @@ class MetaICLData(object):
         if self.tensorized_inputs is None:
             return 0
         return len(self.tensorized_inputs["input_ids"])
+
+    @staticmethod
+    def _normalize_feature_split(split_name):
+        if split_name == "dev":
+            return "val"
+        return split_name
 
     def __str__(self):
         text = "[MetaICL Data]: method=%d, "
@@ -249,30 +243,12 @@ class MetaICLData(object):
     def evaluate(self, predictions, groundtruths, is_classification):
         assert len(predictions)==len(self.metadata)
         accs = []
-        precisions = defaultdict(list)
-        recalls = defaultdict(list)
         for prediction, groundtruth in zip(predictions, groundtruths):
             prediction = prediction.strip()
             groundtruth = [gt.strip() for gt in groundtruth] if type(groundtruth)==list else groundtruth.strip()
             is_correct = prediction in groundtruth if type(groundtruth)==list else prediction==groundtruth
             accs.append(is_correct)
-            if is_classification:
-                recalls[groundtruth].append(is_correct)
-                precisions[prediction].append(is_correct)
-
-        if not is_classification:
-            return np.mean(accs)
-
-        f1s = []
-        for key in recalls:
-            precision = np.mean(precisions[key]) if key in precisions else 1.0
-            recall = np.mean(recalls[key])
-            if precision+recall==0:
-                f1s.append(0)
-            else:
-                f1s.append(2*precision*recall / (precision+recall))
-
-        return np.mean(f1s)
+        return np.mean(accs)
 
     def _prepro_each_datapoint(self, dp, is_first=True, is_training=False, for_demonstrations=False,
                                add_newlines=True):
@@ -339,7 +315,8 @@ class MetaICLData(object):
             else:
                 raise NotImplementedError()
 
-    def tensorize_topk(self, _test_data, _val_data, options=None, add_newlines=True):
+    def tensorize_topk(self, _test_data, _val_data, options=None, add_newlines=True,
+                       retrieval_split="test", eval_split="dev"):
         if options is not None:
             for i, dp in enumerate(_test_data):
                 _test_data[i] = {"input": dp, "options": options}
@@ -358,12 +335,18 @@ class MetaICLData(object):
             val_data.append(dp.copy())
         
         task = _test_data[0]["task"]
-        test_features_path = f"./features/{task}_test_features.json"
+        retrieval_feature_split = self._normalize_feature_split(retrieval_split)
+        eval_feature_split = self._normalize_feature_split(eval_split)
+        test_features_path = f"./features/{task}_{retrieval_feature_split}_features.json"
         with open(test_features_path, "r") as file:
             test_features = json.load(file)
-        val_features_path = f"./features/{task}_val_features.json"
+        val_features_path = f"./features/{task}_{eval_feature_split}_features.json"
         with open(val_features_path, "r") as file:
             val_features = json.load(file)
+        assert len(test_features) >= len(test_data), \
+            f"features size mismatch: {test_features_path} has {len(test_features)}, data has {len(test_data)}"
+        assert len(val_features) >= len(val_data), \
+            f"features size mismatch: {val_features_path} has {len(val_features)}, data has {len(val_data)}"
 
         input_ids, attention_mask, token_type_ids = [], [], []
         metadata = []
@@ -485,7 +468,8 @@ class MetaICLData(object):
 
         return [test_data[i] for i in random_indices]
     
-    def tensorize_randomk(self, _test_data, _val_data, options=None, add_newlines=True):
+    def tensorize_randomk(self, _test_data, _val_data, options=None, add_newlines=True,
+                          retrieval_split="test", eval_split="dev"):
         if options is not None:
             for i, dp in enumerate(_test_data):
                 _test_data[i] = {"input": dp, "options": options}
@@ -504,12 +488,18 @@ class MetaICLData(object):
             val_data.append(dp.copy())
         
         task = _test_data[0]["task"]
-        test_features_path = f"./features/{task}_test_features.json"
+        retrieval_feature_split = self._normalize_feature_split(retrieval_split)
+        eval_feature_split = self._normalize_feature_split(eval_split)
+        test_features_path = f"./features/{task}_{retrieval_feature_split}_features.json"
         with open(test_features_path, "r") as file:
             test_features = json.load(file)
-        val_features_path = f"./features/{task}_val_features.json"
+        val_features_path = f"./features/{task}_{eval_feature_split}_features.json"
         with open(val_features_path, "r") as file:
             val_features = json.load(file)
+        assert len(test_features) >= len(test_data), \
+            f"features size mismatch: {test_features_path} has {len(test_features)}, data has {len(test_data)}"
+        assert len(val_features) >= len(val_data), \
+            f"features size mismatch: {val_features_path} has {len(val_features)}, data has {len(val_data)}"
 
         input_ids, attention_mask, token_type_ids = [], [], []
         metadata = []
@@ -753,6 +743,13 @@ def prepro_sentence_pair_single(ids1, ids2, max_length,
     #special_ids.extend([128000, 128001])
     ids1 = [i for i in ids1 if i not in special_ids]
     ids2 = [i for i in ids2 if i not in special_ids]
+
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
+    if bos_token_id is None:
+        bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else eos_token_id
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer pad_token_id is None; cannot build fixed-length input.")
 
     # Add bos and eos tokens later, so leave space for them
     total_len = len(ids1) + len(ids2) + 2  # +2 for bos and eos

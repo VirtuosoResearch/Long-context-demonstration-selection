@@ -31,7 +31,7 @@ def main(logger, args):
 
     if args.gpt2.startswith("gpt2"):
         tokenizer = GPT2Tokenizer.from_pretrained(args.gpt2)
-    elif "Llama" or "deepseek" or "Qwen" in args.gpt2:
+    elif any(name in args.gpt2 for name in ["Llama", "deepseek", "Qwen"]):
         tokenizer = AutoTokenizer.from_pretrained(args.gpt2)
     else:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -39,15 +39,12 @@ def main(logger, args):
     if tokenizer.padding_side=="left":
         tokenizer.padding_side = "right"
     add_newlines = True
-    if "Llama" or "Qwen" in args.gpt2:
-        special_tokens = {
-            "pad_token": "<pad>",
-            "unk_token": "<unk>",
-            "bos_token": "<bos>",
-            "eos_token": "<eos>"
-        }
-
-        tokenizer.add_special_tokens(special_tokens)
+    if tokenizer.eos_token_id is None and tokenizer.sep_token is not None:
+        tokenizer.eos_token = tokenizer.sep_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token = tokenizer.eos_token
     ### checkpoint ...
     if not args.do_zeroshot:
         if args.checkpoint is not None:
@@ -89,7 +86,7 @@ def main(logger, args):
         args.test_batch_size, max_length, max_length_per_example))
 
     metaicl_data = MetaICLData(args.device ,logger, tokenizer, args.method,args.use_demonstrations, args.k,
-                               max_length=max_length, seed=args.seed, is_flops=args.is_flops)
+                               max_length=max_length, seed=args.seed)
     # metaicl_data.to(device)
     results = []
     errors = []
@@ -98,15 +95,19 @@ def main(logger, args):
 
     for seed in seeds:
 
-        test_data = load_data(args.task, "test", args.k, seed=seed, config_split=config_split,
-                             datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null)
-        val_data = load_data(args.task, "dev", args.k, seed=seed, config_split=config_split,
-                             datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null)
+        retrieval_data = load_data(
+            args.task, args.retrieval_split, args.k, seed=seed, config_split=config_split,
+            datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null
+        )
+        eval_data = load_data(
+            args.task, args.eval_split, args.k, seed=seed, config_split=config_split,
+            datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null
+        )
 
         print("*"*20)
-        print(f"args.split : {args.split}")
+        print(f"retrieval_split: {args.retrieval_split}, eval_split: {args.eval_split}")
 
-        test_task = test_data[0]["task"]
+        test_task = eval_data[0]["task"]
 
         config_file = "config/tasks/{}.json".format(test_task)
         assert os.path.exists(config_file), config_file
@@ -114,11 +115,11 @@ def main(logger, args):
             config = json.load(f)
         is_classification = config["task_type"]=="classification"
         if is_classification:
-            options = test_data[0]["options"]
-            assert np.all([d["options"]==options for d in test_data])
+            options = eval_data[0]["options"]
+            assert np.all([d["options"]==options for d in eval_data])
 
         result = run(logger, test_task, metaicl_data, metaicl_model,
-                     test_data, val_data, seed, checkpoint, is_classification, add_newlines, tokenizer)
+                     retrieval_data, eval_data, seed, checkpoint, is_classification, add_newlines, tokenizer)
         if result is None:
             errors.append("%s/%s" % (test_task, seed))
         else:
@@ -134,36 +135,38 @@ def main(logger, args):
         logger.info("Please see the error messages")
 
 
-def run(logger, task, metaicl_data, metaicl_model, test_data, val_data, seed,
+def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, seed,
         checkpoint, is_classification, add_newlines, tokenizer):
 
     if args.do_zeroshot:
-        split_name = args.split
+        split_name = f"{args.eval_split}-ret={args.retrieval_split}"
         if args.is_null:
             split_name += "-null"
-        cache_path = os.path.join(args.out_dir,
-                                  "{}-{}-{}{}{}{}{}{}{}{}{}{}{}{}{}.pkl".format(
-                                      task,
-                                      split_name,
-                                      metaicl_data.method,
-                                      "-topk" if args.topk else "",
-                                      "-randomk" if args.randomk else "",
-                                      "-bm25" if args.bm25 else "",
-                                      "-k={}".format(args.k) if args.use_demonstrations else "",
-                                      "-s={}".format(seed) if args.use_demonstrations or args.use_random_english_words else "",
-                                      "" if add_newlines else "-no-newlines",
-                                      ""))
+        cache_suffix = "".join([
+            "-topk" if args.topk else "",
+            "-randomk" if args.randomk else "",
+            "-bm25" if args.bm25 else "",
+            "-k={}".format(args.k) if args.use_demonstrations else "",
+            "-s={}".format(seed) if args.use_demonstrations or args.use_random_english_words else "",
+            "" if add_newlines else "-no-newlines",
+        ])
+        cache_path = os.path.join(
+            args.out_dir,
+            f"{task}-{split_name}-{metaicl_data.method}{cache_suffix}.pkl",
+        )
 
-    datapath = "./data/alldata.jsonl"
-    train_split = 0.4
-    train_data = val_data[int(len(val_data)*train_split):]
-    val_data = val_data[:int(len(val_data)*train_split)]
     if args.topk:
-        metaicl_data.tensorize_topk(test_data, val_data, options=None, add_newlines=add_newlines)
+        metaicl_data.tensorize_topk(
+            retrieval_data, eval_data, options=None, add_newlines=add_newlines,
+            retrieval_split=args.retrieval_split, eval_split=args.eval_split,
+        )
     elif args.randomk:
-        metaicl_data.tensorize_randomk(test_data, val_data, options=None,  add_newlines=add_newlines)
+        metaicl_data.tensorize_randomk(
+            retrieval_data, eval_data, options=None, add_newlines=add_newlines,
+            retrieval_split=args.retrieval_split, eval_split=args.eval_split,
+        )
     elif args.bm25:
-        metaicl_data.tensorize_bm25(test_data, val_data, options=None,  add_newlines=add_newlines)
+        metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None,  add_newlines=add_newlines)
     else:
         raise ValueError("Please choose one selection method: --topk, --randomk, or --bm25")
 
@@ -183,9 +186,7 @@ def run(logger, task, metaicl_data, metaicl_model, test_data, val_data, seed,
     losses = []
     n = 0
 
-    losses, flops = metaicl_model.do_inference(metaicl_data, args.test_batch_size, is_flops=args.is_flops)
-    
-    print(f"args.is_flops: {args.is_flops}, flops: {flops}")
+    losses = metaicl_model.do_inference(metaicl_data, args.test_batch_size)
 
     with open(cache_path, "wb") as f:
         pkl.dump(losses, f)
@@ -197,7 +198,8 @@ def run(logger, task, metaicl_data, metaicl_model, test_data, val_data, seed,
 
     if args.use_calibration:
         assert args.do_zeroshot
-        bias_path = cache_path.replace("/"+task+"-"+args.split, "/"+task+"-"+args.split+"-null")
+        key = "/" + task + "-" + f"{args.eval_split}-ret={args.retrieval_split}"
+        bias_path = cache_path.replace(key, key + "-null")
         assert os.path.exists(bias_path), bias_path
         with open(bias_path, "rb") as f:
             bias_losses = pkl.load(f)
@@ -206,9 +208,8 @@ def run(logger, task, metaicl_data, metaicl_model, test_data, val_data, seed,
         bias_losses = np.array(bias_losses)
         assert losses.shape == bias_losses.shape
         losses -= bias_losses
-    logger.info(f"Total_FLOPS: {(metaicl_data.total_flops+flops) / 1e9:.2f} GFLOPs")
     predictions = metaicl_model.do_predict(metaicl_data, losses=losses)
-    groundtruths = [dp["output"] for dp in val_data]
+    groundtruths = [dp["output"] for dp in eval_data]
     perf = metaicl_data.evaluate(predictions, groundtruths, is_classification)
     logger.info("Accuracy= %s", perf)
 
@@ -241,7 +242,8 @@ if __name__=='__main__':
 
     parser.add_argument("--out_dir", type=str, required=True, default="out/gpt2-large")
 
-    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--eval_split", type=str, default="dev")
+    parser.add_argument("--retrieval_split", type=str, default="test")
     parser.add_argument("--is_null", default=False, action="store_true")
     parser.add_argument("--method", type=str, default="direct", choices=["direct", "channel"])
     parser.add_argument("--gpt2", type=str, default="gpt2-large")
@@ -253,7 +255,6 @@ if __name__=='__main__':
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--is_quant", default=False, action="store_true")
     parser.add_argument("--max_length", default=128, type=int)
-    parser.add_argument("--is_flops", default=False, action="store_true")
     args = parser.parse_args()
 
     handlers = [logging.StreamHandler()]
