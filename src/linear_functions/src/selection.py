@@ -50,32 +50,12 @@ task_sampler = get_task_sampler(
 
 def predict_full_label(model, xs, ys, labels):
     with torch.no_grad():
-        #pred = model.seq_inference(xs, ys)
         pred = model(xs, ys)
-    #print(pred[0])
     metric = task.get_metric()
     loss = metric(pred, labels).cpu().numpy()
 
     return pred, loss.mean(axis=0)
 
-def predict_full_label2(model, xs, ys, labels):
-    n_labeled = 20
-    n_total = xs.shape[1] - 1
-    loss_list = []
-    for i in range(10, n_total):
-        query_x = xs[:, -1, :].unsqueeze(1)
-        query_y = ys[:, -1].unsqueeze(1)
-        print(query_y.shape)
-        temp_xs = torch.cat([xs[:, :i, :], query_x], dim=1)
-        temp_ys = torch.cat([ys[:, :i], query_y], dim=1)
-        with torch.no_grad():
-            pred = model(temp_xs, temp_ys)
-        print(pred.shape)
-        metric = task.get_metric()
-        loss = metric(pred, temp_ys).cpu().numpy()
-        loss_list.append(loss.mean(axis=0)[-1])
-
-    return loss_list
 
 def tensor_add_sample(xs, ys, sample):
     xs = torch.cat([xs, sample.x.view(1,1,-1)], dim=1)
@@ -117,6 +97,7 @@ n_unlabeled = n_total - n_labeled
 runs = 1
 loss_full_label_list = []
 loss_random_list = []
+loss_random_ensemble_list = []
 loss_beta_list = []
 loss_loss_list = []
 loss_contrastive_list = []
@@ -129,8 +110,6 @@ add_set_size = 5
 
 def distance_score(model, seq, sample_list, new_sample):
     n = len(sample_list)
-    #print(sample_list[0].x.shape)
-    #print(sample_list[0])
     # concat sample_list to seq
     sub_seq_list = []
     for i in range(n):
@@ -148,8 +127,6 @@ def distance_score(model, seq, sample_list, new_sample):
     with torch.no_grad():
         embedding = model.encoder(xs, ys)
         new_embedding = model.encoder(new_xs, new_ys)
-    #print(embedding.mean(dim=0).shape)
-    #print(new_embedding[0].shape)
     score = torch.norm(embedding.mean(dim=0) - new_embedding[0])
     score = 1 / score
     return score
@@ -157,59 +134,14 @@ def distance_score(model, seq, sample_list, new_sample):
 def x_distance_score(model, sample_list, new_sample):
     n = len(sample_list)
     xs = torch.stack([s.x for s in sample_list], dim=0)
-    #print(xs.shape)
-    #print(new_sample.x.shape)
     score = torch.norm(xs.mean(dim=0) - new_sample.x, dim=0)
-    #score = 1/score
     return score
 
 
-def fs_inference_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    n_points = xs.shape[1] - 1
-    n = len(sample_list)
-    print(n)
-    pos_index = torch.zeros(n, n)
-    seq_list = []
-    for i in range(xs.shape[0]):
-        seq_list.append(Input_sequence(xs[i], ys[i], n_labeled, beta[i], i))
-
-    # init select index for query in each sequence
-    loss_list = []
-    max_points = np.max(set_size_list)
-    sub_sample_list = [[] for _ in range(b_size)]
-    sub_sample_index = [[] for _ in range(b_size)]
-    for k in range(1, max_points+1):
-        for i in range(b_size):
-            
-            same_label_index = [i * n_points + j for j in range(n_points)]
-
-            score = loss_score(model, seq_list[i], n_labeled, sample_list, sub_sample_list[i], task)
-
-            select_index = torch.argmin(score)
-            sub_sample_index[i].append(select_index)
-            sub_sample_list[i].append(sample_list[select_index])
-            seq_list[i].add_sample(sample_list[select_index])
-            score[select_index] = 1e9
-            print(sub_sample_index[i])
-            if k in set_size_list:
-                seq_list[i].get_input()
-        if k in set_size_list:
-            # get the input tensor
-            xs, ys = sequence_to_tensor(seq_list)
-            with torch.no_grad():
-                pred = model(xs, ys)
-            metric = task.get_metric()
-            loss = metric(pred, ys).cpu().numpy()
-            loss_query = loss.mean(axis=0)[-1]
-            #print(loss_query)
-            loss_list.append(loss_query)
-
-    return loss_list
 
 def fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
     n_points = xs.shape[1] - 1
     n = len(sample_list)
-    print(n)
     pos_index = torch.zeros(n, n)
 
     # init select index for query in each sequence
@@ -265,7 +197,6 @@ def fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list
             metric = task.get_metric()
             loss_infer = metric(pred, sub_ys)
             score = loss_infer[:, -1]
-            #print(score.sort())
             
             #score = score_infer
             
@@ -288,9 +219,6 @@ def fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list
                 beta_candidate.append(sample_list[idx].beta.unsqueeze(0))
                 x_candidate.append(sample_list[idx].x.unsqueeze(0))
                 y_candidate.append(sample_list[idx].y.unsqueeze(0))
-                #print(sample_list[idx].x)
-                #print(sample_list[idx].y)
-                #print(sample_list[idx].beta[0,0])
             
             beta_candidate = torch.cat(beta_candidate, dim=0)
             x_candidate = torch.cat(x_candidate, dim=0)
@@ -314,13 +242,13 @@ def fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list
             select_index = torch.argmin(score)
             sub_sample_index[i].append(select_index)
             sub_sample_list[i].append(sample_list[select_index])
-            print("======= least: ", (sample_list[select_index].beta - sample_list[i*(n_total-1)].beta).mean())
-            print("======= mean: ", (mean_beta - sample_list[i*(n_total-1)].beta).mean())
+            # print("======= least: ", (sample_list[select_index].beta - sample_list[i*(n_total-1)].beta).mean())
+            # print("======= mean: ", (mean_beta - sample_list[i*(n_total-1)].beta).mean())
             #temp_x[i], temp_y[i] = tensor_add_sample(temp_x[i], temp_y[i], sample_list[select_index])
             #sub_sample_list[i].append(new_sample)
             temp_x[i], temp_y[i] = tensor_add_sample(temp_x[i], temp_y[i], new_sample)
 
-            print(sub_sample_index[i])
+            # print(sub_sample_index[i])
 
         if k in set_size_list:
             # get the input tensor
@@ -337,416 +265,7 @@ def fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list
             metric = task.get_metric()
             loss = metric(pred, query_ys).cpu().numpy()
             loss_query = loss.mean(axis=0)[-1]
-            #print(loss_query)
             loss_list.append(loss_query)
-
-    return loss_list
-
-def fs_select2(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    n_points = xs.shape[1] - 1
-    n = len(sample_list)
-    print(n)
-    pos_index = torch.zeros(n, n)
-    seq_list = []
-    for i in range(xs.shape[0]):
-        seq_list.append(Input_sequence(xs[i], ys[i], n_labeled, beta[i], i))
-
-    # init select index for query in each sequence
-    loss_list = []
-    loss_list_infer = []
-    max_points = np.max(set_size_list)
-    sub_sample_list = [[] for _ in range(b_size)]
-    sub_sample_index = [[] for _ in range(b_size)]
-    sub_sample_list_infer = [[] for _ in range(b_size)]
-    sub_sample_index_infer = [[] for _ in range(b_size)]
-    for k in range(1, max_points+1):
-        for i in range(b_size):
-            sub_seq_list = []
-            n_val = 3
-            i_seq = copy.deepcopy(seq_list[i])
-            #i_seq.get_input(last_prompt=True)
-            
-            i_seq.get_input(query_range=n_val)
-            xs, ys = sequence_to_tensor([i_seq])
-            pred_0, embeds_0 = model.forward_with_embeds(xs, ys)
-            print(pred_0[0, -n_val-1])
-            grad = torch.autograd.grad(pred_0[0, -n_val:].mean(dim=-1), embeds_0, retain_graph=True, create_graph=True)[0]
-            grad = grad[:, 0::2, :]
-            grad_0 = grad[:, :, :]
-            print(grad_0)
-            embeds_0 = embeds_0[:, 0::2, :]
-
-
-            metric = task.get_metric()
-
-            delta_x = []
-            for j in range(n):
-                sub_seq = copy.deepcopy(seq_list[i])
-                # becausre sample_list contains the last sample
-                #delta_x.append(sample_list[j].x - sub_seq.prompt_x[-1])
-                sub_seq.add_sample(sample_list[j])
-                #sub_seq.get_input(last_prompt=True)
-                #sub_seq.get_input(query_index=-2)
-                sub_seq.get_input(query_range=n_val)
-                #sub_seq.get_input(query_sample=sample_list[j])
-                sub_seq_list.append(sub_seq)
-            #delta_x = torch.stack(delta_x, dim=0)
-            #delta_y = torch.zeros(delta_x.shape[0], delta_x.shape[-1]).to(device)
-            #print(delta_x.shape)
-            #print(delta_y.shape)
-            sub_xs, sub_ys = sequence_to_tensor(sub_seq_list)
-            embeds = model.embed_x(sub_xs)
-            delta_embeds = embeds[:, -n_val-1, :] - embeds[:, -n_val-2, :]
-            print(delta_embeds.shape)
-            print(grad_0.shape)
-            #print(embeds_0)
-            #print(embeds[:, -2, :])
-            #delta_term = torch.sum(grad_0 * delta_embeds, dim=1, keepdim=True)
-
-            delta_term = delta_embeds @ grad_0[0, :, :].T
-            print(delta_term.shape)
-            print(pred_0.shape)
-            #print(delta_embeds_real)
-            #print(delta_embeds)
-            #approx_pred = delta_term + pred_0[0, -1]
-            approx_pred = pred_0
-            #approx_pred[:, -n_val:] = approx_pred.expand(delta_term.shape[0], delta_term.shape[1])[:, -n_val:] + delta_term[:, -n_val:]
-            approx_pred = approx_pred + delta_term
-            #approx_pred = (delta_term + pred_0)
-            print(delta_term)
-            print('---------pred 0', pred_0[0, -n_val:])
-            print(approx_pred.shape)
-            #print("x0 pred", pred_0[0, -1])
-            #print("delta ", delta_term)
-            #print("approx pred", approx_pred)
-
-            
-            xs, ys = sequence_to_tensor(sub_seq_list)
-            with torch.no_grad():
-                pred = model(xs, ys)
-            #print('---------real pred', pred[:5, -n_val:])
-            #print('---------approx pred', approx_pred[:5, -n_val:])
-            metric = task.get_metric()
-            loss_infer = metric(pred, ys)
-            #loss_approx = metric(approx_pred, ys)
-            #print(loss_infer[:5, -1])
-            #print(loss_approx[:5, -1])            
-            score = loss_infer[:, -1]
-
-            #score = score_infer
-            select_index = torch.argmin(score)
-            sub_sample_index[i].append(select_index)
-            sub_sample_list[i].append(sample_list[select_index])
-            seq_list[i].add_sample(sample_list[select_index])
-            #print(a)
-            print(sub_sample_index[i])
-            if k in set_size_list:
-                seq_list[i].get_input()
-        if k in set_size_list:
-            # get the input tensor
-            xs, ys = sequence_to_tensor(seq_list)
-            with torch.no_grad():
-                pred = model(xs, ys)
-            metric = task.get_metric()
-            loss = metric(pred, ys).cpu().numpy()
-            loss_query = loss.mean(axis=0)[-1]
-            #print(loss_query)
-            loss_list.append(loss_query)
-
-    return loss_list
-
-def fs_select3(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    mse_loss = nn.MSELoss(reduction='none')
-    n_points = xs.shape[1] - 1
-    n = len(sample_list)
-    print(n)
-    pos_index = torch.zeros(n, n)
-    seq_list = []
-    for i in range(xs.shape[0]):
-        seq_list.append(Input_sequence(xs[i], ys[i], n_labeled, beta[i], i))
-
-    # init select index for query in each sequence
-    loss_list = []
-    loss_list_infer = []
-    max_points = np.max(set_size_list)
-    sub_sample_list = [[] for _ in range(b_size)]
-    sub_sample_index = [[] for _ in range(b_size)]
-    sub_sample_list_infer = [[] for _ in range(b_size)]
-    sub_sample_index_infer = [[] for _ in range(b_size)]
-    select_index = 0
-    for k in range(1, max_points+1):
-        for i in range(b_size):
-            sub_seq_list = []
-            n_val = 5
-            i_seq = copy.deepcopy(seq_list[i])
-            #i_seq.get_input(last_prompt=True)
-            i_seq.get_input(query_range=n_val)
-            xs, ys = sequence_to_tensor([i_seq])
-            pred_0, embeds_0 = model.forward_with_embeds(xs, ys)
-            grad = torch.autograd.grad(pred_0[0, -1], embeds_0, retain_graph=True, create_graph=True)[0]
-            grad = grad[:, 0::2, :]
-            grad_0 = grad[:, -1, :]
-            embeds_0 = embeds_0[:, 0::2, :]
-
-            metric = task.get_metric()
-
-            delta_x = []
-            for j in range(n):
-                if j in sub_sample_index[i]:
-                    continue
-                sub_seq = copy.deepcopy(seq_list[i])
-
-                sub_seq.add_sample(sample_list[j])
-                #sub_seq.get_input(last_prompt=True)
-                sub_seq.get_input(query_range=n_val)
-                sub_seq_list.append(sub_seq)
-
-            sub_xs, sub_ys = sequence_to_tensor(sub_seq_list)
-            embeds = model.embed_x(sub_xs)
-            delta_embeds = embeds[:, -1, :] - embeds[:, -2, :]
-
-            delta_term = torch.sum(grad_0 * delta_embeds, dim=1, keepdim=True)
-
-            print(delta_term.shape)
-            approx_pred = delta_term + pred_0[0, -1]
-            xs, ys = sequence_to_tensor(sub_seq_list)
-            with torch.no_grad():
-                pred = model(xs, ys)
-            print('---------real pred', pred[:5, -1])
-            print('---------approx pred', approx_pred[:5, -1])
-            metric = task.get_metric()
-            #loss_infer = metric(pred, ys)
-            #loss_approx = metric(approx_pred, ys)
-            label = (xs @ seq_list[i].beta)[:, -1, 0]
-            #print(label.shape)
-            loss_infer = mse_loss(pred[:, -1], label)
-            loss_approx = mse_loss(approx_pred[:, -1], label)
-            #print(loss_infer.shape)
-            print(loss_infer)
-            print(loss_approx)
-            score = loss_infer
-
-            #score = score_infer
-            select_index = torch.argmin(score)
-            sub_sample_index[i].append(select_index)
-            sub_sample_list[i].append(sample_list[select_index])
-            seq_list[i].add_sample(sample_list[select_index])
-
-            print(sub_sample_index[i])
-            if k in set_size_list:
-                seq_list[i].get_input()
-        if k in set_size_list:
-            # get the input tensor
-            xs, ys = sequence_to_tensor(seq_list)
-            with torch.no_grad():
-                pred = model(xs, ys)
-            metric = task.get_metric()
-            loss = metric(pred, ys).cpu().numpy()
-            loss_query = loss.mean(axis=0)[-1]
-            #print(loss_query)
-            loss_list.append(loss_query)
-
-    return loss_list
-
-def fs_select4(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    n_points = xs.shape[1] - 1
-    n = len(sample_list)
-    n = 5
-    print(n)
-    pos_index = torch.zeros(n, n)
-
-    # init select index for query in each sequence
-    loss_list = []
-    loss_list_infer = []
-    max_points = np.max(set_size_list)
-    sub_sample_list = [[] for _ in range(b_size)]
-    sub_sample_index = [[] for _ in range(b_size)]
-    sub_sample_list_infer = [[] for _ in range(b_size)]
-    sub_sample_index_infer = [[] for _ in range(b_size)]
-    select_index = 0
-
-    temp_x = []
-    temp_y = []
-    set_size_list = [3]
-    for i in range(b_size):
-        temp_x.append(xs[i, :n_labeled, :].unsqueeze(0))
-        temp_y.append(ys[i, :n_labeled].unsqueeze(0))
-
-    task_index = range(1)
-    for k in range(1, max_points+1):
-        for i in task_index:
-            ground_beta = sample_list[i*(n_total-1)].beta
-            #print(ground_beta[:5,0])
-            #if i > 0:
-            #    continue
-            sub_seq_x_list = []
-            sub_seq_y_list = []
-            n_val = 5
-            i_x = temp_x[i]
-            i_y = temp_y[i]
-            pred_0, embeds_0 = model.forward_with_embeds(i_x, i_y)
-            grad = torch.autograd.grad(pred_0[0, -1], embeds_0, retain_graph=True, create_graph=True)[0]
-            grad = grad[:, 0::2, :]
-            grad_0 = grad[:, -1, :]
-            embeds_0 = embeds_0[:, 0::2, :]
-
-            metric = task.get_metric()
-            i_sample_list = []
-            for j in range(n):
-                sub_x = XS[i, k+n_labeled-1, :]
-                sub_x = torch.randn(sub_x.shape).to(device)
-                i_class = torch.randint(0, n_classes, (1,))
-                sub_beta = beta[i_class]
-                #sub_beta = torch.randn(sub_x.shape[0], 1).to(device)
-                sub_y = sub_x @ sub_beta
-                sub_sample = Sample(sub_x, sub_y, i_class, sub_beta)
-                sub_i_x, sub_i_y = tensor_add_sample(i_x, i_y, sub_sample)
-                #sub_i_x, sub_i_y = tensor_add_xy(i_x, i_y, temp_x, temp_y)
-                sub_seq_x_list.append(sub_i_x)
-                sub_seq_y_list.append(sub_i_y)
-                i_sample_list.append(sub_sample)
-
-            sub_xs = torch.cat(sub_seq_x_list, dim=0)
-            sub_ys = torch.cat(sub_seq_y_list, dim=0)
-            sub_label = copy.deepcopy(sub_ys)
-            sub_label[:, -1] = sub_label[:, -2]
-            embeds = model.embed_x(sub_xs)
-            delta_embeds = embeds[:, -1, :] - embeds[:, -2, :]
-
-            delta_term = torch.sum(grad_0 * delta_embeds, dim=1, keepdim=True)
-
-            with torch.no_grad():
-                pred = model(sub_xs, sub_ys)
-
-            metric = task.get_metric()
-            loss_infer = metric(pred, sub_ys)
-            score = loss_infer[:, -1]
-            #print(score.sort())
-
-            #score = score_infer
-            
-            threshold = 1e-3
-            filtered_score = score.clone()
-            #score[filtered_score < threshold] = 1e9
-            topk = 3
-            _, topk_indices = torch.topk(score, topk, largest=False)
-            #print(topk_indices)
-            #print(score[topk_indices])
-            #print(sub_xs[topk_indices])
-            #print(sub_ys[topk_indices])
-            #print("ground beta: ", sample_list[i*n_total].beta[0,0])
-            
-            mean_x = 0
-            mean_y = 0
-            mean_beta = 0
-            for idx in topk_indices:
-                #print("============")
-                mean_x+=i_sample_list[idx].x
-                mean_y+=i_sample_list[idx].y
-                mean_beta+=i_sample_list[idx].beta
-                #print(i_sample_list[idx].x)
-                #print(i_sample_list[idx].y)
-                #print(i_sample_list[idx].beta[0,0])
-            mean_x /= topk
-            mean_y /= topk
-            #print(a)
-            #print(mean_x.shape)
-            #print(mean_y.shape)
-
-            #new_sample = Sample(mean_x, mean_y, 0, 0)
-            #new_sample = sample_list[i*n_labeled+k]
-            #print(new_sample.beta[0,0])
-            
-
-            select_index = torch.argmin(score)
-            sub_sample_index[i].append(select_index)
-            #sub_sample_list[i].append(i_sample_list[select_index])
-            #print((i_sample_list[select_index].beta - sample_list[i*n_total].beta).mean())
-            #print(sample_list[select_index].x.shape)
-            temp_x[i], temp_y[i] = tensor_add_sample(temp_x[i], temp_y[i], i_sample_list[select_index])
-            print((new_sample.beta - ground_beta).mean())
-            #sub_sample_list[i].append(new_sample)
-            #temp_x[i], temp_y[i] = tensor_add_sample(temp_x[i], temp_y[i], new_sample)
-            #print(temp_x[i][0,-5:,0])
-
-            #print(sub_sample_index[i])
-
-        if k in set_size_list:
-            # get the input tensor
-            query_xs, query_ys = [], []
-            for _ in task_index:
-                #if _ >0:
-                #    continue
-                _x, _y = tensor_add_xy(temp_x[_], temp_y[_], xs[i, -1, :], ys[i, -1])
-                #_x, _y = tensor_add_xy(temp_x[_], temp_y[_], xs[i, n_labeled+k, :], ys[i, n_labeled+k])
-                query_xs.append(_x)
-                query_ys.append(_y)
-            test_y = xs[i, -1, : ] @ ground_beta
-            #print(test_y - ys[i, -1])
-            query_xs = torch.cat(query_xs, dim=0)
-            query_ys = torch.cat(query_ys, dim=0)
-            #print(query_xs[0, -6:, 0])
-            #print(a)
-            with torch.no_grad():
-                pred = model(query_xs, query_ys)
-            metric = task.get_metric()
-            loss = metric(pred, query_ys).cpu().numpy()
-            loss_query = loss.mean(axis=0)[-1]
-            #print(loss_query)
-            loss_list.append(loss_query)
-
-    return loss_list
-
-
-def loss_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    loss_list = []
-    metric = task.get_metric()
-    seq_list = []
-    for i in range(b_size):
-        seq_list.append(Input_sequence(xs[i], ys[i], n_labeled, beta[i], i))
-    
-    for set_size in set_size_list:
-        
-        for temp_set_size in range(set_size):
-            for outer_i in range(b_size):
-                min_j = outer_i
-                min_loss = 1e9
-                for inner_j in range(b_size):
-                    if outer_i != inner_j:
-                        temp_seq = seq_list[outer_i]
-                        temp_seq.add_sample(sample_list[inner_j * n_total + temp_set_size])
-                        temp_seq.get_input()
-                        temp_xs = temp_seq.input_x.unsqueeze(0)
-                        temp_ys = temp_seq.input_y.unsqueeze(0)
-                        with torch.no_grad():
-                            #pred = model.seq_inference(xs, ys)
-                            pred = model(temp_xs, temp_ys)
-                        #print(pred[0])
-                        
-                        loss = metric(pred, temp_ys).numpy()
-                        loss_query = loss.mean(axis=0)[-1]
-                        print(f"loss for {outer_i} {inner_j}: {loss_query}")
-                        if loss_query < min_loss:
-                            min_loss = loss_query
-                            min_j = inner_j
-                        temp_seq.del_sample()
-                print(f"min j for {outer_i}: {min_j}, {min_loss}")
-                seq_list[outer_i].add_sample(sample_list[min_j * n_total + temp_set_size])
-        for seq in seq_list:
-            print(seq.get_prompt_length())
-            seq.get_input(query_index=-2)
-
-        xs, ys = sequence_to_tensor(seq_list)
-        with torch.no_grad():
-            #pred = model.seq_inference(xs, ys)
-            pred = model(xs, ys)
-        #print(pred[0])
-        
-        loss = metric(pred, ys).numpy()
-        loss_query = loss.mean(axis=0)[-1]
-        #print(loss_query)
-        print(seq_list[0].get_prompt_length())
-        loss_list.append(loss_query)
 
     return loss_list
 
@@ -756,9 +275,7 @@ def beta_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list):
     # find nearest beta
     beta_distance = torch.cdist(beta.view(b_size, n_dims), beta.view(b_size, n_dims))
     beta_distance = beta_distance + torch.eye(beta.shape[0], device=beta.device) * 1e9
-    #print(torch.min(beta_distance, dim=1))
     nearest_beta = torch.argmin(beta_distance, dim=1)
-    #print(nearest_beta)
     for set_size in set_size_list:
         seq_list = []
         for i in range(xs.shape[0]):
@@ -770,25 +287,20 @@ def beta_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list):
                 select_index = nearest_beta[i] * n_total + j + n_labeled
                 seq_list[i].add_sample(sample_list[select_index])
 
-        #print(seq_list)
         # get least loss samples
         for seq in seq_list:
             seq.get_input()
         #seq_list[0].add_sample(sample_list[2])
-        #print(seq_list[0])
 
         xs, ys = sequence_to_tensor(seq_list)
-        #print(xs.shape)
 
         
         with torch.no_grad():
             #pred = model.seq_inference(xs, ys)
             pred = model(xs, ys)
-        #print(pred[0])
         metric = task.get_metric()
         loss = metric(pred, ys).cpu().numpy()
         loss_query = loss.mean(axis=0)[-1]
-        #print(loss_query)
         print(seq_list[0].get_prompt_length())
         loss_list.append(loss_query)
     
@@ -804,38 +316,97 @@ def random_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list):
         # get random samples
         for i in range(xs.shape[0]):
             beta_list = []
-            #print(seq_list[i].beta[0,0])
             for j in range(set_size):
                 select_index = torch.randint(0, len(sample_list), (1,))
                 #select_index = i * n_total + j + n_labeled
                 #select_index = nearest_beta[i] * n_total + j + n_labeled
-                #print(select_index)
                 seq_list[i].add_sample(sample_list[select_index])
                 beta_list.append(sample_list[select_index].beta[0, 0])
-            #print(beta_list)
 
-        #print(seq_list)
         # get least loss samples
         for seq in seq_list:
             seq.get_input(query_index=-2)
         #seq_list[0].add_sample(sample_list[2])
-        #print(seq_list[0])
 
         xs, ys = sequence_to_tensor(seq_list)
-        #print(xs.shape)
 
         
         with torch.no_grad():
             #pred = model.seq_inference(xs, ys)
             pred = model(xs, ys)
-        #print(pred[0])
         metric = task.get_metric()
         loss = metric(pred, ys).cpu().numpy()
         loss_query = loss.mean(axis=0)[-1]
-        #print(loss_query)
-        #print(seq_list[0].get_prompt_length())
         loss_list.append(loss_query)
     
+    return loss_list
+
+def random_ensemble_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list, subset_multiplier=1.5):
+    loss_list = []
+
+    for set_size in set_size_list:
+        seq_list = []
+        for i in range(xs.shape[0]):
+            seq = Input_sequence(xs[i], ys[i], n_labeled, beta[i], i)
+
+            if set_size > 0:
+                # Use the global mixed candidate pool (same as random_select),
+                # instead of restricting to samples from the same sequence i.
+                candidate_indices = list(range(len(sample_list)))
+                n_candidates = len(candidate_indices)
+                m = max(1, int(np.ceil(subset_multiplier * n_candidates)))
+
+                sampled_subsets = []
+                for _ in range(m):
+                    subset = np.random.choice(n_candidates, size=min(set_size, n_candidates), replace=False)
+                    sampled_subsets.append(subset.tolist())
+
+                sub_seq_list = []
+                subset_global_indices = []
+                for subset in sampled_subsets:
+                    sub_seq = Input_sequence(xs[i], ys[i], n_labeled, beta[i], i)
+                    global_subset = [candidate_indices[idx] for idx in subset]
+                    for g_idx in global_subset:
+                        sub_seq.add_sample(sample_list[g_idx])
+                    sub_seq.get_input(query_index=-2)
+                    sub_seq_list.append(sub_seq)
+                    subset_global_indices.append(global_subset)
+
+                sub_xs, sub_ys = sequence_to_tensor(sub_seq_list)
+                with torch.no_grad():
+                    sub_pred = model(sub_xs, sub_ys)
+                metric = task.get_metric()
+                subset_losses = metric(sub_pred, sub_ys)[:, -1].detach().cpu().numpy()
+
+                loss_sum = np.zeros(n_candidates, dtype=np.float64)
+                loss_count = np.zeros(n_candidates, dtype=np.int64)
+                for s_idx, global_subset in enumerate(subset_global_indices):
+                    curr_loss = subset_losses[s_idx]
+                    for g_idx in global_subset:
+                        local_idx = g_idx
+                        loss_sum[local_idx] += curr_loss
+                        loss_count[local_idx] += 1
+
+                avg_loss = np.full(n_candidates, np.inf, dtype=np.float64)
+                valid_mask = loss_count > 0
+                avg_loss[valid_mask] = loss_sum[valid_mask] / loss_count[valid_mask]
+                selected_local = np.argsort(avg_loss)[: min(set_size, n_candidates)]
+                selected_global = [candidate_indices[idx] for idx in selected_local]
+
+                for g_idx in selected_global:
+                    seq.add_sample(sample_list[g_idx])
+
+            seq.get_input(query_index=-2)
+            seq_list.append(seq)
+
+        eval_xs, eval_ys = sequence_to_tensor(seq_list)
+        with torch.no_grad():
+            pred = model(eval_xs, eval_ys)
+        metric = task.get_metric()
+        loss = metric(pred, eval_ys).cpu().numpy()
+        loss_query = loss.mean(axis=0)[-1]
+        loss_list.append(loss_query)
+
     return loss_list
 
 class Sample():
@@ -916,91 +487,7 @@ def generate_synthetic_data(num_sequences=100, n_points=10, x_dim=8, diff_diftri
             mean_vectors = torch.randn(1, x_dim)
             for j in range(xs_b.shape[1]):
                 xs_b[i, j, :] = ((1-alpha) * xs_b[i, j, :] + alpha * mean_vectors)
-    #print(xs_b[0])
     return xs_b
-
-def fs_select_debug3(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list):
-    n_points = xs.shape[1] - 1
-    n = len(sample_list)
-    print(n)
-    pos_index = torch.zeros(n, n)
-    seq_list = []
-    for i in range(xs.shape[0]):
-        seq_list.append(Input_sequence(xs[i], ys[i], n_labeled, beta[i], i))
-
-    # init select index for query in each sequence
-    loss_list = []
-    loss_list_infer = []
-    max_points = np.max(set_size_list)
-    sub_sample_list = [[] for _ in range(b_size)]
-    sub_sample_index = [[] for _ in range(b_size)]
-
-    test_i = 0
-    test_j = n_points
-    n_val = 1
-    i_seq = copy.deepcopy(seq_list[test_i])
-    i_seq.pad()
-    #i_seq.get_input(query_range=n_val)
-    i_seq.get_input(last_prompt=True)
-    xs, ys = sequence_to_tensor([i_seq])
-    xs_variable = xs.clone()
-    ys_variable = ys.clone()
-    seq_variable = model._combine(xs_variable, ys_variable).detach()[0,:,:].unsqueeze(0)
-    print(seq_variable[:, :, 0])
-    seq_variable.requires_grad = True
-    pred = model.forward_by_seq(seq_variable)
-    #embeds_0.retain_grad()
-    #embeds_0.requires_grad = True
-    print("pred: ", pred[0, -1])
-    metric = task.get_metric()
-    loss = F.mse_loss(pred[0, -2], ys[0, -2])
-    loss.backward()
-    #print(embeds_0.grad.shape)
-    #grad = embeds_0.grad.detach()[:, 0::2, :]
-    #grad = embeds_0.grad.detach()
-    grad = seq_variable.grad.detach()
-
-    print("grad shape", grad.shape)
-    #print("--beta", sample_list[test_j].beta)
-    #embeds_0 = embeds_0[:, -n_val-1, :]
-    new_x = i_seq.prompt_x[-1]
-    beta = torch.randn(n_dims).to(device)
-    new_y = torch.dot(new_x, beta)
-    test_sample = Sample(new_x, new_y, test_i, beta)
-    test_sample = sample_list[test_j]
-    new_seq = copy.deepcopy(seq_list[test_i])
-    new_seq.add_sample(test_sample)
-    #new_seq.get_input(query_range=n_val)
-    new_seq.get_input(last_prompt=True)
-    new_xs, new_ys = sequence_to_tensor([new_seq])
-    print((new_xs - xs)[0, :, 0])
-    print((new_ys - ys))
-    new_seq_variable = model._combine(new_xs, new_ys)
-    #delta_embeds = new_embeds - embeds_0
-    print(new_seq_variable.shape)
-    print(seq_variable.shape)
-    delta_seq = new_seq_variable - seq_variable
-    delta_seq = delta_seq[0, :, :]
-
-    #delta_term = torch.sum(grad * delta_embeds)
-    delta_term = torch.sum(grad * delta_seq)
-    print(delta_term.shape)
-    #delta_embeds = model.embed_x(delta_x)
-    #print(delta_embeds_real)
-    #print(delta_embeds)
-    approx_loss = delta_term + loss
-    print("x0 loss", loss)
-    print("delta ", delta_term)
-    print("approx loss", approx_loss)
-    #print(approx_loss)
-    #taylor_approx = y1 + torch.sum(grad_h1 * delta_h)
-    pred = model(new_xs, new_ys)
-    real_loss = F.mse_loss(pred[0, -2], ys[0, -2]).mean()
-    print("real loss", real_loss)
-    #print(real_loss[:, -1])
-    
-    print(a)
-    return loss_list
 
 def generate_orthogonal_matrix(n, m):
     if n > m:
@@ -1017,16 +504,12 @@ def generate_orthogonal_matrix(n, m):
 runs = 3
 for run in range(runs):
     task = task_sampler()
-    #xs = generate_synthetic_data(num_sequences=b_size, n_points=n_total, x_dim=n_dims, diff_diftribution=False, alpha=0.0)
     x_single = torch.randn(n_total, n_dims)
-    #x_single = (x_single - 0.5) * 2
-    #xs = x_single.unsqueeze(0).expand(b_size, -1, -1)
     xs = torch.randn(b_size, n_total, n_dims)
     xs = xs.to(device)
     XS = xs
     n_classes = b_size // 10
     n_classes = 5
-    #anchor_points = torch.randn(n_classes, n_dims).to(device)
     anchor_points = generate_orthogonal_matrix(n_classes, n_dims).to(device)
     beta = torch.randn(b_size, n_dims, 1).to(device)
     alpha = 1
@@ -1050,24 +533,27 @@ for run in range(runs):
             sample_list.append(s)
     
 
-    set_size_list = [1,2,3,4,5,7,10]
+    set_size_list = list(range(1, 21))
 
     pred_full_label, loss_full_label = predict_full_label(model, xs, ys=labels, labels=labels)
-    #loss_full_label =  predict_full_label2(model, xs, ys=labels, labels=labels)
     loss_full_label_list.append(loss_full_label)
-    print(loss_full_label_list)
+    print("loss_full_label_list: ", loss_full_label_list)
     
     
     loss_fs_inference = fs_select(model, xs, ys, beta, sample_list, b_size, n_labeled, set_size_list)
-    print(loss_fs_inference)
+    print("loss_fs_inference: ", loss_fs_inference)
     loss_fs_inference_list.append(loss_fs_inference)
     
     loss_random = random_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list)
-    print(loss_random)
+    print("loss_random: ", loss_random)
     loss_random_list.append(loss_random)
 
+    loss_random_ensemble = random_ensemble_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list)
+    print("loss_random_ensemble: ", loss_random_ensemble)
+    loss_random_ensemble_list.append(loss_random_ensemble)
+
     loss_beta = beta_select(model, xs, ys, beta, sample_list, n_labeled, set_size_list)
-    print(loss_beta)
+    print("loss_beta: ", loss_beta)
     loss_beta_list.append(loss_beta)
 
 
@@ -1080,15 +566,34 @@ x = []
 for i in set_size_list:
     x.append(n_labeled + i)
 x = np.array(x)
-print(x)
+print("x: ", x)
 
 plt.plot(x, np.mean(loss_random_list, axis=0), lw=2, label="random")
 plt.fill_between(x, np.mean(loss_random_list, axis=0)-np.std(loss_random_list, axis=0), np.mean(loss_random_list, axis=0)+np.std(loss_random_list, axis=0), alpha=0.2)
 
+plt.plot(x, np.mean(loss_random_ensemble_list, axis=0), lw=2, label="random ensemble")
+plt.fill_between(
+    x,
+    np.mean(loss_random_ensemble_list, axis=0)-np.std(loss_random_ensemble_list, axis=0),
+    np.mean(loss_random_ensemble_list, axis=0)+np.std(loss_random_ensemble_list, axis=0),
+    alpha=0.2,
+)
+
 plt.plot(x, np.mean(loss_fs_inference_list, axis=0), lw=2, label="inference")
 plt.fill_between(x, np.mean(loss_fs_inference_list, axis=0)-np.std(loss_fs_inference_list, axis=0), np.mean(loss_fs_inference_list, axis=0)+np.std(loss_fs_inference_list, axis=0), alpha=0.2)
 
-np.savez("./results/noisy_LR.npz", x=x, loss_full_label_list=loss_full_label_list, loss_fs_inference_list=loss_fs_inference_list, loss_random_list=loss_random_list)
+plt.plot(x, np.mean(loss_beta_list, axis=0), lw=2, label="beta")
+plt.fill_between(x, np.mean(loss_beta_list, axis=0)-np.std(loss_beta_list, axis=0), np.mean(loss_beta_list, axis=0)+np.std(loss_beta_list, axis=0), alpha=0.2)
+
+np.savez(
+    "./results/noisy_LR.npz",
+    x=x,
+    loss_full_label_list=loss_full_label_list,
+    loss_fs_inference_list=loss_fs_inference_list,
+    loss_random_list=loss_random_list,
+    loss_random_ensemble_list=loss_random_ensemble_list,
+    loss_beta_list=loss_beta_list,
+)
 
 #plt.plot(loss_full_label, lw=2, label="Full label")
 #plt.plot(loss_unlabeled_once, lw=2, label="Unlabeled once")
@@ -1096,5 +601,6 @@ np.savez("./results/noisy_LR.npz", x=x, loss_full_label_list=loss_full_label_lis
 #plt.plot(loss_unlabeled_stepbystep, lw=2, label="Unlabeled step by step")
 plt.xlabel("# in-context examples")
 plt.ylabel("squared error")
+plt.xlim(20, 40)
 plt.legend()
 plt.savefig("noisy_LR.png")
