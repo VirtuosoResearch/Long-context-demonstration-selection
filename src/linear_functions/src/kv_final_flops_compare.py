@@ -115,9 +115,9 @@ same_distribution = True
 add_set_size = 5
 profile_flops = True
 # kv_cache baseline: profile full batch directly (no scaling estimate).
-profile_batch_size_kv = None
+profile_batch_size_kv = 1
 # no_kv baseline: profile partial batch then scale to full batch estimate.
-profile_batch_size_no_kv = 10
+profile_batch_size_no_kv = 1
 
 def distance_score(model, seq, sample_list, new_sample):
     n = len(sample_list)
@@ -597,7 +597,7 @@ def kv_final_select(
         lambda_weight=lambda_weight,
         profile_flops=profile_flops,
         profile_batch_size=profile_batch_size,
-        profile_scale_to_full=False,
+        profile_scale_to_full=True,
         profile_tag="kv_final_select",
     )
 
@@ -732,7 +732,7 @@ def generate_orthogonal_matrix(n, m):
 
 
 runs = 1
-candidate_pool_size = 100
+candidate_pool_size = 70
 for run in range(runs):
     task = task_sampler()
     x_single = torch.randn(n_total, n_dims)
@@ -769,7 +769,7 @@ for run in range(runs):
         replace=False,
     ).tolist()
 
-    set_size_list = list(range(1, 11))
+    set_size_list = list(range(0, 11))
 
 
     kv_result = kv_final_select(
