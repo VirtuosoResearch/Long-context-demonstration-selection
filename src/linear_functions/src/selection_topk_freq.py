@@ -272,9 +272,6 @@ def embedding_similarity_select(
 
     candidate_xs = torch.stack([sample_list[g_idx].x for g_idx in fixed_candidate_indices], dim=0)
     candidate_ys = torch.stack([sample_list[g_idx].y for g_idx in fixed_candidate_indices], dim=0)
-    with torch.no_grad():
-        candidate_emb = model.encoder(candidate_xs.unsqueeze(1), candidate_ys.unsqueeze(1))
-        candidate_emb = _flatten_encoder_embedding(candidate_emb)
 
     for set_size in set_size_list:
         seq_list = []
@@ -283,13 +280,34 @@ def embedding_similarity_select(
             seq = Input_sequence(xs[i], ys[i], n_labeled, beta[i], i)
             if k > 0:
                 with torch.no_grad():
-                    proto_emb = model.encoder(
+                    # Reference context: first n_labeled base examples.
+                    ref_emb = model.encoder(
                         xs[i, :n_labeled, :].unsqueeze(0),
                         ys[i, :n_labeled].unsqueeze(0),
                     )
-                    proto_emb = _flatten_encoder_embedding(proto_emb).squeeze(0)
+                    ref_emb = _flatten_encoder_embedding(ref_emb).squeeze(0)
 
-                dist = torch.norm(candidate_emb - proto_emb.unsqueeze(0), dim=1)
+                    # Candidate context: first n_labeled-1 base examples + each candidate.
+                    n_prefix = max(n_labeled - 1, 0)
+                    prefix_x = xs[i, :n_prefix, :]
+                    prefix_y = ys[i, :n_prefix]
+                    n_candidates = candidate_xs.shape[0]
+
+                    if n_prefix > 0:
+                        prefix_x_b = prefix_x.unsqueeze(0).expand(n_candidates, -1, -1)
+                        prefix_y_b = prefix_y.unsqueeze(0).expand(n_candidates, -1)
+                        cand_x_b = candidate_xs.unsqueeze(1)
+                        cand_y_b = candidate_ys.unsqueeze(1)
+                        prompt_plus_x = torch.cat([prefix_x_b, cand_x_b], dim=1)
+                        prompt_plus_y = torch.cat([prefix_y_b, cand_y_b], dim=1)
+                    else:
+                        prompt_plus_x = candidate_xs.unsqueeze(1)
+                        prompt_plus_y = candidate_ys.unsqueeze(1)
+
+                    cand_emb = model.encoder(prompt_plus_x, prompt_plus_y)
+                    cand_emb = _flatten_encoder_embedding(cand_emb)
+
+                dist = torch.norm(cand_emb - ref_emb.unsqueeze(0), dim=1)
                 topk_local = torch.topk(dist, k=k, largest=False).indices.tolist()
                 for local_idx in topk_local:
                     g_idx = fixed_candidate_indices[local_idx]
@@ -524,11 +542,46 @@ def kv_final_select(
     else:
         fixed_candidate_indices = [int(i) for i in candidate_indices]
 
+    candidate_xs = torch.stack([sample_list[g_idx].x for g_idx in fixed_candidate_indices], dim=0)
+    candidate_ys = torch.stack([sample_list[g_idx].y for g_idx in fixed_candidate_indices], dim=0)
+
     for set_size in set_size_list:
         seq_list = []
         n_candidates = len(fixed_candidate_indices)
         freq_count = np.zeros(n_candidates, dtype=np.float64)
         order_signatures = []
+
+        # Stage 1: similarity-based topk per query, then aggregate to global frequency.
+        if set_size > 0:
+            k = min(set_size, n_candidates)
+            for i in range(xs.shape[0]):
+                with torch.no_grad():
+                    ref_emb = model.encoder(
+                        xs[i, :n_labeled, :].unsqueeze(0),
+                        ys[i, :n_labeled].unsqueeze(0),
+                    )
+                    ref_emb = _flatten_encoder_embedding(ref_emb).squeeze(0)
+
+                    n_prefix = max(n_labeled - 1, 0)
+                    prefix_x = xs[i, :n_prefix, :]
+                    prefix_y = ys[i, :n_prefix]
+                    if n_prefix > 0:
+                        prefix_x_b = prefix_x.unsqueeze(0).expand(n_candidates, -1, -1)
+                        prefix_y_b = prefix_y.unsqueeze(0).expand(n_candidates, -1)
+                        cand_x_b = candidate_xs.unsqueeze(1)
+                        cand_y_b = candidate_ys.unsqueeze(1)
+                        prompt_plus_x = torch.cat([prefix_x_b, cand_x_b], dim=1)
+                        prompt_plus_y = torch.cat([prefix_y_b, cand_y_b], dim=1)
+                    else:
+                        prompt_plus_x = candidate_xs.unsqueeze(1)
+                        prompt_plus_y = candidate_ys.unsqueeze(1)
+                    cand_emb = model.encoder(prompt_plus_x, prompt_plus_y)
+                    cand_emb = _flatten_encoder_embedding(cand_emb)
+
+                dist = torch.norm(cand_emb - ref_emb.unsqueeze(0), dim=1)
+                topk_local = torch.topk(dist, k=k, largest=False).indices.tolist()
+                for local_idx in topk_local:
+                    freq_count[local_idx] += 1.0
 
         for i in range(xs.shape[0]):
             # Put shared demos before query-specific base examples to improve LCP reuse.
@@ -564,15 +617,18 @@ def kv_final_select(
                     affinity_norm = (affinity - aff_min) / (aff_max - aff_min)
                 else:
                     affinity_norm = np.zeros_like(affinity)
+
+                freq_min, freq_max = freq_count.min(), freq_count.max()
+                if freq_max > freq_min:
+                    # Map frequency counts to [0, 1] directly.
+                    freq_norm = (freq_count - freq_min) / (freq_max - freq_min)
+                else:
+                    freq_norm = np.zeros_like(freq_count)
+
                 print("================================================")
                 print("freq_count: ", freq_count)
                 print("freq_count.sum(): ", freq_count.sum())
                 print("================================================")
-                if freq_count.sum() > 0:
-                    freq_norm = freq_count / freq_count.sum()
-                else:
-                    freq_norm = np.zeros_like(freq_count)
-
                 score = lambda_weight * affinity_norm + (1 - lambda_weight) * freq_norm
 
                 print("affinity_norm: ", affinity_norm)
@@ -580,9 +636,6 @@ def kv_final_select(
                 print("score: ", score)
                 print("--------------------------------")
                 selected_local = np.argsort(score)[-min(set_size, n_candidates):][::-1]
-
-                for local_idx in selected_local:
-                    freq_count[local_idx] += 1.0
 
                 # Trie-friendly order: high-frequency demos first.
                 selected_local_sorted = sorted(
@@ -769,6 +822,7 @@ np.savez(
     loss_embedding_sim_list=loss_embedding_sim_list,
     loss_kv_final_list=loss_kv_final_list,
 )
+print(f"saved to ./results/noisy_{task}.npz")
 
 plot_line_means = {
     "x_full_label": np.arange(n_total),
