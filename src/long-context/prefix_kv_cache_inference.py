@@ -53,11 +53,11 @@ def _choose_prefix_fixed_random_demos(
 
 def run_experiment(args):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
-    tokenizer = _setup_tokenizer(args.gpt2)
-    model = AutoModelForCausalLM.from_pretrained(args.gpt2).to(device)
+    tokenizer = _setup_tokenizer(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     model.eval()
 
-    add_newlines = not args.gpt2.startswith("gpt2")
+    add_newlines = not args.model_name.startswith("gpt2")
 
     retrieval_data = load_data(
         task=None,
@@ -177,7 +177,7 @@ def run_experiment(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True, help="e.g. sst2, poem_sentiment")
-    parser.add_argument("--gpt2", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--retrieval_split", type=str, default="test")

@@ -1,1 +1,1 @@
-python test.py --dataset poem_sentiment --gpt2 Qwen/Qwen2.5-1.5B-Instruct --method direct --out_dir out/dir --do_zeroshot --test_batch_size 4 --use_demonstrations --seed 0 --k 5 --randomk
+python test.py --dataset poem_sentiment --model_name Qwen/Qwen2.5-1.5B-Instruct --method direct --out_dir out/dir --do_zeroshot --test_batch_size 4 --use_demonstrations --seed 0 --k 5 --randomk

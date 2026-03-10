@@ -26,6 +26,32 @@ from metaicl.model import MetaICLModel
 
 from utils.data import load_data
 
+
+def _parse_datasets_arg(dataset_arg):
+    if dataset_arg is None:
+        return None
+    datasets = [d.strip() for d in dataset_arg.split(",") if d.strip()]
+    return datasets if len(datasets) > 0 else None
+
+
+def _split_multitask_retrieval(data, candidate_size, validation_size):
+    grouped = defaultdict(list)
+    for dp in data:
+        grouped[dp["task"]].append(dp)
+
+    retrieval_data = []
+    validation_data = []
+    for task, samples in grouped.items():
+        required = candidate_size + validation_size
+        if len(samples) < required:
+            raise ValueError(
+                f"Task {task} has only {len(samples)} samples in retrieval split, "
+                f"but needs at least {required} for candidate/validation split"
+            )
+        retrieval_data.extend(samples[:candidate_size])
+        validation_data.extend(samples[candidate_size:required])
+    return retrieval_data, validation_data
+
 def main(logger, args):
     assert (args.dataset is not None and args.task is None) or (args.dataset is None and args.task is not None)
 
@@ -92,43 +118,108 @@ def main(logger, args):
     errors = []
     seeds = args.seed.split(",")
     config_split = "unseen_domain_test" if args.unseen_domain_only else "test"
+    datasets = _parse_datasets_arg(args.dataset)
+    is_multitask = datasets is not None and len(datasets) > 1
 
     for seed in seeds:
 
         retrieval_data = load_data(
             args.task, args.retrieval_split, args.k, seed=seed, config_split=config_split,
-            datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null
+            datasets=datasets, is_null=args.is_null
         )
         eval_data = load_data(
             args.task, args.eval_split, args.k, seed=seed, config_split=config_split,
-            datasets=None if args.dataset is None else args.dataset.split(","), is_null=args.is_null
+            datasets=datasets, is_null=args.is_null
         )
+        tensorize_eval_split = args.eval_split
+
+        if is_multitask and args.multitask_filter_candidate_set:
+            retrieval_data, validation_data = _split_multitask_retrieval(
+                retrieval_data,
+                candidate_size=args.multitask_candidate_size,
+                validation_size=args.multitask_validation_size,
+            )
+            if args.multitask_use_validation_as_eval:
+                eval_data = validation_data
+                tensorize_eval_split = args.retrieval_split
 
         print("*"*20)
         print(f"retrieval_split: {args.retrieval_split}, eval_split: {args.eval_split}")
+        logger.info(
+            "seed=%s, multitask=%s, #retrieval=%d, #eval=%d",
+            seed, is_multitask, len(retrieval_data), len(eval_data)
+        )
 
-        test_task = eval_data[0]["task"]
+        eval_by_task = defaultdict(list)
+        for dp in eval_data:
+            eval_by_task[dp["task"]].append(dp)
 
-        config_file = "config/tasks/{}.json".format(test_task)
-        assert os.path.exists(config_file), config_file
-        with open(config_file, "r") as f:
-            config = json.load(f)
-        is_classification = config["task_type"]=="classification"
-        if is_classification:
-            options = eval_data[0]["options"]
-            assert np.all([d["options"]==options for d in eval_data])
+        seed_task_metrics = {}
+        seed_total_correct = 0
+        seed_total_count = 0
 
-        result = run(logger, test_task, metaicl_data, metaicl_model,
-                     retrieval_data, eval_data, seed, checkpoint, is_classification, add_newlines, tokenizer)
-        if result is None:
-            errors.append("%s/%s" % (test_task, seed))
-        else:
-            results.append(result)
+        for test_task, eval_data_task in eval_by_task.items():
+            config_file = "config/tasks/{}.json".format(test_task)
+            assert os.path.exists(config_file), config_file
+            with open(config_file, "r") as f:
+                config = json.load(f)
+            is_classification = config["task_type"]=="classification"
+            if is_classification:
+                options = eval_data_task[0]["options"]
+                assert np.all([d["options"]==options for d in eval_data_task])
+
+            result = run(logger, test_task, metaicl_data, metaicl_model,
+                         retrieval_data, eval_data_task, seed, checkpoint, is_classification,
+                         add_newlines, tokenizer, tensorize_eval_split)
+            if result is None:
+                errors.append("%s/%s" % (test_task, seed))
+            else:
+                seed_task_metrics[test_task] = result
+                seed_total_correct += result["correct"]
+                seed_total_count += result["total"]
+                results.append(result)
+
+        if seed_task_metrics:
+            per_task_msg = ", ".join(
+                [
+                    f"{task}: {100.0 * metric['accuracy']:.2f}% ({metric['correct']}/{metric['total']})"
+                    for task, metric in sorted(seed_task_metrics.items())
+                ]
+            )
+            overall_acc = seed_total_correct / seed_total_count if seed_total_count > 0 else 0.0
+            logger.info("Seed %s per-task accuracy => %s", seed, per_task_msg)
+            logger.info(
+                "Seed %s overall accuracy => %.2f%% (%d/%d)",
+                seed, 100.0 * overall_acc, seed_total_correct, seed_total_count
+            )
 
     if args.is_null:
         return
 
-    # logger.info("Macro-F1 of %s over %d target tasks: %.1f" % (args.task, len(results) // len(seeds), 100*np.mean(results)))
+    if results:
+        aggregate_by_task = defaultdict(lambda: {"correct": 0, "total": 0})
+        aggregate_correct = 0
+        aggregate_total = 0
+        for metric in results:
+            task = metric["task"]
+            aggregate_by_task[task]["correct"] += metric["correct"]
+            aggregate_by_task[task]["total"] += metric["total"]
+            aggregate_correct += metric["correct"]
+            aggregate_total += metric["total"]
+
+        per_task_msg = ", ".join(
+            [
+                f"{task}: {100.0 * v['correct'] / v['total']:.2f}% ({v['correct']}/{v['total']})"
+                for task, v in sorted(aggregate_by_task.items())
+                if v["total"] > 0
+            ]
+        )
+        overall_acc = aggregate_correct / aggregate_total if aggregate_total > 0 else 0.0
+        logger.info("Aggregate per-task accuracy => %s", per_task_msg)
+        logger.info(
+            "Aggregate overall accuracy => %.2f%% (%d/%d)",
+            100.0 * overall_acc, aggregate_correct, aggregate_total
+        )
 
     if len(errors)>0:
         logger.info("You had errors with datasets:", ",".join(errors))
@@ -136,10 +227,10 @@ def main(logger, args):
 
 
 def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, seed,
-        checkpoint, is_classification, add_newlines, tokenizer):
+        checkpoint, is_classification, add_newlines, tokenizer, tensorize_eval_split):
 
     if args.do_zeroshot:
-        split_name = f"{args.eval_split}-ret={args.retrieval_split}"
+        split_name = f"{tensorize_eval_split}-ret={args.retrieval_split}"
         if args.is_null:
             split_name += "-null"
         cache_suffix = "".join([
@@ -158,12 +249,12 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, se
     if args.topk:
         metaicl_data.tensorize_topk(
             retrieval_data, eval_data, options=None, add_newlines=add_newlines,
-            retrieval_split=args.retrieval_split, eval_split=args.eval_split,
+            retrieval_split=args.retrieval_split, eval_split=tensorize_eval_split,
         )
     elif args.randomk:
         metaicl_data.tensorize_randomk(
             retrieval_data, eval_data, options=None, add_newlines=add_newlines,
-            retrieval_split=args.retrieval_split, eval_split=args.eval_split,
+            retrieval_split=args.retrieval_split, eval_split=tensorize_eval_split,
         )
     elif args.bm25:
         metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None,  add_newlines=add_newlines)
@@ -198,7 +289,7 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, se
 
     if args.use_calibration:
         assert args.do_zeroshot
-        key = "/" + task + "-" + f"{args.eval_split}-ret={args.retrieval_split}"
+        key = "/" + task + "-" + f"{tensorize_eval_split}-ret={args.retrieval_split}"
         bias_path = cache_path.replace(key, key + "-null")
         assert os.path.exists(bias_path), bias_path
         with open(bias_path, "rb") as f:
@@ -210,15 +301,30 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, se
         losses -= bias_losses
     predictions = metaicl_model.do_predict(metaicl_data, losses=losses)
     groundtruths = [dp["output"] for dp in eval_data]
-    perf = metaicl_data.evaluate(predictions, groundtruths, is_classification)
-    logger.info("Accuracy= %s", perf)
+    correct = 0
+    for prediction, groundtruth in zip(predictions, groundtruths):
+        prediction = prediction.strip()
+        if isinstance(groundtruth, list):
+            gt = [item.strip() for item in groundtruth]
+            is_correct = prediction in gt
+        else:
+            is_correct = prediction == groundtruth.strip()
+        correct += int(is_correct)
+    total = len(groundtruths)
+    perf = correct / total if total > 0 else 0.0
+    logger.info("Task=%s Accuracy= %.4f (%d/%d)", task, perf, correct, total)
 
     with open(prediction_path, "w") as f:
         for prediction in predictions:
             f.write(prediction)
             f.write("\n")
 
-    return perf
+    return {
+        "task": task,
+        "accuracy": perf,
+        "correct": correct,
+        "total": total,
+    }
 
 if __name__=='__main__':
 
@@ -240,13 +346,13 @@ if __name__=='__main__':
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--use_random_english_words", default=False, action="store_true")
 
-    parser.add_argument("--out_dir", type=str, required=True, default="out/gpt2-large")
+    parser.add_argument("--out_dir", type=str, required=True, default="out/llama-3.2-1b-instruct")
 
     parser.add_argument("--eval_split", type=str, default="dev")
     parser.add_argument("--retrieval_split", type=str, default="test")
     parser.add_argument("--is_null", default=False, action="store_true")
     parser.add_argument("--method", type=str, default="direct", choices=["direct", "channel"])
-    parser.add_argument("--model_name", type=str, default="gpt2-large")
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
 
     parser.add_argument("--topk",default=False, action="store_true")
     parser.add_argument("--randomk", default=False, action="store_true")
@@ -255,6 +361,13 @@ if __name__=='__main__':
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--is_quant", default=False, action="store_true")
     parser.add_argument("--max_length", default=128, type=int)
+    parser.add_argument("--multitask_filter_candidate_set", dest="multitask_filter_candidate_set", action="store_true")
+    parser.add_argument("--no_multitask_filter_candidate_set", dest="multitask_filter_candidate_set", action="store_false")
+    parser.add_argument("--multitask_candidate_size", type=int, default=90)
+    parser.add_argument("--multitask_validation_size", type=int, default=50)
+    parser.add_argument("--multitask_use_validation_as_eval", dest="multitask_use_validation_as_eval", action="store_true")
+    parser.add_argument("--no_multitask_use_validation_as_eval", dest="multitask_use_validation_as_eval", action="store_false")
+    parser.set_defaults(multitask_filter_candidate_set=True, multitask_use_validation_as_eval=True)
     args = parser.parse_args()
 
     handlers = [logging.StreamHandler()]

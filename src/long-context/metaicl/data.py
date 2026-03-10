@@ -185,6 +185,46 @@ class MetaICLData(object):
             return "val"
         return split_name
 
+    def _get_feature_path(self, task, split_name):
+        normalized_split = self._normalize_feature_split(split_name)
+        candidate_paths = [
+            f"./features/{task}_{normalized_split}_features.json",
+            f"./features/{task}_features.json",
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            f"Cannot find feature file for task={task}, split={split_name}. "
+            f"Tried: {candidate_paths}"
+        )
+
+    def _load_features_for_datapoints(self, data, split_name):
+        if len(data) == 0:
+            return []
+
+        features_by_task = {}
+        counters_by_task = defaultdict(int)
+        selected_features = []
+
+        for dp in data:
+            task = dp["task"]
+            if task not in features_by_task:
+                feature_path = self._get_feature_path(task, split_name)
+                with open(feature_path, "r") as file:
+                    features_by_task[task] = json.load(file)
+            idx_in_task = counters_by_task[task]
+            task_features = features_by_task[task]
+            if idx_in_task >= len(task_features):
+                raise ValueError(
+                    f"features size mismatch for task={task}: "
+                    f"need index {idx_in_task}, but only {len(task_features)} features found"
+                )
+            selected_features.append(task_features[idx_in_task])
+            counters_by_task[task] += 1
+
+        return selected_features
+
     def __str__(self):
         text = "[MetaICL Data]: method=%d, "
         if self.use_demonstrations:
@@ -208,11 +248,11 @@ class MetaICLData(object):
         topk_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
         return [candidate_data[i] for i in topk_indices], topk_indices, scores
 
-    def _select_top_k_neighbors(self, test_sample_embedding, test_embeddings, test_data, k, dp_idx):
+    def _select_top_k_neighbors(self, test_sample_embedding, test_embeddings, test_data, k, exclude_idx=None):
         similarities = []
         for idx, dp in enumerate(test_embeddings):
             if idx == len(test_data): break
-            if idx == dp_idx:
+            if exclude_idx is not None and idx == exclude_idx:
                 similarities.append(-1.0)
                 continue
             similarity = 1 - cosine(test_sample_embedding, dp)
@@ -334,19 +374,8 @@ class MetaICLData(object):
                 dp["output"] = dp["options"][0]  # randomly choose one (we don't need it anyways)
             val_data.append(dp.copy())
         
-        task = _test_data[0]["task"]
-        retrieval_feature_split = self._normalize_feature_split(retrieval_split)
-        eval_feature_split = self._normalize_feature_split(eval_split)
-        test_features_path = f"./features/{task}_{retrieval_feature_split}_features.json"
-        with open(test_features_path, "r") as file:
-            test_features = json.load(file)
-        val_features_path = f"./features/{task}_{eval_feature_split}_features.json"
-        with open(val_features_path, "r") as file:
-            val_features = json.load(file)
-        assert len(test_features) >= len(test_data), \
-            f"features size mismatch: {test_features_path} has {len(test_features)}, data has {len(test_data)}"
-        assert len(val_features) >= len(val_data), \
-            f"features size mismatch: {val_features_path} has {len(val_features)}, data has {len(val_data)}"
+        test_features = self._load_features_for_datapoints(test_data, retrieval_split)
+        val_features = self._load_features_for_datapoints(val_data, eval_split)
 
         input_ids, attention_mask, token_type_ids = [], [], []
         metadata = []
@@ -358,7 +387,7 @@ class MetaICLData(object):
                 dp_feature = val_features[dp_idx]            
 
                 top_k_neighbors, _, __ = self._select_top_k_neighbors(
-                    dp_feature, test_features, test_data, self.k, dp_idx
+                    dp_feature, test_features, test_data, self.k, exclude_idx=None
                 )
 
                 demonstrations = []
@@ -461,9 +490,9 @@ class MetaICLData(object):
         real_id = [idx for idx in selected_indices]
         return [test_data[idx] for idx in real_id], real_id
 
-    def _select_random_k_neighbors(self, test_sample_embedding, test_embeddings, test_data, k, dp_idx):
+    def _select_random_k_neighbors(self, test_sample_embedding, test_embeddings, test_data, k, exclude_idx=None):
         length = len(test_data)
-        candidates = [i for i in range(length) if i!= dp_idx]
+        candidates = [i for i in range(length) if i != exclude_idx]
         random_indices = random.sample(candidates, k)
 
         return [test_data[i] for i in random_indices]
@@ -487,19 +516,8 @@ class MetaICLData(object):
                 dp["output"] = dp["options"][0]  # randomly choose one (we don't need it anyways)
             val_data.append(dp.copy())
         
-        task = _test_data[0]["task"]
-        retrieval_feature_split = self._normalize_feature_split(retrieval_split)
-        eval_feature_split = self._normalize_feature_split(eval_split)
-        test_features_path = f"./features/{task}_{retrieval_feature_split}_features.json"
-        with open(test_features_path, "r") as file:
-            test_features = json.load(file)
-        val_features_path = f"./features/{task}_{eval_feature_split}_features.json"
-        with open(val_features_path, "r") as file:
-            val_features = json.load(file)
-        assert len(test_features) >= len(test_data), \
-            f"features size mismatch: {test_features_path} has {len(test_features)}, data has {len(test_data)}"
-        assert len(val_features) >= len(val_data), \
-            f"features size mismatch: {val_features_path} has {len(val_features)}, data has {len(val_data)}"
+        test_features = self._load_features_for_datapoints(test_data, retrieval_split)
+        val_features = self._load_features_for_datapoints(val_data, eval_split)
 
         input_ids, attention_mask, token_type_ids = [], [], []
         metadata = []
@@ -513,11 +531,11 @@ class MetaICLData(object):
                 dp_feature = val_features[dp_idx]            
 
                 random_k_neighbors = self._select_random_k_neighbors(
-                    dp_feature, test_features, test_data, self.k-self.k//4, dp_idx
+                    dp_feature, test_features, test_data, self.k-self.k//4, exclude_idx=None
                 )
 
                 top_k_neighbors, _, __ = self._select_top_k_neighbors(
-                    dp_feature, test_features, test_data, self.k//4, dp_idx
+                    dp_feature, test_features, test_data, self.k//4, exclude_idx=None
                 )
 
                 demonstrations = []
