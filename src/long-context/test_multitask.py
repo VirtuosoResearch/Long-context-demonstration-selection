@@ -54,6 +54,49 @@ def _split_multitask_retrieval(data, candidate_size, validation_size):
     return retrieval_data, validation_data
 
 
+def _to_preview_text(value):
+    if isinstance(value, list):
+        return " | ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _format_demo_preview(dp, max_chars=220):
+    text = f"input={_to_preview_text(dp.get('input', ''))}; output={_to_preview_text(dp.get('output', ''))}"
+    if len(text) > max_chars:
+        return text[: max_chars - 3] + "..."
+    return text
+
+
+def _log_selected_demos(logger, selection_name, task, selected_demo_info):
+    if not selected_demo_info:
+        return
+    logger.info("[%s] selected demos for task=%s (queries=%d)", selection_name, task, len(selected_demo_info))
+    for query_info in selected_demo_info:
+        eval_index = int(query_info.get("eval_index", -1))
+        eval_task = query_info.get("eval_task", task)
+        logger.info(
+            "[%s][%s] eval_index=%d selected_count=%d",
+            selection_name,
+            eval_task,
+            eval_index,
+            len(query_info.get("selected_demos", [])),
+        )
+        for demo in query_info.get("selected_demos", []):
+            logger.info(
+                "[%s][%s] eval_index=%d rank=%d source=%s pool_idx=%d candidate_task=%s content=%s",
+                selection_name,
+                eval_task,
+                eval_index,
+                int(demo.get("rank", -1)),
+                demo.get("selection_source", selection_name),
+                int(demo.get("candidate_index_in_pool", -1)),
+                demo.get("candidate_task"),
+                demo.get("content", ""),
+            )
+
+
 def _mean_gt_loss_for_eval(metaicl_data, losses):
     losses = np.asarray(losses)
     gt_losses = []
@@ -282,23 +325,10 @@ def main(logger, args):
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token = tokenizer.eos_token
     ### checkpoint ...
-    if not args.do_zeroshot:
-        if args.checkpoint is not None:
-            checkpoint = args.checkpoint
-            assert args.global_step is None
-        else:
-            assert args.global_step is not None
-            checkpoint = os.path.join(args.out_dir, "model-{}.pt".format(args.global_step))
-        assert os.path.exists(checkpoint)
-    else:
-        add_newlines = not args.model_name.startswith("gpt2")
-        if False: #args.model_name=="gpt-j-6B":
-            # we are using the HF veresion where GPT-J-6B checkpoint is not officially registered
-            # so need to download the model checkpoint and specify checkpoint
-            assert args.checkpoint is not None and os.path.exists(args.checkpoint)
-            args.model_name = args.checkpoint
-        checkpoint = None
-    
+
+    add_newlines = not args.model_name.startswith("gpt2")
+    checkpoint = None
+
     metaicl_model = MetaICLModel(args.device, logger, args.out_dir, model_name=args.model_name)
 
     if not os.path.exists(args.out_dir):
@@ -309,12 +339,12 @@ def main(logger, args):
     # Treat --max_length as per-example budget and scale total context budget by k.
     max_length_per_example = args.max_length
     max_length = args.max_length
-    if args.use_demonstrations and args.k > 0:
+    if args.k > 0:
         max_length = args.max_length * args.k
     logger.info("batch_size=%d\tmax_length=%d\tmax_length_per_example=%d" % (
         args.test_batch_size, max_length, max_length_per_example))
 
-    metaicl_data = MetaICLData(args.device ,logger, tokenizer, args.method,args.use_demonstrations, args.k,
+    metaicl_data = MetaICLData(args.device ,logger, tokenizer, args.method, True, args.k,
                                max_length=max_length, max_length_per_example=max_length_per_example, seed=args.seed)
     # metaicl_data.to(device)
     results = []
@@ -375,6 +405,11 @@ def main(logger, args):
             candidate_by_task = defaultdict(list)
             for dp in retrieval_data:
                 candidate_by_task[dp["task"]].append(dp)
+            task_local_idx_by_gid = {}
+            for task_name, rows in candidate_by_task.items():
+                for task_idx, row in enumerate(rows):
+                    gid = int(row.get("__global_id", -1))
+                    task_local_idx_by_gid[gid] = (task_name, task_idx)
             validation_by_task = defaultdict(list)
             for dp in validation_data:
                 validation_by_task[dp["task"]].append(dp)
@@ -443,7 +478,6 @@ def main(logger, args):
                     nearest = np.argpartition(dists[i], subset_k - 1)[:subset_k]
                     freq_count[nearest] += 1.0
                 freq_norm = _normalize_scores(freq_count)
-
                 score = args.kv_final_lambda * affinity_norm + (1.0 - args.kv_final_lambda) * freq_norm
                 selected = np.argsort(score)[-subset_k:][::-1].tolist()
                 task_selected_local[test_task] = selected
@@ -454,6 +488,13 @@ def main(logger, args):
                     "freq_count": freq_count,
                     "score": score,
                 }
+                print("--------------------------------")
+                print("test_task: ", test_task)
+                print("affinity_norm: ", affinity_norm)
+                print("freq_norm: ", freq_norm)
+                print("freq_count: ", freq_count)
+                print("score: ", score)
+                print("--------------------------------")
 
             # Stage2: global recompute over union of selected demos (all tasks), then task-wise internal sort.
             selected_gid_set = set()
@@ -504,6 +545,23 @@ def main(logger, args):
                 with open(score_path, "w") as f:
                     json.dump(score_rows, f, ensure_ascii=False, indent=2)
                 logger.info("Saved kv_final task scores to %s", score_path)
+                logger.info("[kv_final] selected demos for test_task=%s (count=%d)", test_task, len(selected_sorted))
+                for rank, idx in enumerate(selected_sorted):
+                    dp = cands[idx]
+                    gid = int(dp["__global_id"])
+                    candidate_task, task_local_idx = task_local_idx_by_gid.get(
+                        gid, (dp.get("task"), -1)
+                    )
+                    logger.info(
+                        "[kv_final][%s] rank=%d candidate_task=%s task_local_idx=%d pool_idx=%d global_id=%d content=%s",
+                        test_task,
+                        rank,
+                        candidate_task,
+                        int(task_local_idx),
+                        int(idx),
+                        gid,
+                        _format_demo_preview(dp),
+                    )
 
             pairs = [(dp, task_demo_bank[dp["task"]]) for dp in eval_data]
             pairs.sort(
@@ -569,18 +627,9 @@ def main(logger, args):
             continue
 
         for test_task, eval_data_task in eval_by_task.items():
-            config_file = "config/tasks/{}.json".format(test_task)
-            assert os.path.exists(config_file), config_file
-            with open(config_file, "r") as f:
-                config = json.load(f)
-            is_classification = config["task_type"]=="classification"
-            if is_classification:
-                options = eval_data_task[0]["options"]
-                assert np.all([d["options"]==options for d in eval_data_task])
-
             validation_data_task = [dp for dp in validation_data if dp["task"] == test_task] if validation_data else []
             result = run(logger, test_task, metaicl_data, metaicl_model,
-                         retrieval_data, eval_data_task, validation_data_task, seed, checkpoint, is_classification,
+                         retrieval_data, eval_data_task, validation_data_task, seed, checkpoint,
                          add_newlines, tokenizer, tensorize_eval_split)
             if result is None:
                 errors.append("%s/%s" % (test_task, seed))
@@ -638,30 +687,35 @@ def main(logger, args):
 
 
 def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, validation_data, seed,
-        checkpoint, is_classification, add_newlines, tokenizer, tensorize_eval_split):
+        checkpoint, add_newlines, tokenizer, tensorize_eval_split):
 
-    if args.do_zeroshot:
-        split_name = f"{tensorize_eval_split}-ret={args.retrieval_split}"
-        if args.is_null:
-            split_name += "-null"
-        cache_suffix = "".join([
-            "-topk" if args.topk else "",
-            "-randomk" if args.randomk else "",
-            "-kv-final" if args.kv_final else "",
-            "-bm25" if args.bm25 else "",
-            "-k={}".format(args.k) if args.use_demonstrations else "",
-            "-s={}".format(seed) if args.use_demonstrations or args.use_random_english_words else "",
-            "" if add_newlines else "-no-newlines",
-        ])
-        cache_path = os.path.join(
-            args.out_dir,
-            f"{task}-{split_name}-{metaicl_data.method}{cache_suffix}.pkl",
-        )
+    split_name = f"{tensorize_eval_split}-ret={args.retrieval_split}"
+    if args.is_null:
+        split_name += "-null"
+    cache_suffix = "".join([
+        "-topk" if args.topk else "",
+        "-randomk" if args.randomk else "",
+        "-kv-final" if args.kv_final else "",
+        "-bm25" if args.bm25 else "",
+        "-k={}".format(args.k),
+        "-s={}".format(seed),
+        "" if add_newlines else "-no-newlines",
+    ])
+    cache_path = os.path.join(
+        args.out_dir,
+        f"{task}-{split_name}-{metaicl_data.method}{cache_suffix}.pkl",
+    )
 
     if args.topk:
         metaicl_data.tensorize_topk(
             retrieval_data, eval_data, options=None, add_newlines=add_newlines,
             retrieval_split=args.retrieval_split, eval_split=tensorize_eval_split,
+        )
+        _log_selected_demos(
+            logger,
+            "topk",
+            task,
+            getattr(metaicl_data, "topk_last_selected_demo_info", []),
         )
     elif args.kv_final:
         metaicl_data.tensorize_kv_final(
@@ -681,6 +735,12 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
         metaicl_data.tensorize_randomk(
             retrieval_data, eval_data, options=None, add_newlines=add_newlines,
             retrieval_split=args.retrieval_split, eval_split=tensorize_eval_split,
+        )
+        _log_selected_demos(
+            logger,
+            "randomk",
+            task,
+            getattr(metaicl_data, "randomk_last_selected_demo_info", []),
         )
     elif args.bm25:
         metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None,  add_newlines=add_newlines)
@@ -714,7 +774,6 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
         return None
 
     if args.use_calibration:
-        assert args.do_zeroshot
         key = "/" + task + "-" + f"{tensorize_eval_split}-ret={args.retrieval_split}"
         bias_path = cache_path.replace(key, key + "-null")
         assert os.path.exists(bias_path), bias_path
@@ -755,8 +814,6 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
 if __name__=='__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--do_zeroshot", default=False, action="store_true")
-    parser.add_argument("--use_demonstrations", default=False, action="store_true")
     parser.add_argument("--use_calibration", default=False, action="store_true")
     parser.add_argument("--unseen_domain_only", default=False, action="store_true")
 
