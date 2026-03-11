@@ -18,7 +18,7 @@ from utils.utils import get_checkpoint_id, download_file
 
 class MetaICLModel(object):
 
-    def __init__(self, device_num, logger=None, out_dir=None, fp16=True, local_rank=-1, gpt2="deepseek-ai/deepseek-llm-7b-chat"):
+    def __init__(self, device_num, logger=None, out_dir=None, fp16=True, local_rank=-1, model_name="deepseek-ai/deepseek-llm-7b-chat"):
         if logger is None:
             class Logger():
                 def info(self, text):
@@ -49,7 +49,7 @@ class MetaICLModel(object):
         self.model_name = None
         self.model = None
         self.mode = None
-        self.tokenizer = AutoTokenizer.from_pretrained(gpt2)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def __str__(self):
         text = "[MetaICL Model]: "
@@ -83,19 +83,13 @@ class MetaICLModel(object):
         self.model.resize_token_embeddings(len(tokenizer))
 
 
-    def load(self, checkpoint=None, gpt2="gpt2-large", is_quant=False):
+    def load(self, checkpoint=None, model_name="gpt2-large", is_quant=False):
         '''
         checkpoint can be either keyword of the model or path to the checkpoint file
         '''
-        if "deepseek" in gpt2: is_quant=True
-        if "8B" in gpt2 or "13b" in gpt2 or "34" in gpt2: is_quant=True
+        if "deepseek" in model_name: is_quant=True
+        if "8B" in model_name or "13b" in model_name or "34" in model_name: is_quant=True
         if is_quant:
-            # bnb_config = BitsAndBytesConfig(
-            #     load_in_4bit=True,
-            #     bnb_4bit_compute_dtype=torch.bfloat16,
-            #     bnb_4bit_quant_type="nf4",
-            #     llm_int8_threshold=6.0
-            # )
 
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -104,23 +98,20 @@ class MetaICLModel(object):
                 bnb_4bit_quant_type="nf4",
             )
             model = AutoModelForCausalLM.from_pretrained(
-                # gpt2, 
-                # quantization_config=bnb_config,
-                # device_map= {"": self.device}
-                    gpt2,
+                    model_name,
                     quantization_config=bnb_config,
                     device_map={"": self.device},
                     torch_dtype=torch.float16
             )
-        elif gpt2.startswith("gpt2"):
-            model = AutoModelForCausalLM.from_pretrained(gpt2)
-        elif "gpt-j" in gpt2:
-            model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-j-6b") #/gpt2)
-        elif "Llama" in gpt2 or "opt" in gpt2 or "deepseek" in gpt2 or "Qwen" in gpt2:
-            model = AutoModelForCausalLM.from_pretrained(gpt2)
+        elif model_name.startswith("model_name"):
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+        elif "gpt-j" in model_name:
+            model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-j-6b") #/model_name)
+        elif "Llama" in model_name or "opt" in model_name or "deepseek" in model_name or "Qwen" in model_name:
+            model = AutoModelForCausalLM.from_pretrained(model_name)
         else:
             raise NotImplementedError(checkpoint)
-        self.model_name = gpt2
+        self.model_name = model_name
         model.config.use_flash_attention = False
 
         self.model = model

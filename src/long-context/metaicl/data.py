@@ -181,14 +181,16 @@ class MetaICLData(object):
 
     @staticmethod
     def _normalize_feature_split(split_name):
-        if split_name == "dev":
-            return "val"
+        if split_name == "val":
+            return "dev"
         return split_name
 
     def _get_feature_path(self, task, split_name):
         normalized_split = self._normalize_feature_split(split_name)
         candidate_paths = [
             f"./features/{task}_{normalized_split}_features.json",
+            # backward compatibility with older files
+            f"./features/{task}_val_features.json" if normalized_split == "dev" else f"./features/{task}_dev_features.json",
             f"./features/{task}_features.json",
         ]
         for path in candidate_paths:
@@ -213,7 +215,9 @@ class MetaICLData(object):
                 feature_path = self._get_feature_path(task, split_name)
                 with open(feature_path, "r") as file:
                     features_by_task[task] = json.load(file)
-            idx_in_task = counters_by_task[task]
+            # Prefer explicit source index so subsets (e.g. first 90 / last 50)
+            # map to the correct feature rows from the original split file.
+            idx_in_task = dp.get("__feature_idx", counters_by_task[task])
             task_features = features_by_task[task]
             if idx_in_task >= len(task_features):
                 raise ValueError(
@@ -221,7 +225,8 @@ class MetaICLData(object):
                     f"need index {idx_in_task}, but only {len(task_features)} features found"
                 )
             selected_features.append(task_features[idx_in_task])
-            counters_by_task[task] += 1
+            if "__feature_idx" not in dp:
+                counters_by_task[task] += 1
 
         return selected_features
 
@@ -250,15 +255,131 @@ class MetaICLData(object):
 
     def _select_top_k_neighbors(self, test_sample_embedding, test_embeddings, test_data, k, exclude_idx=None):
         similarities = []
+        query_dim = len(test_sample_embedding)
         for idx, dp in enumerate(test_embeddings):
             if idx == len(test_data): break
             if exclude_idx is not None and idx == exclude_idx:
                 similarities.append(-1.0)
                 continue
+            cand_dim = len(dp)
+            if cand_dim != query_dim:
+                raise ValueError(
+                    f"Feature dimension mismatch: query dim={query_dim}, candidate dim={cand_dim} "
+                    f"at candidate index={idx}, task={test_data[idx].get('task', 'unknown')}. "
+                    "Please regenerate all feature files with the same embedding model."
+                )
             similarity = 1 - cosine(test_sample_embedding, dp)
             similarities.append(similarity)
         top_k_indices = np.argsort(similarities)[-k:][::-1]
         return [test_data[i] for i in top_k_indices], top_k_indices , similarities
+
+    def _kv_final_plan(self, candidate_features, eval_features, k, lambda_weight=0.7):
+        n_candidates = len(candidate_features)
+        n_eval = len(eval_features)
+        if k <= 0 or n_candidates == 0 or n_eval == 0:
+            return [[] for _ in range(n_eval)]
+
+        cand = np.asarray(candidate_features, dtype=np.float32)
+        ev = np.asarray(eval_features, dtype=np.float32)
+        if cand.ndim != 2 or ev.ndim != 2:
+            raise ValueError("Features for kv_final must be 2D arrays.")
+        if cand.shape[1] != ev.shape[1]:
+            raise ValueError(
+                f"Feature dim mismatch in kv_final: candidate_dim={cand.shape[1]}, eval_dim={ev.shape[1]}"
+            )
+
+        dists = np.linalg.norm(ev[:, None, :] - cand[None, :, :], axis=2)  # [n_eval, n_candidates]
+        topk = min(k, n_candidates)
+
+        # Stage 1: aggregate query-wise nearest top-k to global frequency.
+        freq_count = np.zeros(n_candidates, dtype=np.float32)
+        for i in range(n_eval):
+            nearest = np.argpartition(dists[i], topk - 1)[:topk]
+            freq_count[nearest] += 1.0
+
+        fmin, fmax = float(freq_count.min()), float(freq_count.max())
+        if fmax > fmin:
+            freq_norm = (freq_count - fmin) / (fmax - fmin)
+        else:
+            freq_norm = np.zeros_like(freq_count)
+
+        # Stage 2: per-query blend of affinity and frequency.
+        selected_indices_per_query = []
+        for i in range(n_eval):
+            affinity = -dists[i]  # lower distance => higher affinity
+            amin, amax = float(affinity.min()), float(affinity.max())
+            if amax > amin:
+                affinity_norm = (affinity - amin) / (amax - amin)
+            else:
+                affinity_norm = np.zeros_like(affinity)
+
+            score = lambda_weight * affinity_norm + (1.0 - lambda_weight) * freq_norm
+            selected = np.argsort(score)[-topk:][::-1].tolist()
+            selected = sorted(selected, key=lambda idx: (-freq_count[idx], idx))
+            selected_indices_per_query.append(selected)
+
+        return selected_indices_per_query
+
+    def _kv_final_task_scores(self, candidate_features, validation_features, test_features, k, lambda_weight=0.7):
+        n_candidates = len(candidate_features)
+        n_val = len(validation_features)
+        n_test = len(test_features)
+        if k <= 0 or n_candidates == 0 or n_val == 0 or n_test == 0:
+            return {
+                "selected_indices": [],
+                "score": np.zeros(n_candidates, dtype=np.float32),
+                "affinity_norm": np.zeros(n_candidates, dtype=np.float32),
+                "freq_norm": np.zeros(n_candidates, dtype=np.float32),
+                "freq_count": np.zeros(n_candidates, dtype=np.float32),
+            }
+
+        cand = np.asarray(candidate_features, dtype=np.float32)
+        val = np.asarray(validation_features, dtype=np.float32)
+        tst = np.asarray(test_features, dtype=np.float32)
+        if cand.ndim != 2 or val.ndim != 2:
+            raise ValueError("Features for kv_final must be 2D arrays.")
+        if cand.shape[1] != val.shape[1] or cand.shape[1] != tst.shape[1]:
+            raise ValueError(
+                f"Feature dim mismatch in kv_final: candidate_dim={cand.shape[1]}, "
+                f"validation_dim={val.shape[1]}, test_dim={tst.shape[1]}"
+            )
+
+        # 1) Affinity is estimated ONLY from validation set.
+        dists_val = np.linalg.norm(val[:, None, :] - cand[None, :, :], axis=2)  # [n_val, n_candidates]
+        mean_dist_val = dists_val.mean(axis=0)
+        affinity = -mean_dist_val
+        amin, amax = float(affinity.min()), float(affinity.max())
+        if amax > amin:
+            affinity_norm = (affinity - amin) / (amax - amin)
+        else:
+            affinity_norm = np.zeros_like(affinity)
+
+        # 2) Final selection/ranking happens on test set.
+        dists_test = np.linalg.norm(tst[:, None, :] - cand[None, :, :], axis=2)  # [n_test, n_candidates]
+        topk = min(k, n_candidates)
+
+        freq_count = np.zeros(n_candidates, dtype=np.float32)
+        for i in range(n_test):
+            nearest = np.argpartition(dists_test[i], topk - 1)[:topk]
+            freq_count[nearest] += 1.0
+
+        fmin, fmax = float(freq_count.min()), float(freq_count.max())
+        if fmax > fmin:
+            freq_norm = (freq_count - fmin) / (fmax - fmin)
+        else:
+            freq_norm = np.zeros_like(freq_count)
+
+        score = lambda_weight * affinity_norm + (1.0 - lambda_weight) * freq_norm
+        selected = np.argsort(score)[-topk:][::-1].tolist()
+        selected = sorted(selected, key=lambda idx: (-freq_count[idx], idx))
+
+        return {
+            "selected_indices": selected,
+            "score": score,
+            "affinity_norm": affinity_norm,
+            "freq_norm": freq_norm,
+            "freq_count": freq_count,
+        }
     
     def get_dataloader(self, batch_size, is_training):
         inputs = self.tensorized_inputs
@@ -267,7 +388,9 @@ class MetaICLData(object):
                 inputs[k] = torch.LongTensor(v)
         shape = inputs["input_ids"].shape
         self.logger.info(shape)
-        for v in inputs.values():
+        for k, v in inputs.items():
+            if k in ["demo_lens"]:
+                continue
             assert v.shape==shape
         if "labels" in inputs:
             dataset = TensorDataset(inputs["input_ids"], inputs["attention_mask"], inputs["token_type_ids"], inputs["labels"])
@@ -289,6 +412,26 @@ class MetaICLData(object):
             is_correct = prediction in groundtruth if type(groundtruth)==list else prediction==groundtruth
             accs.append(is_correct)
         return np.mean(accs)
+
+    def _tokenize_prompt_text(self, text):
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    def _demo_prompt_prefix_tokens(self, n_examples):
+        prompt = f"Use the following {n_examples} examples to answer the final query.\n"
+        return self._tokenize_prompt_text(prompt)
+
+    def _demo_example_separator_tokens(self):
+        return self._tokenize_prompt_text("\n")
+
+    def _query_prefix_tokens(self):
+        return self._tokenize_prompt_text("\nFinal query:\n")
+
+    def _strip_leading_special_tokens(self, token_ids):
+        special_ids = set(self.tokenizer.all_special_ids)
+        i = 0
+        while i < len(token_ids) and token_ids[i] in special_ids:
+            i += 1
+        return token_ids[i:]
 
     def _prepro_each_datapoint(self, dp, is_first=True, is_training=False, for_demonstrations=False,
                                add_newlines=True):
@@ -377,7 +520,7 @@ class MetaICLData(object):
         test_features = self._load_features_for_datapoints(test_data, retrieval_split)
         val_features = self._load_features_for_datapoints(val_data, eval_split)
 
-        input_ids, attention_mask, token_type_ids = [], [], []
+        input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
         metadata = []
 
         for dp_idx, dp in enumerate(val_data):
@@ -390,11 +533,15 @@ class MetaICLData(object):
                     dp_feature, test_features, test_data, self.k, exclude_idx=None
                 )
 
-                demonstrations = []
+                demonstrations = self._demo_prompt_prefix_tokens(len(top_k_neighbors))
+                sep_tokens = self._demo_example_separator_tokens()
                 for i, neighbor_dp in enumerate(reversed(top_k_neighbors)):
                     input_, output_ = self._prepro_each_datapoint(
                         neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
-                    demonstrations += input_[1:] + output_[1:]
+                    if i > 0:
+                        demonstrations += sep_tokens
+                    demonstrations += self._strip_leading_special_tokens(input_)
+                    demonstrations += self._strip_leading_special_tokens(output_)
                 #print(demonstrations)
             #print(a)
             indices = [[i] for i in range(len(input_ids), len(input_ids) + len(inputs))]
@@ -408,7 +555,7 @@ class MetaICLData(object):
             for inputs_, outputs_ in zip(inputs, outputs):
 
                 if self.use_demonstrations:
-                    inputs_ = demonstrations + inputs_[1:]
+                    inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
                 encoded = prepro_sentence_pair_single(
                     inputs_, outputs_, self.max_length, self.tokenizer,self.tokenizer.bos_token_id, self.tokenizer.eos_token_id, 
                     allow_truncation=self.use_demonstrations
@@ -421,6 +568,177 @@ class MetaICLData(object):
         self.tensorized_inputs = dict(input_ids=torch.LongTensor(input_ids),
                                       attention_mask=torch.LongTensor(attention_mask),
                                       token_type_ids=torch.LongTensor(token_type_ids))
+        self.metadata = metadata
+
+    def tensorize_kv_final(self, _test_data, _val_data, options=None, add_newlines=True,
+                           retrieval_split="test", eval_split="dev", validation_data=None,
+                           validation_split="test", lambda_weight=0.7):
+        if options is not None:
+            for i, dp in enumerate(_test_data):
+                _test_data[i] = {"input": dp, "options": options}
+            for i, dp in enumerate(_val_data):
+                _val_data[i] = {"input": dp, "options": options}
+
+        val_data, test_data = [], []
+        for dp in _test_data:
+            if "output" not in dp:
+                dp["output"] = dp["options"][0]
+            test_data.append(dp.copy())
+        for dp in _val_data:
+            if "output" not in dp:
+                dp["output"] = dp["options"][0]
+            val_data.append(dp.copy())
+
+        if validation_data is None:
+            validation_data = _val_data
+            validation_split = eval_split
+
+        validation_task_data = []
+        for dp in validation_data:
+            if "output" not in dp:
+                dp = dp.copy()
+                dp["output"] = dp["options"][0]
+            validation_task_data.append(dp.copy())
+
+        test_features = self._load_features_for_datapoints(test_data, retrieval_split)
+        validation_features = self._load_features_for_datapoints(validation_task_data, validation_split)
+        # Affinity comes from validation; final subset selection/ranking uses test features.
+        test_eval_features = self._load_features_for_datapoints(val_data, eval_split)
+        kv_info = self._kv_final_task_scores(
+            candidate_features=test_features,
+            validation_features=validation_features,
+            test_features=test_eval_features,
+            k=self.k,
+            lambda_weight=lambda_weight,
+        )
+        selected_indices = kv_info["selected_indices"]
+
+        self.kv_final_last_scores = []
+        for rank, idx in enumerate(selected_indices):
+            dp = test_data[idx]
+            self.kv_final_last_scores.append(
+                {
+                    "rank": rank,
+                    "candidate_index_in_pool": int(idx),
+                    "candidate_task": dp.get("task"),
+                    "candidate_feature_idx": int(dp.get("__feature_idx", -1)),
+                    "score": float(kv_info["score"][idx]),
+                    "affinity_norm": float(kv_info["affinity_norm"][idx]),
+                    "freq_norm": float(kv_info["freq_norm"][idx]),
+                    "freq_count": float(kv_info["freq_count"][idx]),
+                }
+            )
+
+        input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
+        metadata = []
+
+        for dp_idx, dp in enumerate(val_data):
+            inputs, outputs, answer = self._prepro_each_datapoint(
+                dp, is_first=not self.use_demonstrations, add_newlines=add_newlines)
+
+            demonstrations = []
+            if self.use_demonstrations and self.k > 0:
+                selected_local_indices = selected_indices
+                selected_neighbors = [test_data[idx] for idx in selected_local_indices]
+                demonstrations = self._demo_prompt_prefix_tokens(len(selected_neighbors))
+                sep_tokens = self._demo_example_separator_tokens()
+                for i, neighbor_dp in enumerate(selected_neighbors):
+                    input_, output_ = self._prepro_each_datapoint(
+                        neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
+                    if i > 0:
+                        demonstrations += sep_tokens
+                    demonstrations += self._strip_leading_special_tokens(input_)
+                    demonstrations += self._strip_leading_special_tokens(output_)
+
+            indices = [[i] for i in range(len(input_ids), len(input_ids) + len(inputs))]
+            metadata.append({"indices": indices, "answer": answer, "options": dp["options"]})
+
+            for inputs_, outputs_ in zip(inputs, outputs):
+                if self.use_demonstrations:
+                    inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
+                encoded = prepro_sentence_pair_single(
+                    inputs_, outputs_, self.max_length, self.tokenizer,
+                    self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
+                    allow_truncation=self.use_demonstrations
+                )
+                input_ids.append(encoded[0])
+                attention_mask.append(encoded[1])
+                token_type_ids.append(encoded[2])
+
+        self.tensorized_inputs = dict(
+            input_ids=torch.LongTensor(input_ids),
+            attention_mask=torch.LongTensor(attention_mask),
+            token_type_ids=torch.LongTensor(token_type_ids)
+        )
+        self.metadata = metadata
+
+    def tensorize_with_selected_demo_examples(self, eval_data, selected_demo_examples_per_query, add_newlines=True):
+        if len(eval_data) != len(selected_demo_examples_per_query):
+            raise ValueError(
+                f"Length mismatch: eval_data={len(eval_data)} vs selected_demo_examples_per_query={len(selected_demo_examples_per_query)}"
+            )
+
+        val_data = []
+        for dp in eval_data:
+            if "output" not in dp:
+                dp = dp.copy()
+                dp["output"] = dp["options"][0]
+            val_data.append(dp.copy())
+
+        input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
+        metadata = []
+
+        special_ids = set(self.tokenizer.all_special_ids)
+
+        for dp_idx, dp in enumerate(val_data):
+            inputs, outputs, answer = self._prepro_each_datapoint(
+                dp, is_first=not self.use_demonstrations, add_newlines=add_newlines
+            )
+
+            demonstrations = []
+            if self.use_demonstrations and self.k > 0:
+                selected_neighbors = selected_demo_examples_per_query[dp_idx][: self.k]
+                demonstrations = self._demo_prompt_prefix_tokens(len(selected_neighbors))
+                sep_tokens = self._demo_example_separator_tokens()
+                for i, neighbor_dp in enumerate(selected_neighbors):
+                    input_, output_ = self._prepro_each_datapoint(
+                        neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines
+                    )
+                    if i > 0:
+                        demonstrations += sep_tokens
+                    demonstrations += self._strip_leading_special_tokens(input_)
+                    demonstrations += self._strip_leading_special_tokens(output_)
+
+            indices = [[i] for i in range(len(input_ids), len(input_ids) + len(inputs))]
+            metadata.append({"indices": indices, "answer": answer, "options": dp["options"], "task": dp.get("task")})
+
+            for inputs_, outputs_ in zip(inputs, outputs):
+                if self.use_demonstrations:
+                    # Must match prepro_sentence_pair_single() behavior that drops all special tokens.
+                    demo_len = sum(1 for tok in demonstrations if tok not in special_ids)
+                    inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
+                else:
+                    demo_len = 0
+                encoded = prepro_sentence_pair_single(
+                    inputs_,
+                    outputs_,
+                    self.max_length,
+                    self.tokenizer,
+                    self.tokenizer.bos_token_id,
+                    self.tokenizer.eos_token_id,
+                    allow_truncation=self.use_demonstrations,
+                )
+                input_ids.append(encoded[0])
+                attention_mask.append(encoded[1])
+                token_type_ids.append(encoded[2])
+                demo_lens.append(demo_len)
+
+        self.tensorized_inputs = dict(
+            input_ids=torch.LongTensor(input_ids),
+            attention_mask=torch.LongTensor(attention_mask),
+            token_type_ids=torch.LongTensor(token_type_ids),
+            demo_lens=torch.LongTensor(demo_lens),
+        )
         self.metadata = metadata
 
 
@@ -538,14 +856,18 @@ class MetaICLData(object):
                     dp_feature, test_features, test_data, self.k//4, exclude_idx=None
                 )
 
-                demonstrations = []
+                demonstrations = self._demo_prompt_prefix_tokens(len(random_k_neighbors) + len(top_k_neighbors))
+                sep_tokens = self._demo_example_separator_tokens()
                 for i, neighbor_dp in enumerate(random_k_neighbors):
                     input_, output_ = self._prepro_each_datapoint(
                         neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
+                    if i > 0:
+                        demonstrations += sep_tokens
                     demonstrations += input_ + output_
                 for i, neighbor_dp in enumerate(top_k_neighbors):
                     input_, output_ = self._prepro_each_datapoint(
                         neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
+                    demonstrations += sep_tokens
                     demonstrations += input_ + output_
 
             indices = [[i] for i in range(len(input_ids), len(input_ids) + len(inputs))]
@@ -554,7 +876,7 @@ class MetaICLData(object):
 
             for inputs_, outputs_ in zip(inputs, outputs):
                 if self.use_demonstrations:
-                    inputs_ = demonstrations + inputs_
+                    inputs_ = demonstrations + self._query_prefix_tokens() + inputs_
                 encoded = prepro_sentence_pair_single(
                     inputs_, outputs_, self.max_length, self.tokenizer, self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
                     allow_truncation=self.use_demonstrations
@@ -600,11 +922,8 @@ class MetaICLData(object):
         test_inputs = [dp["input"].split() for dp in test_data]
         bm25 = BM25Okapi(test_inputs)
 
-        instructions = f"Here are {len(test_data[0]['options'])} options: "
-        for option in test_data[0]["options"]:
-            instructions += option + ", "
-        instructions += f"You should choose one of them to answer at the end. \nHere are {self.k} samples for your reference. \n"
-        init_tokens = self.tokenizer(instructions)["input_ids"][1:]
+        instructions = f"Use the following {self.k} examples to answer the final query.\n"
+        init_tokens = self._tokenize_prompt_text(instructions)
 
         for dp_idx, dp in enumerate(val_data):
             inputs, outputs, answer = self._prepro_each_datapoint(
@@ -619,17 +938,21 @@ class MetaICLData(object):
                 top_k_neighbors = [test_data[i] for i in topk_indices]
 
                 demonstrations = init_tokens
+                sep_tokens = self._demo_example_separator_tokens()
                 for i, neighbor_dp in enumerate(top_k_neighbors):
                     input_, output_ = self._prepro_each_datapoint(
                         neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
-                    demonstrations += input_[1:] + output_[1:]
+                    if i > 0:
+                        demonstrations += sep_tokens
+                    demonstrations += self._strip_leading_special_tokens(input_)
+                    demonstrations += self._strip_leading_special_tokens(output_)
 
             indices = [[i] for i in range(len(input_ids), len(input_ids) + len(inputs))]
 
             metadata.append({"indices": indices, "answer": answer, "options": dp["options"]})
             for inputs_, outputs_ in zip(inputs, outputs):
                 if self.use_demonstrations:
-                    inputs_ = demonstrations + inputs_[1:]
+                    inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
                 encoded = prepro_sentence_pair_single(
                     inputs_, [outputs_[2]], self.max_length, self.tokenizer,
                     self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
