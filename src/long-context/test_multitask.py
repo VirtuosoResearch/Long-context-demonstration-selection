@@ -121,6 +121,63 @@ def _normalize_scores(arr):
     return np.zeros_like(arr, dtype=np.float32)
 
 
+def _filter_candidates_for_task_by_topk(metaicl_data, candidates_task, eval_task_data, retrieval_split, eval_split, filter_k):
+    if filter_k is None or filter_k <= 0 or len(candidates_task) <= filter_k or len(eval_task_data) == 0:
+        return candidates_task
+
+    candidate_features = np.asarray(
+        metaicl_data._load_features_for_datapoints(candidates_task, retrieval_split), dtype=np.float32
+    )
+    eval_task_features = np.asarray(
+        metaicl_data._load_features_for_datapoints(eval_task_data, eval_split), dtype=np.float32
+    )
+    if candidate_features.ndim != 2 or eval_task_features.ndim != 2:
+        return candidates_task
+    if candidate_features.shape[1] != eval_task_features.shape[1]:
+        raise ValueError(
+            f"Feature dim mismatch in kv_final pre-filter: "
+            f"candidate_dim={candidate_features.shape[1]}, eval_dim={eval_task_features.shape[1]}"
+        )
+
+    # Keep the closest candidates to this task's eval distribution.
+    dists = np.linalg.norm(eval_task_features[:, None, :] - candidate_features[None, :, :], axis=2)
+    mean_dist = dists.mean(axis=0)
+    keep_indices = np.argsort(mean_dist)[:filter_k].tolist()
+    return [candidates_task[i] for i in keep_indices]
+
+
+def _gradicl_greedy_select(metaicl_data, metaicl_model, validation_rows, candidate_demo_tokens, k, task_name):
+    n_candidates = len(candidate_demo_tokens)
+    target_k = min(k, n_candidates)
+    selected = []
+    remaining = set(range(n_candidates))
+    selection_trace = []
+
+    for step in range(target_k):
+        best_idx = None
+        best_loss = None
+        for cand_idx in tqdm(
+            sorted(remaining),
+            desc=f"gradicl-greedy-{task_name}-step={step}",
+            leave=False,
+        ):
+            trial_subset = selected + [cand_idx]
+            _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, trial_subset)
+            val_losses = _kv_cached_row_losses(metaicl_model, metaicl_data)
+            subset_loss = _mean_gt_loss_for_eval(metaicl_data, val_losses)
+            if best_loss is None or subset_loss < best_loss:
+                best_loss = subset_loss
+                best_idx = cand_idx
+
+        if best_idx is None:
+            break
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+        selection_trace.append({"step": int(step), "picked_index": int(best_idx), "val_loss": float(best_loss)})
+
+    return selected, selection_trace
+
+
 def _precompute_candidate_demo_tokens(metaicl_data, candidates_task, add_newlines):
     token_seqs = []
     for dp in candidates_task:
@@ -432,6 +489,23 @@ def main(logger, args):
             task_score_artifacts = {}
             for test_task, eval_data_task in eval_by_task.items():
                 candidates_task = retrieval_data if args.kv_final_global_pool else candidate_by_task[test_task]
+                candidates_before_filter = len(candidates_task)
+                candidates_task = _filter_candidates_for_task_by_topk(
+                    metaicl_data,
+                    candidates_task,
+                    eval_data_task,
+                    args.retrieval_split,
+                    tensorize_eval_split,
+                    args.filter,
+                )
+                if args.filter > 0:
+                    logger.info(
+                        "[kv_final] task=%s pre-filter topk=%d candidates: %d -> %d",
+                        test_task,
+                        args.filter,
+                        candidates_before_filter,
+                        len(candidates_task),
+                    )
                 validation_task = validation_by_task[test_task]
                 if len(candidates_task) == 0:
                     raise ValueError(f"No candidate data for task={test_task}")
@@ -626,6 +700,175 @@ def main(logger, args):
                 )
             continue
 
+        if args.gradicl:
+            if len(validation_data) == 0:
+                raise ValueError("gradicl requires non-empty validation_data from retrieval split.")
+
+            if metaicl_model.is_none():
+                metaicl_model.load(checkpoint, model_name=args.model_name, is_quant=args.is_quant)
+                metaicl_model.cuda()
+                metaicl_model.eval()
+            if "Llama" in args.model_name:
+                metaicl_model.resize(tokenizer)
+
+            candidate_by_task = defaultdict(list)
+            for dp in retrieval_data:
+                candidate_by_task[dp["task"]].append(dp)
+            task_local_idx_by_gid = {}
+            for task_name, rows in candidate_by_task.items():
+                for task_idx, row in enumerate(rows):
+                    gid = int(row.get("__global_id", -1))
+                    task_local_idx_by_gid[gid] = (task_name, task_idx)
+            validation_by_task = defaultdict(list)
+            for dp in validation_data:
+                validation_by_task[dp["task"]].append(dp)
+
+            task_demo_bank = {}
+            task_candidates_ref = {}
+            task_score_artifacts = {}
+
+            for test_task, eval_data_task in eval_by_task.items():
+                candidates_task = retrieval_data if args.kv_final_global_pool else candidate_by_task[test_task]
+                candidates_before_filter = len(candidates_task)
+                candidates_task = _filter_candidates_for_task_by_topk(
+                    metaicl_data,
+                    candidates_task,
+                    eval_data_task,
+                    args.retrieval_split,
+                    tensorize_eval_split,
+                    args.filter,
+                )
+                if args.filter > 0:
+                    logger.info(
+                        "[gradicl] task=%s pre-filter topk=%d candidates: %d -> %d",
+                        test_task,
+                        args.filter,
+                        candidates_before_filter,
+                        len(candidates_task),
+                    )
+                validation_task = validation_by_task[test_task]
+                if len(candidates_task) == 0:
+                    raise ValueError(f"No candidate data for task={test_task}")
+                if len(validation_task) == 0:
+                    raise ValueError(f"No validation data for task={test_task}")
+
+                candidate_demo_tokens = _precompute_candidate_demo_tokens(metaicl_data, candidates_task, add_newlines)
+                validation_rows = _precompute_eval_items(metaicl_data, validation_task, add_newlines)
+                selected, trace = _gradicl_greedy_select(
+                    metaicl_data,
+                    metaicl_model,
+                    validation_rows,
+                    candidate_demo_tokens,
+                    args.k,
+                    test_task,
+                )
+                task_candidates_ref[test_task] = candidates_task
+                task_demo_bank[test_task] = [candidates_task[idx] for idx in selected]
+                task_score_artifacts[test_task] = {"selection_trace": trace}
+
+                score_path = os.path.join(
+                    args.out_dir,
+                    f"{test_task}-{tensorize_eval_split}-ret={args.retrieval_split}-gradicl-scores-s={seed}.json",
+                )
+                score_rows = []
+                for rank, idx in enumerate(selected):
+                    dp = candidates_task[idx]
+                    gid = int(dp["__global_id"])
+                    score_rows.append(
+                        {
+                            "rank": rank,
+                            "candidate_index_in_filtered_pool": int(idx),
+                            "candidate_global_id": gid,
+                            "candidate_task": dp.get("task"),
+                            "candidate_feature_idx": int(dp.get("__feature_idx", -1)),
+                            "selection_step": int(trace[rank]["step"]) if rank < len(trace) else int(rank),
+                            "validation_loss_after_pick": float(trace[rank]["val_loss"]) if rank < len(trace) else None,
+                        }
+                    )
+                with open(score_path, "w") as f:
+                    json.dump(score_rows, f, ensure_ascii=False, indent=2)
+                logger.info("Saved gradicl task scores to %s", score_path)
+                logger.info("[gradicl] selected demos for test_task=%s (count=%d)", test_task, len(selected))
+                for rank, idx in enumerate(selected):
+                    dp = candidates_task[idx]
+                    gid = int(dp["__global_id"])
+                    candidate_task, task_local_idx = task_local_idx_by_gid.get(
+                        gid, (dp.get("task"), -1)
+                    )
+                    logger.info(
+                        "[gradicl][%s] rank=%d candidate_task=%s task_local_idx=%d filtered_pool_idx=%d global_id=%d content=%s",
+                        test_task,
+                        rank,
+                        candidate_task,
+                        int(task_local_idx),
+                        int(idx),
+                        gid,
+                        _format_demo_preview(dp),
+                    )
+
+            pairs = [(dp, task_demo_bank[dp["task"]]) for dp in eval_data]
+            pairs.sort(
+                key=lambda x: tuple(int(d.get("__global_id", -1)) for d in x[1])
+            )
+            eval_data_sorted = [x[0] for x in pairs]
+            selected_demo_examples_per_query = [x[1] for x in pairs]
+            metaicl_data.tensorize_with_selected_demo_examples(
+                eval_data_sorted, selected_demo_examples_per_query, add_newlines=add_newlines
+            )
+            losses = _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc="gradicl-test")
+            preds = metaicl_model.do_predict(metaicl_data, losses=losses)
+
+            cache_path = os.path.join(
+                args.out_dir,
+                f"multitask-{tensorize_eval_split}-ret={args.retrieval_split}-gradicl-k={args.k}-s={seed}.pkl",
+            )
+            with open(cache_path, "wb") as f:
+                pkl.dump(losses, f)
+            logger.info("Saved gradicl losses to %s", cache_path)
+
+            pred_by_task = defaultdict(list)
+            gt_by_task = defaultdict(list)
+            for pred, dp in zip(preds, eval_data_sorted):
+                pred_by_task[dp["task"]].append(pred)
+                gt_by_task[dp["task"]].append(dp["output"])
+
+            for test_task in sorted(pred_by_task.keys()):
+                correct = 0
+                gts = gt_by_task[test_task]
+                for pred, gt in zip(pred_by_task[test_task], gts):
+                    p = pred.strip()
+                    if isinstance(gt, list):
+                        ok = p in [x.strip() for x in gt]
+                    else:
+                        ok = p == gt.strip()
+                    correct += int(ok)
+                total = len(gts)
+                acc = correct / total if total > 0 else 0.0
+                seed_task_metrics[test_task] = {
+                    "task": test_task,
+                    "accuracy": acc,
+                    "correct": correct,
+                    "total": total,
+                }
+                seed_total_correct += correct
+                seed_total_count += total
+                results.append(seed_task_metrics[test_task])
+
+            if seed_task_metrics:
+                per_task_msg = ", ".join(
+                    [
+                        f"{task}: {100.0 * metric['accuracy']:.2f}% ({metric['correct']}/{metric['total']})"
+                        for task, metric in sorted(seed_task_metrics.items())
+                    ]
+                )
+                overall_acc = seed_total_correct / seed_total_count if seed_total_count > 0 else 0.0
+                logger.info("Seed %s per-task accuracy => %s", seed, per_task_msg)
+                logger.info(
+                    "Seed %s overall accuracy => %.2f%% (%d/%d)",
+                    seed, 100.0 * overall_acc, seed_total_correct, seed_total_count
+                )
+            continue
+
         for test_task, eval_data_task in eval_by_task.items():
             validation_data_task = [dp for dp in validation_data if dp["task"] == test_task] if validation_data else []
             result = run(logger, test_task, metaicl_data, metaicl_model,
@@ -696,6 +939,7 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
         "-topk" if args.topk else "",
         "-randomk" if args.randomk else "",
         "-kv-final" if args.kv_final else "",
+        "-gradicl" if args.gradicl else "",
         "-bm25" if args.bm25 else "",
         "-k={}".format(args.k),
         "-s={}".format(seed),
@@ -745,7 +989,7 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
     elif args.bm25:
         metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None,  add_newlines=add_newlines)
     else:
-        raise ValueError("Please choose one selection method: --topk, --kv_final, --randomk, or --bm25")
+        raise ValueError("Please choose one selection method: --topk, --kv_final, --gradicl, --randomk, or --bm25")
 
     metaicl_data.print_tensorized_example()
     logger.info(cache_path)
@@ -839,8 +1083,11 @@ if __name__=='__main__':
 
     parser.add_argument("--topk",default=False, action="store_true")
     parser.add_argument("--kv_final", default=False, action="store_true")
-    parser.add_argument("--kv_final_lambda", type=float, default=0.7)
+    parser.add_argument("--gradicl", default=False, action="store_true")
+    parser.add_argument("--kv_final_lambda", type=float, default=0.9)
     parser.add_argument("--kv_final_subset_multiplier", type=float, default=1.0)
+    parser.add_argument("--filter", type=int, default=100,
+                        help="Per-task top-k pre-filter size for kv_final/gradicl candidates. 0 disables pre-filter.")
     parser.add_argument("--kv_final_global_pool", dest="kv_final_global_pool", action="store_true")
     parser.add_argument("--no_kv_final_global_pool", dest="kv_final_global_pool", action="store_false")
     parser.add_argument("--randomk", default=False, action="store_true")
@@ -869,6 +1116,10 @@ if __name__=='__main__':
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO,
                         handlers=handlers)
+    # Silence verbose Hugging Face/network INFO logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
     logger = logging.getLogger(__name__)
     logger.info(args)
 
