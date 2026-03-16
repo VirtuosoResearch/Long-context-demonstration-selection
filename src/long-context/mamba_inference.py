@@ -170,11 +170,22 @@ class SSMVirtualKVSidecar(nn.Module):
 
 
 class SSMHybridICLScorer:
-    def __init__(self, model, tokenizer, device: str, num_virtual_tokens: int = 8, train_A: bool = False):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device: str,
+        num_virtual_tokens: int = 8,
+        train_A: bool = False,
+        sink_tokens: int = 0,
+        align_true_positions: bool = False,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.model_dtype = self.model.get_input_embeddings().weight.dtype
+        self.sink_tokens = max(0, sink_tokens)
+        self.align_true_positions = align_true_positions
 
         # Attach sidecar SSM compressor.
         self.sidecar = SSMVirtualKVSidecar(
@@ -186,21 +197,29 @@ class SSMHybridICLScorer:
 
         self.demo_past = None
         self.demo_len = 0  # Fixed context length after compression.
+        self.true_demo_len = 0  # Original demonstration token length before compression.
 
     @torch.no_grad()
     def build_demo_cache(self, demo_text: str, measure_flops: bool = False):
         demo_ids = self.tokenizer(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
         if demo_ids.numel() == 0:
             raise ValueError("Demonstration text is empty.")
+        self.true_demo_len = demo_ids.shape[1]
 
         # Feed long demos to the sidecar compressor instead of full attention.
         inputs_embeds = self.model.get_input_embeddings()(demo_ids)
 
         # Build compressed virtual-token KV cache.
-        self.demo_past = _ensure_cache_obj(self.sidecar(inputs_embeds))
+        virtual_past = _ensure_cache_obj(self.sidecar(inputs_embeds))
+        self.demo_past = _merge_sink_and_virtual_cache(
+            model=self.model,
+            demo_ids=demo_ids,
+            virtual_past=virtual_past,
+            sink_tokens=self.sink_tokens,
+        )
 
-        # Context length collapses to a constant virtual-token count.
-        self.demo_len = self.sidecar.num_virtual_tokens
+        # Context length is sink tokens + virtual token count.
+        self.demo_len = self.sink_tokens + self.sidecar.num_virtual_tokens
 
         # Rough SSM compute proxy.
         flops = inputs_embeds.shape[1] * self.sidecar.ssm_dim * self.sidecar.ssm_dim
@@ -212,13 +231,19 @@ class SSMHybridICLScorer:
         if q_ids.numel() == 0:
             raise ValueError("Question text is empty.")
 
+        # Build fresh cache per query; model forward may mutate cache in-place.
+        demo_past = _fresh_cache_instance(self.demo_past)
+
         # Attention mask now uses compressed prefix length.
         attn = torch.ones((1, self.demo_len + q_ids.shape[1]), dtype=torch.long, device=self.device)
+        pos_start = self.true_demo_len if self.align_true_positions else self.demo_len
+        position_ids = _position_ids_from_start(pos_start, q_ids.shape[1], self.device)
 
         outputs = self.model(
             input_ids=q_ids,
-            past_key_values=self.demo_past,
+            past_key_values=demo_past,
             attention_mask=attn,
+            position_ids=position_ids,
             use_cache=True,
         )
         # FLOPs proxy is tracked separately via attention proxy.
@@ -247,6 +272,8 @@ class SSMHybridICLScorer:
         # Base context length is compressed virtual prefix + question length.
         base_len = self.demo_len + question_len
         attn = torch.ones((bsz, base_len + max_len), dtype=torch.long, device=self.device)
+        option_pos_start = (self.true_demo_len + question_len) if self.align_true_positions else (self.demo_len + question_len)
+        option_pos = _position_ids_from_start(option_pos_start, max_len, self.device, bsz=bsz)
         for i, l in enumerate(lengths):
             if l < max_len:
                 attn[i, base_len + l :] = 0
@@ -255,6 +282,7 @@ class SSMHybridICLScorer:
             input_ids=input_ids,
             past_key_values=batched_past,
             attention_mask=attn,
+            position_ids=option_pos,
             use_cache=False,
         )
 
@@ -284,6 +312,53 @@ def _ensure_cache_obj(past_key_values):
         # Older/newer cache_utils APIs may only support constructor-based init.
         return DynamicCache(past_key_values)
     return past_key_values
+
+
+def _cache_to_legacy_tuple(past_key_values):
+    if past_key_values is None:
+        return None
+    if isinstance(past_key_values, tuple):
+        return past_key_values
+    if hasattr(past_key_values, "to_legacy_cache"):
+        return past_key_values.to_legacy_cache()
+    return tuple(past_key_values)
+
+
+def _fresh_cache_instance(past_key_values):
+    # Rebuild cache each call to avoid in-place cache mutation side effects and
+    # avoid deepcopy limitations for non-leaf tensors in training.
+    legacy = _cache_to_legacy_tuple(past_key_values)
+    return _ensure_cache_obj(legacy)
+
+
+def _position_ids_from_start(start: int, seq_len: int, device: torch.device, bsz: int = 1) -> torch.Tensor:
+    pos = torch.arange(start, start + seq_len, dtype=torch.long, device=device).unsqueeze(0)
+    if bsz > 1:
+        pos = pos.expand(bsz, -1)
+    return pos
+
+
+def _merge_sink_and_virtual_cache(model, demo_ids: torch.Tensor, virtual_past, sink_tokens: int):
+    virtual_legacy = _cache_to_legacy_tuple(_ensure_cache_obj(virtual_past))
+    if sink_tokens <= 0:
+        return _ensure_cache_obj(virtual_legacy)
+
+    sink_tokens = min(int(sink_tokens), int(demo_ids.shape[1]))
+    if sink_tokens <= 0:
+        return _ensure_cache_obj(virtual_legacy)
+
+    # Sink KV is a frozen-model forward pass and should not create grads.
+    with torch.no_grad():
+        sink_out = model(input_ids=demo_ids[:, :sink_tokens], use_cache=True)
+    sink_legacy = _cache_to_legacy_tuple(_ensure_cache_obj(sink_out.past_key_values))
+
+    merged = []
+    for (k_sink, v_sink), (k_virtual, v_virtual) in zip(sink_legacy, virtual_legacy):
+        # Concatenate along sequence length dimension.
+        k = torch.cat([k_sink, k_virtual], dim=2)
+        v = torch.cat([v_sink, v_virtual], dim=2)
+        merged.append((k, v))
+    return _ensure_cache_obj(tuple(merged))
 
 
 def _freeze_backbone(model: nn.Module):
@@ -318,6 +393,7 @@ def _build_student_demo_past(
     demo_ids: torch.Tensor,
     tbptt_chunk_size: int = 0,
     detach_state_every_chunk: bool = False,
+    sink_tokens: int = 0,
 ):
     demo_embeds = model.get_input_embeddings()(demo_ids)
     demo_embeds = demo_embeds.to(dtype=sidecar.B.weight.dtype)
@@ -329,7 +405,13 @@ def _build_student_demo_past(
         )
     else:
         demo_past = sidecar(demo_embeds)
-    return _ensure_cache_obj(demo_past), sidecar.num_virtual_tokens
+    demo_past = _merge_sink_and_virtual_cache(
+        model=model,
+        demo_ids=demo_ids,
+        virtual_past=demo_past,
+        sink_tokens=sink_tokens,
+    )
+    return _ensure_cache_obj(demo_past), sink_tokens + sidecar.num_virtual_tokens, demo_ids.shape[1]
 
 
 def _student_prefill_question_with_demo_past(
@@ -337,13 +419,17 @@ def _student_prefill_question_with_demo_past(
     demo_past,
     demo_len: int,
     q_ids: torch.Tensor,
+    question_position_start: int,
 ):
-    demo_past = _ensure_cache_obj(demo_past)
+    # Build fresh cache per query; model forward may mutate cache in-place.
+    demo_past = _fresh_cache_instance(demo_past)
     attn = torch.ones((1, demo_len + q_ids.shape[1]), dtype=torch.long, device=q_ids.device)
+    position_ids = _position_ids_from_start(question_position_start, q_ids.shape[1], q_ids.device)
     out = model(
         input_ids=q_ids,
         past_key_values=demo_past,
         attention_mask=attn,
+        position_ids=position_ids,
         use_cache=True,
     )
     return out.logits[:, -1, :], out.past_key_values, demo_len
@@ -362,16 +448,27 @@ def _teacher_prefill_question(model, demo_past, demo_len: int, q_ids: torch.Tens
     return out.logits[:, -1, :], out.past_key_values
 
 
-def _answer_pass_logits_and_hidden(model, first_logits, past_after_question, base_len: int, answer_ids: torch.Tensor):
+def _answer_pass_logits_and_hidden(
+    model,
+    first_logits,
+    past_after_question,
+    base_len: int,
+    answer_ids: torch.Tensor,
+    position_start: int = -1,
+):
     past_after_question = _ensure_cache_obj(past_after_question)
     ans_len = answer_ids.shape[1]
     attn = torch.ones((1, base_len + ans_len), dtype=torch.long, device=answer_ids.device)
+    extra_kwargs = {}
+    if position_start >= 0:
+        extra_kwargs["position_ids"] = _position_ids_from_start(position_start, ans_len, answer_ids.device)
     out = model(
         input_ids=answer_ids,
         past_key_values=past_after_question,
         attention_mask=attn,
         use_cache=False,
         output_hidden_states=True,
+        **extra_kwargs,
     )
     if ans_len == 1:
         pred_logits = first_logits.unsqueeze(1)
@@ -380,11 +477,193 @@ def _answer_pass_logits_and_hidden(model, first_logits, past_after_question, bas
     return pred_logits, out.hidden_states[-1]
 
 
+@torch.no_grad()
+def _compute_answer_ce_loss_with_full_cache(
+    model,
+    demo_past,
+    demo_len: int,
+    q_ids: torch.Tensor,
+    ans_ids: torch.Tensor,
+) -> float:
+    first_logits, q_past = _teacher_prefill_question(model, demo_past, demo_len, q_ids)
+    pred_logits, _ = _answer_pass_logits_and_hidden(
+        model, first_logits, q_past, demo_len + q_ids.shape[1], ans_ids
+    )
+    vocab_size = pred_logits.size(-1)
+    ce = F.cross_entropy(
+        pred_logits.reshape(-1, vocab_size),
+        ans_ids.reshape(-1),
+        reduction="mean",
+    )
+    return float(ce.item())
+
+
+@torch.no_grad()
+def _compute_answer_ce_loss_with_ssm_cache(
+    model,
+    demo_past,
+    demo_len: int,
+    true_demo_len: int,
+    align_true_positions: bool,
+    q_ids: torch.Tensor,
+    ans_ids: torch.Tensor,
+) -> float:
+    question_position_start = true_demo_len if align_true_positions else demo_len
+    answer_position_start = question_position_start + q_ids.shape[1]
+    first_logits, q_past, s_demo_len = _student_prefill_question_with_demo_past(
+        model=model,
+        demo_past=demo_past,
+        demo_len=demo_len,
+        q_ids=q_ids,
+        question_position_start=question_position_start,
+    )
+    pred_logits, _ = _answer_pass_logits_and_hidden(
+        model,
+        first_logits,
+        q_past,
+        s_demo_len + q_ids.shape[1],
+        ans_ids,
+        position_start=answer_position_start,
+    )
+    vocab_size = pred_logits.size(-1)
+    ce = F.cross_entropy(
+        pred_logits.reshape(-1, vocab_size),
+        ans_ids.reshape(-1),
+        reduction="mean",
+    )
+    return float(ce.item())
+
+
+def run_loss_square_error(args, sidecar_state_dict=None):
+    device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    tokenizer = _setup_tokenizer(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    model.eval()
+    align_true_positions = args.align_true_positions
+    if align_true_positions and getattr(model.config, "model_type", "") == "qwen2":
+        print("WARNING: align_true_positions is not supported on current HF Qwen2 attention path; fallback to compressed-position mode.")
+        align_true_positions = False
+
+    add_newlines = not args.model_name.startswith("gpt2")
+    retrieval_data = load_data(
+        task=None,
+        split=args.retrieval_split,
+        k=args.k,
+        seed=args.seed,
+        datasets=args.dataset.split(","),
+        is_null=False,
+    )
+    eval_data = load_data(
+        task=None,
+        split=args.eval_split,
+        k=args.k,
+        seed=args.seed,
+        datasets=args.dataset.split(","),
+        is_null=False,
+    )
+    if len(retrieval_data) == 0 or len(eval_data) == 0:
+        raise ValueError("Loaded empty retrieval/eval data.")
+
+    fixed_demos = _choose_fixed_demos(retrieval_data, args.k, args.demo_strategy, args.seed)
+    demo_text = _build_demo_text(fixed_demos, add_newlines=add_newlines)
+    demo_ids = tokenizer(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+    if demo_ids.numel() == 0:
+        raise ValueError("Demonstration text is empty after tokenization.")
+
+    # Baseline path: full KV-cache over raw demonstrations.
+    with torch.no_grad():
+        base_demo = model(input_ids=demo_ids, use_cache=True)
+        base_demo_past = base_demo.past_key_values
+    base_demo_len = demo_ids.shape[1]
+
+    # SSM path: compressed demo cache.
+    kv = SSMHybridICLScorer(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        num_virtual_tokens=args.num_virtual_tokens,
+        train_A=args.train_A,
+        sink_tokens=args.sink_tokens,
+        align_true_positions=align_true_positions,
+    )
+    if sidecar_state_dict is not None:
+        kv.sidecar.load_state_dict(sidecar_state_dict, strict=True)
+        kv.sidecar.eval()
+        print("Loaded sidecar weights from in-memory trained state.")
+    elif args.load_sidecar_path:
+        ckpt = torch.load(args.load_sidecar_path, map_location=device)
+        state = ckpt["sidecar"] if isinstance(ckpt, dict) and "sidecar" in ckpt else ckpt
+        kv.sidecar.load_state_dict(state, strict=True)
+        kv.sidecar.eval()
+        print(f"Loaded sidecar checkpoint from: {args.load_sidecar_path}")
+    else:
+        print("WARNING: No sidecar checkpoint loaded; SSM loss may be unstable/random.")
+    kv.build_demo_cache(demo_text)
+
+    norm_sq_errs = []
+    full_losses = []
+    ssm_losses = []
+
+    for dp in tqdm(eval_data, total=len(eval_data), desc="compare-loss-ssm-vs-full"):
+        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_newlines)
+        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+        ans_ids = tokenizer(ans_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+        if q_ids.numel() == 0 or ans_ids.numel() == 0:
+            continue
+
+        full_ce = _compute_answer_ce_loss_with_full_cache(
+            model=model,
+            demo_past=base_demo_past,
+            demo_len=base_demo_len,
+            q_ids=q_ids,
+            ans_ids=ans_ids,
+        )
+        ssm_ce = _compute_answer_ce_loss_with_ssm_cache(
+            model=model,
+            demo_past=kv.demo_past,
+            demo_len=kv.demo_len,
+            true_demo_len=kv.true_demo_len,
+            align_true_positions=align_true_positions,
+            q_ids=q_ids,
+            ans_ids=ans_ids,
+        )
+
+        full_losses.append(full_ce)
+        ssm_losses.append(ssm_ce)
+        denom = max(ssm_ce, full_ce)
+        if denom <= 0.0:
+            # CE loss should be non-negative; this guard avoids division-by-zero.
+            continue
+        norm_sq_errs.append(((ssm_ce - full_ce) / denom) ** 2)
+
+    if len(norm_sq_errs) == 0:
+        raise ValueError("No valid eval samples to compare loss.")
+
+    mean_full = sum(full_losses) / len(full_losses)
+    mean_ssm = sum(ssm_losses) / len(ssm_losses)
+    mean_square_loss = sum(norm_sq_errs) / len(norm_sq_errs)
+    min_square_loss = min(norm_sq_errs)
+    final_loss_sq_err = (mean_ssm - mean_full) ** 2
+
+    print("\n===== Loss Square Error (SSM vs Full-KV) =====")
+    print(f"num_samples={len(norm_sq_errs)}")
+    print(f"mean_ce_full_kv={mean_full:.6f}")
+    print(f"mean_ce_ssm={mean_ssm:.6f}")
+    print("mean_square_loss = mean(((ssm-fullkv)/max(ssm,fullkv))^2)")
+    print(f"mean_square_loss={mean_square_loss:.6f}")
+    print(f"min_square_loss={min_square_loss:.6f}")
+    print(f"square_error_of_mean_loss={final_loss_sq_err:.6f}")
+
+
 def run_distillation_training(args):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     tokenizer = _setup_tokenizer(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     _freeze_backbone(model)
+    align_true_positions = args.align_true_positions
+    if align_true_positions and getattr(model.config, "model_type", "") == "qwen2":
+        print("WARNING: align_true_positions is not supported on current HF Qwen2 attention path; fallback to compressed-position mode.")
+        align_true_positions = False
 
     add_newlines = not args.model_name.startswith("gpt2")
     retrieval_data = load_data(
@@ -424,6 +703,8 @@ def run_distillation_training(args):
         device=device,
         num_virtual_tokens=args.num_virtual_tokens,
         train_A=args.train_A,
+        sink_tokens=args.sink_tokens,
+        align_true_positions=align_true_positions,
     )
     sidecar = student.sidecar
     sidecar.train()
@@ -459,12 +740,13 @@ def run_distillation_training(args):
                 continue
 
             # Build student demo cache once per optimizer step.
-            student_demo_past, student_demo_len = _build_student_demo_past(
+            student_demo_past, student_demo_len, student_true_demo_len = _build_student_demo_past(
                 model=model,
                 sidecar=sidecar,
                 demo_ids=demo_ids,
                 tbptt_chunk_size=args.tbptt_chunk_size,
                 detach_state_every_chunk=False,
+                sink_tokens=args.sink_tokens,
             )
 
             batch_loss = None
@@ -485,14 +767,22 @@ def run_distillation_training(args):
                         model, t_first, t_q_past, full_demo_len + q_ids.shape[1], ans_ids
                     )
 
+                question_position_start = student_true_demo_len if align_true_positions else student_demo_len
+                answer_position_start = question_position_start + q_ids.shape[1]
                 s_first, s_q_past, s_demo_len = _student_prefill_question_with_demo_past(
                     model=model,
                     demo_past=student_demo_past,
                     demo_len=student_demo_len,
                     q_ids=q_ids,
+                    question_position_start=question_position_start,
                 )
                 s_logits, s_hidden = _answer_pass_logits_and_hidden(
-                    model, s_first, s_q_past, s_demo_len + q_ids.shape[1], ans_ids
+                    model,
+                    s_first,
+                    s_q_past,
+                    s_demo_len + q_ids.shape[1],
+                    ans_ids,
+                    position_start=answer_position_start,
                 )
 
                 vocab_size = s_logits.size(-1)
@@ -557,6 +847,9 @@ def run_distillation_training(args):
         torch.save(ckpt, args.save_sidecar_path)
         print(f"Saved sidecar checkpoint to: {args.save_sidecar_path}")
 
+    # Return a CPU copy so caller can run post-train comparisons without reloading.
+    return {k: v.detach().cpu() for k, v in sidecar.state_dict().items()}
+
 # ----------------- Utility Functions -----------------
 def _setup_tokenizer(model_name: str):
     tokenizer = GPT2Tokenizer.from_pretrained(model_name) if model_name.startswith("gpt2") else AutoTokenizer.from_pretrained(model_name)
@@ -594,6 +887,10 @@ def run_experiment(args):
     tokenizer = _setup_tokenizer(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     model.eval()
+    align_true_positions = args.align_true_positions
+    if align_true_positions and getattr(model.config, "model_type", "") == "qwen2":
+        print("WARNING: align_true_positions is not supported on current HF Qwen2 attention path; fallback to compressed-position mode.")
+        align_true_positions = False
 
     add_newlines = not args.model_name.startswith("gpt2")
     retrieval_data = load_data(
@@ -629,6 +926,8 @@ def run_experiment(args):
         device=device,
         num_virtual_tokens=num_virtual_tokens,
         train_A=args.train_A,
+        sink_tokens=args.sink_tokens,
+        align_true_positions=align_true_positions,
     )
     if args.load_sidecar_path:
         ckpt = torch.load(args.load_sidecar_path, map_location=device)
@@ -679,17 +978,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--k", type=int, default=50)
+    parser.add_argument("--k", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--retrieval_split", type=str, default="test")
     parser.add_argument("--eval_split", type=str, default="dev")
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--demo_strategy", type=str, default="first")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--run_mode", type=str, default="eval", choices=["eval", "train", "train_eval"])
+    parser.add_argument(
+        "--run_mode",
+        type=str,
+        default="eval",
+        choices=["eval", "train", "train_eval", "compare_loss", "train_compare_loss"],
+    )
 
     # Sidecar/training options
     parser.add_argument("--num_virtual_tokens", type=int, default=8)
+    parser.add_argument("--sink_tokens", type=int, default=0)
+    parser.add_argument("--align_true_positions", action="store_true")
     parser.add_argument("--train_A", action="store_true")
     parser.add_argument("--tbptt_chunk_size", type=int, default=2048)
     parser.add_argument("--train_batch_size", type=int, default=4)
@@ -707,14 +1013,24 @@ if __name__ == "__main__":
     parser.add_argument("--compile_mode", type=str, default="default")
     parser.add_argument("--save_sidecar_path", type=str, default="")
     parser.add_argument("--load_sidecar_path", type=str, default="")
+    parser.add_argument("--compare_loss_after_train", action="store_true")
     args = parser.parse_args()
 
     if args.run_mode == "train":
-        run_distillation_training(args)
+        trained_state = run_distillation_training(args)
+        if args.compare_loss_after_train:
+            run_loss_square_error(args, sidecar_state_dict=trained_state)
     elif args.run_mode == "train_eval":
-        run_distillation_training(args)
+        trained_state = run_distillation_training(args)
         if args.save_sidecar_path:
             args.load_sidecar_path = args.save_sidecar_path
         run_experiment(args)
+        if args.compare_loss_after_train:
+            run_loss_square_error(args, sidecar_state_dict=trained_state)
+    elif args.run_mode == "train_compare_loss":
+        trained_state = run_distillation_training(args)
+        run_loss_square_error(args, sidecar_state_dict=trained_state)
+    elif args.run_mode == "compare_loss":
+        run_loss_square_error(args)
     else:
         run_experiment(args)
