@@ -174,6 +174,7 @@ class SSMHybridICLScorer:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.model_dtype = self.model.get_input_embeddings().weight.dtype
 
         # Attach sidecar SSM compressor.
         self.sidecar = SSMVirtualKVSidecar(
@@ -181,7 +182,7 @@ class SSMHybridICLScorer:
             ssm_dim=256,
             num_virtual_tokens=num_virtual_tokens,
             train_A=train_A,
-        ).to(device)
+        ).to(device=device, dtype=self.model_dtype)
 
         self.demo_past = None
         self.demo_len = 0  # Fixed context length after compression.
@@ -196,7 +197,7 @@ class SSMHybridICLScorer:
         inputs_embeds = self.model.get_input_embeddings()(demo_ids)
 
         # Build compressed virtual-token KV cache.
-        self.demo_past = self.sidecar(inputs_embeds)
+        self.demo_past = _ensure_cache_obj(self.sidecar(inputs_embeds))
 
         # Context length collapses to a constant virtual-token count.
         self.demo_len = self.sidecar.num_virtual_tokens
@@ -240,10 +241,7 @@ class SSMHybridICLScorer:
             input_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=self.device)
             token_mask[i, : len(ids)] = 1.0
 
-        if isinstance(past_after_question, tuple):
-            batched_past = DynamicCache.from_legacy_cache(past_after_question)
-        else:
-            batched_past = copy.deepcopy(past_after_question)
+        batched_past = copy.deepcopy(_ensure_cache_obj(past_after_question))
         batched_past.batch_repeat_interleave(bsz)
 
         # Base context length is compressed virtual prefix + question length.
@@ -272,6 +270,20 @@ def _build_demo_text(fixed_demos: List[Dict], add_newlines: bool) -> str:
     return "".join(
         [di + do for i, dp in enumerate(fixed_demos) for di, do in [_normalize_text(dp, i == 0, add_newlines)]]
     )
+
+
+def _ensure_cache_obj(past_key_values):
+    """
+    Convert legacy tuple cache to DynamicCache for newer HF models.
+    """
+    if past_key_values is None:
+        return None
+    if isinstance(past_key_values, tuple):
+        if hasattr(DynamicCache, "from_legacy_cache"):
+            return DynamicCache.from_legacy_cache(past_key_values)
+        # Older/newer cache_utils APIs may only support constructor-based init.
+        return DynamicCache(past_key_values)
+    return past_key_values
 
 
 def _freeze_backbone(model: nn.Module):
@@ -308,6 +320,7 @@ def _build_student_demo_past(
     detach_state_every_chunk: bool = False,
 ):
     demo_embeds = model.get_input_embeddings()(demo_ids)
+    demo_embeds = demo_embeds.to(dtype=sidecar.B.weight.dtype)
     if tbptt_chunk_size > 0:
         demo_past = sidecar.forward_chunked(
             demo_embeds,
@@ -316,7 +329,7 @@ def _build_student_demo_past(
         )
     else:
         demo_past = sidecar(demo_embeds)
-    return demo_past, sidecar.num_virtual_tokens
+    return _ensure_cache_obj(demo_past), sidecar.num_virtual_tokens
 
 
 def _student_prefill_question_with_demo_past(
@@ -325,6 +338,7 @@ def _student_prefill_question_with_demo_past(
     demo_len: int,
     q_ids: torch.Tensor,
 ):
+    demo_past = _ensure_cache_obj(demo_past)
     attn = torch.ones((1, demo_len + q_ids.shape[1]), dtype=torch.long, device=q_ids.device)
     out = model(
         input_ids=q_ids,
@@ -337,6 +351,7 @@ def _student_prefill_question_with_demo_past(
 
 @torch.no_grad()
 def _teacher_prefill_question(model, demo_past, demo_len: int, q_ids: torch.Tensor):
+    demo_past = _ensure_cache_obj(demo_past)
     attn = torch.ones((1, demo_len + q_ids.shape[1]), dtype=torch.long, device=q_ids.device)
     out = model(
         input_ids=q_ids,
@@ -348,6 +363,7 @@ def _teacher_prefill_question(model, demo_past, demo_len: int, q_ids: torch.Tens
 
 
 def _answer_pass_logits_and_hidden(model, first_logits, past_after_question, base_len: int, answer_ids: torch.Tensor):
+    past_after_question = _ensure_cache_obj(past_after_question)
     ans_len = answer_ids.shape[1]
     attn = torch.ones((1, base_len + ans_len), dtype=torch.long, device=answer_ids.device)
     out = model(
@@ -596,14 +612,14 @@ def run_experiment(args):
         datasets=args.dataset.split(","),
         is_null=False,
     )
-    options = eval_data[0]["options"]
     fixed_demos = _choose_fixed_demos(retrieval_data, args.k, args.demo_strategy, args.seed)
 
     demo_text = _build_demo_text(fixed_demos, add_newlines=add_newlines)
     original_demo_len = len(tokenizer(demo_text, add_special_tokens=False)["input_ids"])
 
     print("\n===== SSM Virtual KV-cache Experiment =====")
-    print("WARNING: Without training the SSMVirtualKVSidecar, accuracy will be random!")
+    if not args.load_sidecar_path:
+        print("WARNING: No trained sidecar checkpoint loaded; accuracy may be near random.")
 
     # Use the SSM-hybrid scorer.
     num_virtual_tokens = args.num_virtual_tokens
@@ -637,6 +653,8 @@ def run_experiment(args):
         assert q_len_runtime == q_len
         kv_proxy += _attention_proxy_incremental(kv.demo_len, q_len)
 
+        # Multi-task evaluation requires per-example candidate options.
+        options = dp["options"]
         opt_texts = [_normalize_option(opt, add_newlines=add_newlines) for opt in options]
         scores_text = kv.score_options_nll(first_logits, q_past, q_len, opt_texts)
         scores = {opt: scores_text[opt_text] for opt, opt_text in zip(options, opt_texts)}
@@ -650,7 +668,7 @@ def run_experiment(args):
     kv_time = time.perf_counter() - t1
     kv_acc = _accuracy(kv_preds, [dp["output"] for dp in eval_data])
 
-    print(f"\nSSM Hybrid Acc (Untrained) = {kv_acc:.6f}")
+    print(f"\nSSM Hybrid Acc = {kv_acc:.6f}")
     print(f"Time Taken = {kv_time:.3f}s")
     print(f"Original Demo Length = {original_demo_len}")
     print(f"Compressed Demo Length = {kv.demo_len}")
