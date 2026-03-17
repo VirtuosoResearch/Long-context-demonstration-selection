@@ -188,3 +188,5 @@ datasets/
 *.zip
 src/linear_functions/models
 src/linear_functions/src/results
+
+*.pt
