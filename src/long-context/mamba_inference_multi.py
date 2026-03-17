@@ -252,16 +252,27 @@ def kv_matching_loss(
 ) -> torch.Tensor:
     """
     Compare virtual KV against chunked-mean-pooled teacher KV.
-    Provides a strong, direct gradient to the sidecar without going
-    through a full model forward.
+    teacher_kv can be:
+      - List[Tuple[Tensor, Tensor]] (raw tensor pairs, preferred)
+      - DynamicCache
+      - Legacy tuple cache
     """
-    t_legacy = _cache_to_legacy(_ensure_cache_obj(teacher_kv))
+    # Normalise teacher_kv to a list of (K, V) tensor pairs.
+    if isinstance(teacher_kv, list):
+        t_kv = teacher_kv
+    elif isinstance(teacher_kv, DynamicCache):
+        t_kv = [(teacher_kv.key_cache[i], teacher_kv.value_cache[i])
+                for i in range(len(teacher_kv.key_cache))]
+    else:
+        # Legacy tuple
+        t_kv = list(teacher_kv)
+
     device = virtual_kv[0][0].device
     total = torch.tensor(0.0, device=device)
     n_terms = 0
 
     for layer_idx, (vk, vv) in enumerate(virtual_kv):
-        tk, tv = t_legacy[layer_idx]          # [B, heads, T_full, hdim]
+        tk, tv = t_kv[layer_idx]              # [B, heads, T_full, hdim]
         T_full = tk.shape[2]
         chunk = max(1, T_full // num_virtual_tokens)
 
@@ -395,9 +406,11 @@ def _generate_diverse_demo_texts(
 
 
 def _teacher_demo_kv(model, demo_ids: torch.Tensor):
-    """Full KV cache from frozen teacher."""
+    """Full KV cache from frozen teacher, returned as legacy tuple of (K, V) pairs.
+    Works regardless of HF version / DynamicCache internals."""
     with torch.no_grad():
-        return model(input_ids=demo_ids, use_cache=True).past_key_values
+        out = model(input_ids=demo_ids, use_cache=True)
+        return _cache_to_legacy(out.past_key_values)
 
 
 def _student_virtual_kv(model, sidecar, demo_ids: torch.Tensor):
@@ -408,20 +421,26 @@ def _student_virtual_kv(model, sidecar, demo_ids: torch.Tensor):
 
 
 @torch.no_grad()
-def _teacher_qa_logits(model, teacher_kv, demo_len: int, q_ids, ans_ids):
-    """Teacher logits on answer tokens (no grad)."""
-    t_kv = _ensure_cache_obj(teacher_kv)
-    attn_q = torch.ones(1, demo_len + q_ids.shape[1], dtype=torch.long, device=q_ids.device)
-    out_q = model(input_ids=q_ids, past_key_values=copy.deepcopy(t_kv),
-                  attention_mask=attn_q, use_cache=True)
-    first = out_q.logits[:, -1:]
-    base = demo_len + q_ids.shape[1]
-    attn_a = torch.ones(1, base + ans_ids.shape[1], dtype=torch.long, device=q_ids.device)
-    out_a = model(input_ids=ans_ids, past_key_values=out_q.past_key_values,
-                  attention_mask=attn_a, use_cache=False)
-    if ans_ids.shape[1] == 1:
-        return first
-    return torch.cat([first, out_a.logits[:, :-1]], dim=1)
+def _teacher_qa_logits_nocache(model, demo_ids, q_ids, ans_ids):
+    """
+    Teacher logits on answer tokens via a single concatenated forward pass.
+    No KV cache involved at all – immune to all DynamicCache version issues.
+    Slightly more expensive but guaranteed correct.
+    """
+    # Concat: [demo_ids, q_ids, ans_ids]
+    all_ids = torch.cat([demo_ids, q_ids, ans_ids], dim=1)
+    out = model(input_ids=all_ids, use_cache=False)
+
+    # We need logits that predict each answer token.
+    # ans_ids[0] is predicted by logits at position (demo_len + q_len - 1),
+    # ans_ids[1] by position (demo_len + q_len), etc.
+    demo_len = demo_ids.shape[1]
+    q_len = q_ids.shape[1]
+    ans_len = ans_ids.shape[1]
+    start = demo_len + q_len - 1
+    end = start + ans_len
+    pred_logits = out.logits[:, start:end, :]  # [1, ans_len, vocab]
+    return pred_logits
 
 
 def _student_qa_logits(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
@@ -626,7 +645,8 @@ def run_experiment(args, sidecar_state_dict=None):
                           seed=args.seed, datasets=args.dataset.split(","), is_null=False)
     fixed_demos = _choose_fixed_demos(retrieval_data, args.k, args.demo_strategy, args.seed)
     demo_text = _build_demo_text(fixed_demos, add_newlines=add_nl)
-    original_demo_len = len(tokenizer(demo_text, add_special_tokens=False)["input_ids"])
+    demo_ids = tokenizer(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+    original_demo_len = demo_ids.shape[1]
 
     sidecar = LayerGroupSSMSidecar(
         model.config, ssm_dim=args.ssm_dim, num_virtual_tokens=args.num_virtual_tokens,
@@ -638,16 +658,77 @@ def run_experiment(args, sidecar_state_dict=None):
     scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
                                 sink_tokens=args.sink_tokens, align_true_positions=align)
 
+    # ─── Full-KV baseline (accuracy + CE) ───
+    # Uses concatenated forward (no cache) for both accuracy and loss.
+    # This is slower but guaranteed correct on any HF version.
+    print("\n--- Running Full-KV baseline ---")
+    full_kv_preds = []
+    full_losses = []
+    for dp in tqdm(eval_data, desc="full-kv-baseline"):
+        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
+        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+        a_ids = tokenizer(ans_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+
+        # Full-KV accuracy: score each option via concatenated forward
+        opts = dp["options"]
+        opt_scores = {}
+        for opt in opts:
+            opt_text = _normalize_option(opt, add_nl)
+            opt_ids = tokenizer(opt_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+            if opt_ids.numel() == 0:
+                opt_scores[opt] = float("inf")
+                continue
+            with torch.no_grad():
+                all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
+                out = model(input_ids=all_ids, use_cache=False)
+                start = demo_ids.shape[1] + q_ids.shape[1] - 1
+                pred_logits = out.logits[:, start : start + opt_ids.shape[1], :]
+                nll = F.cross_entropy(
+                    pred_logits.reshape(-1, pred_logits.size(-1)),
+                    opt_ids.reshape(-1),
+                    reduction="sum",
+                ).item()
+            opt_scores[opt] = nll
+        full_kv_preds.append(min(opt_scores, key=opt_scores.get))
+
+        # Full-KV CE on ground-truth answer
+        if q_ids.numel() > 0 and a_ids.numel() > 0:
+            with torch.no_grad():
+                t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+                t_ce = F.cross_entropy(
+                    t_logits.reshape(-1, t_logits.size(-1)),
+                    a_ids.reshape(-1),
+                    reduction="mean",
+                ).item()
+            full_losses.append(t_ce)
+
+    full_kv_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
+
+    # ─── SSM compressed evaluation ───
+    print("\n--- Running SSM evaluation ---")
     t0 = time.perf_counter()
     scorer.build_demo_cache(demo_text)
 
-    preds = []
+    # Build SSM virtual KV once for loss comparison
+    with torch.no_grad():
+        emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
+        eval_virtual_kv = sidecar(emb)
+        eval_sink_kv = None
+        st = min(args.sink_tokens, demo_ids.shape[1])
+        if st > 0:
+            eval_sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+        eval_ssm_demo_len = st + sidecar.num_virtual_tokens
+
+    ssm_preds = []
     proxy = _attn_proxy_full(scorer.demo_len)
+    ssm_losses = []
 
     for dp in tqdm(eval_data, desc="ssm-eval"):
-        q_text, _ = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-        q_len_tok = len(tokenizer(q_text, add_special_tokens=False)["input_ids"])
+        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
+        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+        a_ids = tokenizer(ans_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
 
+        # SSM accuracy
         first, q_past, q_len = scorer.prefill_question(q_text)
         proxy += _attn_proxy_inc(scorer.demo_len, q_len)
 
@@ -658,17 +739,58 @@ def run_experiment(args, sidecar_state_dict=None):
         for ot in opt_texts:
             proxy += _attn_proxy_inc(scorer.demo_len + q_len,
                                      len(tokenizer(ot, add_special_tokens=False)["input_ids"]))
-        preds.append(min(scores, key=scores.get))
+        ssm_preds.append(min(scores, key=scores.get))
+
+        # SSM CE on ground-truth answer
+        if q_ids.numel() > 0 and a_ids.numel() > 0:
+            with torch.no_grad():
+                s_logits = _student_qa_logits(
+                    model, eval_virtual_kv, eval_sink_kv,
+                    eval_ssm_demo_len, original_demo_len, align, q_ids, a_ids,
+                )
+                s_ce = F.cross_entropy(
+                    s_logits.reshape(-1, s_logits.size(-1)),
+                    a_ids.reshape(-1),
+                    reduction="mean",
+                ).item()
+            ssm_losses.append(s_ce)
 
     elapsed = time.perf_counter() - t0
-    acc = _accuracy(preds, [dp["output"] for dp in eval_data])
+    ssm_acc = _accuracy(ssm_preds, [dp["output"] for dp in eval_data])
 
-    print(f"\n===== SSM Hybrid Eval =====")
-    print(f"Accuracy        = {acc:.6f}")
-    print(f"Time            = {elapsed:.3f}s")
-    print(f"Original prefix = {original_demo_len} tokens")
-    print(f"Compressed      = {scorer.demo_len} tokens")
-    print(f"Attn proxy      = {proxy}")
+    # ─── Loss comparison ───
+    n_compare = min(len(full_losses), len(ssm_losses))
+    norm_sq_errs = []
+    for i in range(n_compare):
+        fc, sc = full_losses[i], ssm_losses[i]
+        denom = max(fc, sc)
+        if denom > 0:
+            norm_sq_errs.append(((sc - fc) / denom) ** 2)
+
+    mean_full = sum(full_losses) / max(1, len(full_losses))
+    mean_ssm = sum(ssm_losses) / max(1, len(ssm_losses))
+    mean_sq_loss = ((mean_ssm - mean_full) / max(mean_ssm, mean_full)) ** 2 if max(mean_ssm, mean_full) > 0 else 0.0
+    per_sample_mse = sum(norm_sq_errs) / max(1, len(norm_sq_errs)) if norm_sq_errs else 0.0
+
+    print(f"\n{'='*50}")
+    print(f"  SSM Hybrid Eval Results")
+    print(f"{'='*50}")
+    print(f"Full-KV Accuracy    = {full_kv_acc:.6f}  (upper bound)")
+    print(f"SSM Accuracy        = {ssm_acc:.6f}")
+    print(f"Accuracy gap        = {full_kv_acc - ssm_acc:.6f}")
+    print(f"Time (SSM only)     = {elapsed:.3f}s")
+    print(f"Original prefix     = {original_demo_len} tokens")
+    print(f"Compressed prefix   = {scorer.demo_len} tokens")
+    print(f"Compression ratio   = {original_demo_len / max(1, scorer.demo_len):.1f}x")
+    print(f"Attn proxy (SSM)    = {proxy}")
+    print(f"\n{'='*50}")
+    print(f"  Loss Comparison (SSM vs Full-KV)")
+    print(f"{'='*50}")
+    print(f"num_samples         = {n_compare}")
+    print(f"mean_CE_full_kv     = {mean_full:.6f}")
+    print(f"mean_CE_ssm         = {mean_ssm:.6f}")
+    print(f"mean_norm_sq_loss   = {mean_sq_loss:.6f}  (on means)")
+    print(f"per_sample_mean_MSE = {per_sample_mse:.6f}  (avg of per-sample ((ssm-full)/max)^2)")
 
 
 # =====================================================================
@@ -696,10 +818,6 @@ def run_loss_comparison(args, sidecar_state_dict=None):
     fixed_demos = _choose_fixed_demos(retrieval_data, args.k, args.demo_strategy, args.seed)
     demo_text = _build_demo_text(fixed_demos, add_newlines=add_nl)
     demo_ids = tokenizer(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-
-    # Teacher baseline
-    with torch.no_grad():
-        teacher_kv = model(input_ids=demo_ids, use_cache=True).past_key_values
     full_len = demo_ids.shape[1]
 
     # SSM scorer
@@ -714,6 +832,16 @@ def run_loss_comparison(args, sidecar_state_dict=None):
                                 sink_tokens=args.sink_tokens, align_true_positions=align)
     scorer.build_demo_cache(demo_text)
 
+    # Build SSM virtual KV once
+    with torch.no_grad():
+        emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
+        eval_virtual_kv = sidecar(emb)
+        eval_sink_kv = None
+        st = min(args.sink_tokens, demo_ids.shape[1])
+        if st > 0:
+            eval_sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+        eval_ssm_demo_len = st + sidecar.num_virtual_tokens
+
     full_losses, ssm_losses = [], []
     for dp in tqdm(eval_data, desc="compare-loss"):
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
@@ -722,24 +850,21 @@ def run_loss_comparison(args, sidecar_state_dict=None):
         if q_ids.numel() == 0 or a_ids.numel() == 0:
             continue
 
-        # Teacher CE
         with torch.no_grad():
-            t_logits = _teacher_qa_logits(model, teacher_kv, full_len, q_ids, a_ids)
-            t_ce = F.cross_entropy(t_logits.reshape(-1, t_logits.size(-1)), a_ids.reshape(-1), reduction="mean").item()
+            # Teacher: single concatenated forward, no cache
+            t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+            t_ce = F.cross_entropy(
+                t_logits.reshape(-1, t_logits.size(-1)), a_ids.reshape(-1), reduction="mean"
+            ).item()
 
-        # SSM CE
-        with torch.no_grad():
-            emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
-            vkv = sidecar(emb)
-            sink_kv = None
-            st = min(args.sink_tokens, demo_ids.shape[1])
-            if st > 0:
-                sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
-            demo_len = st + sidecar.num_virtual_tokens
+            # SSM
             s_logits = _student_qa_logits(
-                model, vkv, sink_kv, demo_len, full_len, align, q_ids, a_ids,
+                model, eval_virtual_kv, eval_sink_kv,
+                eval_ssm_demo_len, full_len, align, q_ids, a_ids,
             )
-            s_ce = F.cross_entropy(s_logits.reshape(-1, s_logits.size(-1)), a_ids.reshape(-1), reduction="mean").item()
+            s_ce = F.cross_entropy(
+                s_logits.reshape(-1, s_logits.size(-1)), a_ids.reshape(-1), reduction="mean"
+            ).item()
 
         full_losses.append(t_ce)
         ssm_losses.append(s_ce)
