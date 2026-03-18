@@ -1,6 +1,6 @@
-
 import argparse
 import copy
+import gc
 import math
 import random
 import time
@@ -40,16 +40,20 @@ def _hippo_legs_input_vector(size: int, device: torch.device, dtype: torch.dtype
 
 class LayerGroupSSM(nn.Module):
     def __init__(self, hidden_size, ssm_dim, num_layers_in_group, num_kv_heads,
-                 head_dim, num_virtual_tokens, dt=1.0):
+                 head_dim, num_virtual_tokens, dt=1.0, scan_chunk_size=64):
         super().__init__()
         self.ssm_dim = ssm_dim
         self.num_layers_in_group = num_layers_in_group
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.num_virtual_tokens = num_virtual_tokens
+        self.scan_chunk_size = scan_chunk_size
 
+        # Discretised HiPPO-LegS A matrix — FROZEN, not trained.
         a_cont = _hippo_legs_matrix(ssm_dim, torch.device("cpu"), torch.float32)
-        self.A = nn.Parameter(torch.matrix_exp(dt * a_cont))
+        a_disc = torch.matrix_exp(dt * a_cont)
+        self.register_buffer("A", a_disc)
+
         self.B = nn.Linear(hidden_size, ssm_dim)
         self._init_hippo_B(hidden_size)
 
@@ -68,14 +72,58 @@ class LayerGroupSSM(nn.Module):
             self.B.weight.mul_(b.unsqueeze(1))
             nn.init.zeros_(self.B.bias)
 
-    def scan(self, x, chunk_size=512):
+    def scan(self, x, chunk_size=None):
+        """
+        Chunk-parallel scan using precomputed A powers (real-valued).
+
+        For a chunk of C inputs u_0..u_{C-1} and incoming state s:
+          s_out = A^C @ s + A^{C-1} @ u_0 + A^{C-2} @ u_1 + ... + I @ u_{C-1}
+
+        The sum is a single batched einsum per chunk, reducing T kernel
+        launches to ~T/C launches.  A powers are computed on-the-fly per
+        chunk (C matmuls of [D,D]) to avoid storing a large buffer.
+        """
+        if chunk_size is None:
+            chunk_size = self.scan_chunk_size
         bsz, T, _ = x.shape
-        state = torch.zeros(bsz, self.ssm_dim, device=x.device, dtype=x.dtype)
-        a = self.A.to(device=x.device, dtype=x.dtype)
-        for s in range(0, T, chunk_size):
-            u = self.B(x[:, s:s + chunk_size])
-            for t in range(u.shape[1]):
-                state = F.linear(state, a) + u[:, t]
+        device, dtype = x.device, x.dtype
+        D = self.ssm_dim
+
+        # Project all inputs at once: [B, T, D]
+        u_all = self.B(x)
+
+        state = torch.zeros(bsz, D, device=device, dtype=dtype)
+        A = self.A.to(device=device, dtype=dtype)  # [D, D]
+
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            C = end - start
+            u_chunk = u_all[:, start:end, :]  # [B, C, D]
+
+            if C == 1:
+                state = (state @ A.T) + u_chunk[:, 0]
+                continue
+
+            # Build weight matrices on the fly: weights[t] = A^{C-1-t}
+            # weights[C-1] = I, weights[C-2] = A, weights[C-3] = A^2, ...
+            # Compute iteratively: only C matmuls of [D,D]
+            weights = torch.zeros(C, D, D, device=device, dtype=dtype)
+            weights[C - 1] = torch.eye(D, device=device, dtype=dtype)
+            if C >= 2:
+                weights[C - 2] = A
+            for t in range(C - 3, -1, -1):
+                weights[t] = weights[t + 1] @ A
+
+            # Batched contribution: einsum over chunk dim
+            # weights: [C, D, D], u_chunk: [B, C, D]
+            # contrib[b, c, d] = sum_j weights[c, d, j] * u_chunk[b, c, j]
+            # total: [B, D] = sum over c
+            total_contrib = torch.einsum('cdj,bcj->bd', weights, u_chunk)
+
+            # A^C = weights[0] @ A (since weights[0] = A^{C-1})
+            A_C = weights[0] @ A  # [D, D]
+            state = (state @ A_C.T) + total_contrib
+
         return state
 
     def forward(self, x):
@@ -531,6 +579,12 @@ def run_distillation_training(args):
                       f"lr={scheduler.get_last_lr()[0]:.6f}")
                 running = {"loss": 0.0, "kv": 0.0, "logit": 0.0}
 
+            # Drop large per-step tensor references early; no effect on numerics.
+            del teacher_kv, virtual_kv, sink_kv, demo_ids, loss, loss_kv, loss_logit
+            if device.startswith("cuda") and args.empty_cache_every > 0 and (step % args.empty_cache_every == 0):
+                gc.collect()
+                torch.cuda.empty_cache()
+
             if 0 < args.max_steps <= step:
                 break
         if 0 < args.max_steps <= step:
@@ -577,16 +631,17 @@ def run_experiment(args, sidecar_state_dict=None):
     rng_eval = random.Random(args.seed + 7777)
 
     full_kv_preds, ssm_preds = [], []
-    full_ce_by_sample, ssm_ce_by_sample = [], []
-    eval_records = []
+    full_losses, ssm_losses = [], []
+    query_logit_mses = []
+    teacher_first_token_logits, student_first_token_logits = [], []
+    ds_results = {}  # ds -> {"full_p":[], "ssm_p":[], "gt":[]}
 
     if per_query_random:
         print(f"\nPer-query random demos (k={args.k}) from {len(retrieval_data)} candidates.")
     else:
         print(f"\nFixed demos (strategy={args.demo_strategy}).")
 
-    full_start = time.perf_counter()
-    for dp in tqdm(eval_data, desc="eval/full-kv"):
+    for dp in tqdm(eval_data, desc="eval"):
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
@@ -605,20 +660,10 @@ def run_experiment(args, sidecar_state_dict=None):
             demos = run_experiment._fixed_demos
 
         demo_text = _build_demo_text(demos, add_newlines=add_nl)
-        demo_ids_cpu = tokenizer(demo_text, return_tensors="pt",
-                                 add_special_tokens=False)["input_ids"]
-        demo_ids = demo_ids_cpu.to(device)
-        original_demo_len = int(demo_ids_cpu.shape[1])
+        demo_ids = tokenizer(demo_text, return_tensors="pt",
+                             add_special_tokens=False)["input_ids"].to(device)
+        original_demo_len = demo_ids.shape[1]
         opts = dp["options"]
-
-        eval_records.append({
-            "dp": dp,
-            "q_text": q_text,
-            "ans_text": ans_text,
-            "opts": opts,
-            "demo_ids_cpu": demo_ids_cpu,
-            "original_demo_len": original_demo_len,
-        })
 
         # ─── Full-KV: concatenated forward ───
         opt_scores = {}
@@ -642,31 +687,20 @@ def run_experiment(args, sidecar_state_dict=None):
         full_kv_preds.append(min(opt_scores, key=opt_scores.get))
 
         # Full-KV CE
-        t_ce = None
+        t_logits_s = None
+        first_token_id = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
             with torch.no_grad():
                 t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
                 a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
                 if a_stripped.numel() > 0:
+                    t_logits_s = t_logits[:, n_stripped:, :]
+                    first_token_id = a_stripped[:, 0].unsqueeze(1)
                     t_ce = F.cross_entropy(
-                        t_logits[:, n_stripped:].reshape(-1, t_logits.size(-1)),
+                        t_logits_s.reshape(-1, t_logits_s.size(-1)),
                         a_stripped.reshape(-1), reduction="mean",
                     ).item()
-        full_ce_by_sample.append(t_ce)
-    full_elapsed = time.perf_counter() - full_start
-
-    ssm_start = time.perf_counter()
-    for rec in tqdm(eval_records, desc="eval/ssm"):
-        q_text = rec["q_text"]
-        ans_text = rec["ans_text"]
-        opts = rec["opts"]
-        demo_ids = rec["demo_ids_cpu"].to(device)
-        original_demo_len = rec["original_demo_len"]
-
-        q_ids = tokenizer(q_text, return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
-        a_ids = tokenizer(ans_text, return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
+                    full_losses.append(t_ce)
 
         # ─── SSM: compress this query's demos ───
         with torch.no_grad():
@@ -692,7 +726,7 @@ def run_experiment(args, sidecar_state_dict=None):
         ssm_preds.append(min(scores, key=scores.get))
 
         # SSM CE
-        s_ce = None
+        s_logits_s = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
             with torch.no_grad():
                 s_logits = _student_qa_logits(
@@ -701,41 +735,42 @@ def run_experiment(args, sidecar_state_dict=None):
                 )
                 a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
                 if a_stripped.numel() > 0:
+                    s_logits_s = s_logits[:, n_stripped:, :]
                     s_ce = F.cross_entropy(
-                        s_logits[:, n_stripped:].reshape(-1, s_logits.size(-1)),
+                        s_logits_s.reshape(-1, s_logits_s.size(-1)),
                         a_stripped.reshape(-1), reduction="mean",
                     ).item()
-        ssm_ce_by_sample.append(s_ce)
-    ssm_elapsed = time.perf_counter() - ssm_start
+                    ssm_losses.append(s_ce)
 
-    ds_results = {}  # ds -> {"full_p":[], "ssm_p":[], "gt":[]}
-    for rec, fp, sp in zip(eval_records, full_kv_preds, ssm_preds):
-        dp = rec["dp"]
+        # Per-query relative squared error on the correct answer's first-token logit.
+        if t_logits_s is not None and s_logits_s is not None and first_token_id is not None:
+            t_first = t_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
+            s_first = s_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
+            t_first_val = float(t_first.item())
+            s_first_val = float(s_first.item())
+            teacher_first_token_logits.append(t_first_val)
+            student_first_token_logits.append(s_first_val)
+            denom = max(s_first_val, t_first_val)
+            rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
+            query_logit_mses.append(rel_sq)
+
+        # Track per-dataset
         ds = dp.get("task", dp.get("dataset", "unknown"))
         if ds not in ds_results:
             ds_results[ds] = {"full_p": [], "ssm_p": [], "gt": []}
-        ds_results[ds]["full_p"].append(fp)
-        ds_results[ds]["ssm_p"].append(sp)
+        ds_results[ds]["full_p"].append(full_kv_preds[-1])
+        ds_results[ds]["ssm_p"].append(ssm_preds[-1])
         ds_results[ds]["gt"].append(dp["output"])
 
     # ─── Aggregate ───
     full_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
     ssm_acc = _accuracy(ssm_preds, [dp["output"] for dp in eval_data])
 
-    full_losses = [x for x in full_ce_by_sample if x is not None]
-    ssm_losses = [x for x in ssm_ce_by_sample if x is not None]
     mean_full_ce = sum(full_losses) / max(1, len(full_losses))
     mean_ssm_ce = sum(ssm_losses) / max(1, len(ssm_losses))
 
-    valid_ces = [(fc, sc) for fc, sc in zip(full_ce_by_sample, ssm_ce_by_sample)
-                 if fc is not None and sc is not None]
-    n_compare = len(valid_ces)
-    norm_sq_errs = []
-    for fc, sc in valid_ces:
-        d = max(fc, sc)
-        if d > 0:
-            norm_sq_errs.append(((sc - fc) / d) ** 2)
-    per_sample_mse = sum(norm_sq_errs) / max(1, len(norm_sq_errs)) if norm_sq_errs else 0.0
+    n_compare = len(query_logit_mses)
+    per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
     d_means = max(mean_ssm_ce, mean_full_ce)
     mean_sq_loss = ((mean_ssm_ce - mean_full_ce) / d_means) ** 2 if d_means > 0 else 0.0
 
@@ -746,18 +781,6 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"Full-KV Accuracy    = {full_acc:.6f}")
     print(f"SSM Accuracy        = {ssm_acc:.6f}")
     print(f"Accuracy gap        = {full_acc - ssm_acc:+.6f}")
-
-    n_eval = max(1, len(eval_records))
-    print(f"\n{'='*60}")
-    print("  Runtime Comparison")
-    print(f"{'='*60}")
-    print(f"full_kv_time_sec    = {full_elapsed:.3f}")
-    print(f"ssm_time_sec        = {ssm_elapsed:.3f}")
-    print(f"time_gap_sec        = {full_elapsed - ssm_elapsed:+.3f}")
-    print(f"full_kv_sec/sample  = {full_elapsed / n_eval:.4f}")
-    print(f"ssm_sec/sample      = {ssm_elapsed / n_eval:.4f}")
-    if ssm_elapsed > 0:
-        print(f"speed_ratio(full/ssm)= {full_elapsed / ssm_elapsed:.3f}x")
 
     print(f"\n{'='*60}")
     print(f"  Per-Dataset Breakdown")
@@ -780,185 +803,6 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"CE_gap (ssm-full)   = {mean_ssm_ce - mean_full_ce:+.6f}")
     print(f"mean_norm_sq_loss   = {mean_sq_loss:.6f}")
     print(f"per_sample_mean_MSE = {per_sample_mse:.6f}")
-
-
-def _sum_profiler_flops(prof) -> float:
-    total = 0.0
-    for evt in prof.key_averages():
-        f = getattr(evt, "flops", 0)
-        if f:
-            total += float(f)
-    return total
-
-
-def run_flops_profile(args, sidecar_state_dict=None):
-    device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
-    tokenizer = _setup_tokenizer(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
-    model.eval()
-
-    align = args.align_true_positions
-    if align and getattr(model.config, "model_type", "") == "qwen2":
-        print("WARN: align_true_positions disabled for Qwen2.")
-        align = False
-
-    add_nl = not args.model_name.startswith("gpt2")
-    retrieval_data = load_data(task=None, split=args.retrieval_split, k=args.k,
-                               seed=args.seed, datasets=args.dataset.split(","), is_null=False)
-    eval_data = load_data(task=None, split=args.eval_split, k=args.k,
-                          seed=args.seed, datasets=args.dataset.split(","), is_null=False)
-    if not retrieval_data or not eval_data:
-        raise ValueError("Empty data.")
-
-    max_samples = args.profile_samples if args.profile_samples > 0 else len(eval_data)
-    eval_subset = eval_data[:min(max_samples, len(eval_data))]
-    per_query_random = (args.num_eval_demo_sets > 1)
-
-    sidecar = LayerGroupSSMSidecar(
-        model.config, ssm_dim=args.ssm_dim, num_virtual_tokens=args.num_virtual_tokens,
-        num_groups=args.num_groups,
-    ).to(device=device, dtype=model.get_input_embeddings().weight.dtype)
-    _load_sidecar(sidecar, args, device, sidecar_state_dict)
-    sidecar.eval()
-
-    rng_eval = random.Random(args.seed + 7777)
-    eval_records = []
-
-    for dp in eval_subset:
-        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-
-        if per_query_random:
-            indices = rng_eval.sample(range(len(retrieval_data)),
-                                      min(args.k, len(retrieval_data)))
-            demos = [retrieval_data[i] for i in indices]
-        else:
-            if not hasattr(run_flops_profile, "_fixed_demos"):
-                run_flops_profile._fixed_demos = _choose_fixed_demos(
-                    retrieval_data, args.k, args.demo_strategy, args.seed)
-            demos = run_flops_profile._fixed_demos
-
-        demo_text = _build_demo_text(demos, add_newlines=add_nl)
-        demo_ids_cpu = tokenizer(demo_text, return_tensors="pt",
-                                 add_special_tokens=False)["input_ids"]
-        eval_records.append({
-            "q_text": q_text,
-            "ans_text": ans_text,
-            "opts": dp["options"],
-            "demo_ids_cpu": demo_ids_cpu,
-            "original_demo_len": int(demo_ids_cpu.shape[1]),
-        })
-
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if device.startswith("cuda"):
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-    full_start = time.perf_counter()
-    with torch.profiler.profile(activities=activities, with_flops=True) as prof_full:
-        for rec in tqdm(eval_records, desc="profile/full-kv"):
-            q_ids = tokenizer(rec["q_text"], return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
-            a_ids = tokenizer(rec["ans_text"], return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
-            demo_ids = rec["demo_ids_cpu"].to(device)
-
-            for opt in rec["opts"]:
-                opt_text = _normalize_option(opt, add_nl)
-                opt_ids = tokenizer(opt_text, return_tensors="pt",
-                                    add_special_tokens=False)["input_ids"].to(device)
-                if opt_ids.numel() == 0:
-                    continue
-                with torch.no_grad():
-                    all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
-                    out = model(input_ids=all_ids, use_cache=False)
-                    start = demo_ids.shape[1] + q_ids.shape[1] - 1
-                    pred_logits = out.logits[:, start:start + opt_ids.shape[1], :]
-                    _ = F.cross_entropy(
-                        pred_logits.reshape(-1, pred_logits.size(-1)),
-                        opt_ids.reshape(-1), reduction="sum",
-                    ).item()
-
-            if q_ids.numel() > 0 and a_ids.numel() > 0:
-                with torch.no_grad():
-                    t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                    a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                    if a_stripped.numel() > 0:
-                        _ = F.cross_entropy(
-                            t_logits[:, n_stripped:].reshape(-1, t_logits.size(-1)),
-                            a_stripped.reshape(-1), reduction="mean",
-                        ).item()
-
-            if device.startswith("cuda"):
-                torch.cuda.synchronize()
-            prof_full.step()
-    full_elapsed = time.perf_counter() - full_start
-    full_flops = _sum_profiler_flops(prof_full)
-
-    ssm_start = time.perf_counter()
-    with torch.profiler.profile(activities=activities, with_flops=True) as prof_ssm:
-        for rec in tqdm(eval_records, desc="profile/ssm"):
-            q_ids = tokenizer(rec["q_text"], return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
-            a_ids = tokenizer(rec["ans_text"], return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
-            demo_ids = rec["demo_ids_cpu"].to(device)
-            original_demo_len = rec["original_demo_len"]
-
-            with torch.no_grad():
-                emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
-                virtual_kv = sidecar(emb)
-                sink_kv = None
-                st = min(args.sink_tokens, demo_ids.shape[1])
-                if st > 0:
-                    sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
-                ssm_demo_len = st + sidecar.num_virtual_tokens
-
-            scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
-                                        sink_tokens=args.sink_tokens, align_true_positions=align)
-            scorer.demo_cache = _build_cache_from_kv_list(virtual_kv, sink_kv=sink_kv)
-            scorer.demo_len = ssm_demo_len
-            scorer.true_demo_len = original_demo_len
-
-            first, q_past, q_len = scorer.prefill_question(rec["q_text"])
-            opt_texts = [_normalize_option(o, add_nl) for o in rec["opts"]]
-            _ = scorer.score_options_nll(first, q_past, q_len, opt_texts)
-
-            if q_ids.numel() > 0 and a_ids.numel() > 0:
-                with torch.no_grad():
-                    s_logits = _student_qa_logits(
-                        model, virtual_kv, sink_kv,
-                        ssm_demo_len, original_demo_len, align, q_ids, a_ids,
-                    )
-                    a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                    if a_stripped.numel() > 0:
-                        _ = F.cross_entropy(
-                            s_logits[:, n_stripped:].reshape(-1, s_logits.size(-1)),
-                            a_stripped.reshape(-1), reduction="mean",
-                        ).item()
-
-            if device.startswith("cuda"):
-                torch.cuda.synchronize()
-            prof_ssm.step()
-    ssm_elapsed = time.perf_counter() - ssm_start
-    ssm_flops = _sum_profiler_flops(prof_ssm)
-
-    n = max(1, len(eval_records))
-    print(f"\n{'='*60}")
-    print(f"  FLOPs Profile ({len(eval_records)} samples)")
-    print(f"{'='*60}")
-    print(f"full_kv_total_flops = {full_flops:.0f}")
-    print(f"ssm_total_flops     = {ssm_flops:.0f}")
-    print(f"flops_gap           = {full_flops - ssm_flops:+.0f}")
-    if ssm_flops > 0:
-        print(f"flops_ratio(full/ssm)= {full_flops / ssm_flops:.4f}x")
-    print(f"full_kv_flops/sample= {full_flops / n:.0f}")
-    print(f"ssm_flops/sample    = {ssm_flops / n:.0f}")
-
-    print(f"\n{'='*60}")
-    print("  Runtime During Profiling")
-    print(f"{'='*60}")
-    print(f"full_kv_time_sec    = {full_elapsed:.3f}")
-    print(f"ssm_time_sec        = {ssm_elapsed:.3f}")
-    print(f"time_ratio(full/ssm)= {(full_elapsed / ssm_elapsed):.4f}x" if ssm_elapsed > 0 else "time_ratio(full/ssm)= inf")
 
 
 # =====================================================================
@@ -1112,12 +956,18 @@ def _attn_proxy_inc(ctx, new):
 
 def _load_sidecar(sidecar, args, device, state_dict=None):
     if state_dict is not None:
-        sidecar.load_state_dict(state_dict, strict=True)
-        print("Loaded sidecar from in-memory state.")
+        # Filter out frozen buffers (A, eigenvalues, V, V_inv) that may differ
+        # between old checkpoints (A was nn.Parameter) and new code (A is buffer).
+        filtered = {k: v for k, v in state_dict.items()
+                    if not any(k.endswith(s) for s in ('.A', '.A_powers', '.eigenvalues', '.V', '.V_inv'))}
+        sidecar.load_state_dict(filtered, strict=False)
+        print("Loaded sidecar from in-memory state (trainable params only).")
     elif args.load_sidecar_path:
         ckpt = torch.load(args.load_sidecar_path, map_location=device)
         st = ckpt["sidecar"] if isinstance(ckpt, dict) and "sidecar" in ckpt else ckpt
-        sidecar.load_state_dict(st, strict=True)
+        filtered = {k: v for k, v in st.items()
+                    if not any(k.endswith(s) for s in ('.A', '.A_powers', '.eigenvalues', '.V', '.V_inv'))}
+        sidecar.load_state_dict(filtered, strict=False)
         print(f"Loaded sidecar from: {args.load_sidecar_path}")
     else:
         print("WARN: No sidecar checkpoint; results may be random.")
@@ -1138,13 +988,11 @@ if __name__ == "__main__":
     p.add_argument("--eval_split", type=str, default="dev")
     p.add_argument("--train_split", type=str, default="train")
     p.add_argument("--demo_strategy", type=str, default="first")
-    p.add_argument("--num_eval_demo_sets", type=int, default=2,
+    p.add_argument("--num_eval_demo_sets", type=int, default=1,
                    help=">1 enables per-query random demo sampling at eval time.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--run_mode", type=str, default="eval",
-                   choices=["eval", "train", "train_eval", "compare_loss", "train_compare_loss", "profile_flops"])
-    p.add_argument("--profile_samples", type=int, default=0,
-                   help="Number of eval samples used for FLOPs profiling; <=0 uses all.")
+                   choices=["eval", "train", "train_eval", "compare_loss", "train_compare_loss"])
 
     p.add_argument("--num_virtual_tokens", type=int, default=16)
     p.add_argument("--sink_tokens", type=int, default=4)
@@ -1167,6 +1015,8 @@ if __name__ == "__main__":
 
     p.add_argument("--save_sidecar_path", type=str, default="")
     p.add_argument("--load_sidecar_path", type=str, default="")
+    p.add_argument("--empty_cache_every", type=int, default=0,
+                   help="If >0, run gc.collect()+torch.cuda.empty_cache() every N train steps.")
 
     args = p.parse_args()
 
@@ -1180,7 +1030,5 @@ if __name__ == "__main__":
         run_loss_comparison(args, sidecar_state_dict=sd)
     elif args.run_mode == "compare_loss":
         run_loss_comparison(args)
-    elif args.run_mode == "profile_flops":
-        run_flops_profile(args)
     else:
         run_experiment(args)
