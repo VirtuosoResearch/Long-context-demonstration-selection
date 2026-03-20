@@ -433,6 +433,23 @@ class MetaICLData(object):
             i += 1
         return token_ids[i:]
 
+    @staticmethod
+    def _to_preview_text(value):
+        if isinstance(value, list):
+            return " | ".join(str(v) for v in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    def _format_demo_preview(self, dp, max_chars=220):
+        text = (
+            f"input={self._to_preview_text(dp.get('input', ''))}; "
+            f"output={self._to_preview_text(dp.get('output', ''))}"
+        )
+        if len(text) > max_chars:
+            return text[: max_chars - 3] + "..."
+        return text
+
     def _prepro_each_datapoint(self, dp, is_first=True, is_training=False, for_demonstrations=False,
                                add_newlines=True):
         dp = dp.copy()
@@ -522,6 +539,8 @@ class MetaICLData(object):
 
         input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
         metadata = []
+        self.topk_last_selected_demo_info = []
+        special_ids = set(self.tokenizer.all_special_ids)
 
         for dp_idx, dp in enumerate(val_data):
             inputs, outputs, answer = self._prepro_each_datapoint(
@@ -529,13 +548,32 @@ class MetaICLData(object):
             if self.use_demonstrations:
                 dp_feature = val_features[dp_idx]            
 
-                top_k_neighbors, _, __ = self._select_top_k_neighbors(
+                top_k_neighbors, top_k_indices, __ = self._select_top_k_neighbors(
                     dp_feature, test_features, test_data, self.k, exclude_idx=None
+                )
+                prompt_order = list(reversed(top_k_neighbors))
+                prompt_order_indices = list(reversed([int(i) for i in top_k_indices]))
+                self.topk_last_selected_demo_info.append(
+                    {
+                        "eval_index": int(dp_idx),
+                        "eval_task": dp.get("task"),
+                        "selected_indices": prompt_order_indices,
+                        "selected_demos": [
+                            {
+                                "rank": int(rank),
+                                "candidate_index_in_pool": int(prompt_order_indices[rank]),
+                                "candidate_task": demo_dp.get("task"),
+                                "candidate_feature_idx": int(demo_dp.get("__feature_idx", -1)),
+                                "content": self._format_demo_preview(demo_dp),
+                            }
+                            for rank, demo_dp in enumerate(prompt_order)
+                        ],
+                    }
                 )
 
                 demonstrations = self._demo_prompt_prefix_tokens(len(top_k_neighbors))
                 sep_tokens = self._demo_example_separator_tokens()
-                for i, neighbor_dp in enumerate(reversed(top_k_neighbors)):
+                for i, neighbor_dp in enumerate(prompt_order):
                     input_, output_ = self._prepro_each_datapoint(
                         neighbor_dp, is_first=i == 0, for_demonstrations=True, add_newlines=add_newlines)
                     if i > 0:
@@ -553,9 +591,11 @@ class MetaICLData(object):
             metadata.append({"indices": indices, "answer": answer, "options": dp["options"]})
 
             for inputs_, outputs_ in zip(inputs, outputs):
-
                 if self.use_demonstrations:
+                    demo_len = 1 + sum(1 for tok in demonstrations if tok not in special_ids)
                     inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
+                else:
+                    demo_len = 0
                 encoded = prepro_sentence_pair_single(
                     inputs_, outputs_, self.max_length, self.tokenizer,self.tokenizer.bos_token_id, self.tokenizer.eos_token_id, 
                     allow_truncation=self.use_demonstrations
@@ -563,11 +603,13 @@ class MetaICLData(object):
                 input_ids.append(encoded[0])
                 attention_mask.append(encoded[1])
                 token_type_ids.append(encoded[2])
+                demo_lens.append(demo_len)
 
 
         self.tensorized_inputs = dict(input_ids=torch.LongTensor(input_ids),
                                       attention_mask=torch.LongTensor(attention_mask),
-                                      token_type_ids=torch.LongTensor(token_type_ids))
+                                      token_type_ids=torch.LongTensor(token_type_ids),
+                                      demo_lens=torch.LongTensor(demo_lens))
         self.metadata = metadata
 
     def tensorize_kv_final(self, _test_data, _val_data, options=None, add_newlines=True,
@@ -715,7 +757,8 @@ class MetaICLData(object):
             for inputs_, outputs_ in zip(inputs, outputs):
                 if self.use_demonstrations:
                     # Must match prepro_sentence_pair_single() behavior that drops all special tokens.
-                    demo_len = sum(1 for tok in demonstrations if tok not in special_ids)
+                    # +1 for BOS that prepro_sentence_pair_single() prepends.
+                    demo_len = 1 + sum(1 for tok in demonstrations if tok not in special_ids)
                     inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
                 else:
                     demo_len = 0
@@ -833,12 +876,15 @@ class MetaICLData(object):
             if "output" not in dp:
                 dp["output"] = dp["options"][0]  # randomly choose one (we don't need it anyways)
             val_data.append(dp.copy())
+        test_index_by_obj = {id(dp): idx for idx, dp in enumerate(test_data)}
         
         test_features = self._load_features_for_datapoints(test_data, retrieval_split)
         val_features = self._load_features_for_datapoints(val_data, eval_split)
 
-        input_ids, attention_mask, token_type_ids = [], [], []
+        input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
         metadata = []
+        self.randomk_last_selected_demo_info = []
+        special_ids = set(self.tokenizer.all_special_ids)
 
         for dp_idx, dp in enumerate(val_data):
             inputs, outputs, answer = self._prepro_each_datapoint(
@@ -852,8 +898,42 @@ class MetaICLData(object):
                     dp_feature, test_features, test_data, self.k-self.k//4, exclude_idx=None
                 )
 
-                top_k_neighbors, _, __ = self._select_top_k_neighbors(
+                top_k_neighbors, top_k_indices, __ = self._select_top_k_neighbors(
                     dp_feature, test_features, test_data, self.k//4, exclude_idx=None
+                )
+                top_k_indices = [int(i) for i in top_k_indices]
+                random_indices = [int(test_index_by_obj[id(neighbor_dp)]) for neighbor_dp in random_k_neighbors]
+                selected_demos = []
+                for rank, (neighbor_dp, candidate_idx) in enumerate(zip(random_k_neighbors, random_indices)):
+                    selected_demos.append(
+                        {
+                            "rank": int(rank),
+                            "selection_source": "random",
+                            "candidate_index_in_pool": int(candidate_idx),
+                            "candidate_task": neighbor_dp.get("task"),
+                            "candidate_feature_idx": int(neighbor_dp.get("__feature_idx", -1)),
+                            "content": self._format_demo_preview(neighbor_dp),
+                        }
+                    )
+                base_rank = len(selected_demos)
+                for offset, (neighbor_dp, candidate_idx) in enumerate(zip(top_k_neighbors, top_k_indices)):
+                    selected_demos.append(
+                        {
+                            "rank": int(base_rank + offset),
+                            "selection_source": "topk_tail",
+                            "candidate_index_in_pool": int(candidate_idx),
+                            "candidate_task": neighbor_dp.get("task"),
+                            "candidate_feature_idx": int(neighbor_dp.get("__feature_idx", -1)),
+                            "content": self._format_demo_preview(neighbor_dp),
+                        }
+                    )
+                self.randomk_last_selected_demo_info.append(
+                    {
+                        "eval_index": int(dp_idx),
+                        "eval_task": dp.get("task"),
+                        "selected_indices": random_indices + top_k_indices,
+                        "selected_demos": selected_demos,
+                    }
                 )
 
                 demonstrations = self._demo_prompt_prefix_tokens(len(random_k_neighbors) + len(top_k_neighbors))
@@ -876,7 +956,10 @@ class MetaICLData(object):
 
             for inputs_, outputs_ in zip(inputs, outputs):
                 if self.use_demonstrations:
+                    demo_len = 1 + sum(1 for tok in demonstrations if tok not in special_ids)
                     inputs_ = demonstrations + self._query_prefix_tokens() + inputs_
+                else:
+                    demo_len = 0
                 encoded = prepro_sentence_pair_single(
                     inputs_, outputs_, self.max_length, self.tokenizer, self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
                     allow_truncation=self.use_demonstrations
@@ -884,10 +967,12 @@ class MetaICLData(object):
                 input_ids.append(encoded[0])
                 attention_mask.append(encoded[1])
                 token_type_ids.append(encoded[2])
+                demo_lens.append(demo_len)
 
         self.tensorized_inputs = dict(input_ids=torch.LongTensor(input_ids),
                                       attention_mask=torch.LongTensor(attention_mask),
-                                      token_type_ids=torch.LongTensor(token_type_ids))
+                                      token_type_ids=torch.LongTensor(token_type_ids),
+                                      demo_lens=torch.LongTensor(demo_lens))
         self.metadata = metadata
 
     def _random_datasource(self, task, datapath, m):
@@ -916,8 +1001,9 @@ class MetaICLData(object):
             val_data.append(dp.copy())
 
         task = _test_data[0]["task"]
-        input_ids, attention_mask, token_type_ids = [], [], []
+        input_ids, attention_mask, token_type_ids, demo_lens = [], [], [], []
         metadata = []
+        special_ids = set(self.tokenizer.all_special_ids)
 
         test_inputs = [dp["input"].split() for dp in test_data]
         bm25 = BM25Okapi(test_inputs)
@@ -952,7 +1038,10 @@ class MetaICLData(object):
             metadata.append({"indices": indices, "answer": answer, "options": dp["options"]})
             for inputs_, outputs_ in zip(inputs, outputs):
                 if self.use_demonstrations:
+                    demo_len = 1 + sum(1 for tok in demonstrations if tok not in special_ids)
                     inputs_ = demonstrations + self._query_prefix_tokens() + self._strip_leading_special_tokens(inputs_)
+                else:
+                    demo_len = 0
                 encoded = prepro_sentence_pair_single(
                     inputs_, [outputs_[2]], self.max_length, self.tokenizer,
                     self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
@@ -960,11 +1049,13 @@ class MetaICLData(object):
                 input_ids.append(encoded[0])
                 attention_mask.append(encoded[1])
                 token_type_ids.append(encoded[2])
+                demo_lens.append(demo_len)
 
         self.tensorized_inputs = dict(
             input_ids=torch.LongTensor(input_ids),
             attention_mask=torch.LongTensor(attention_mask),
-            token_type_ids=torch.LongTensor(token_type_ids))
+            token_type_ids=torch.LongTensor(token_type_ids),
+            demo_lens=torch.LongTensor(demo_lens))
         self.metadata = metadata
     
     def tensorize(self, _train_data, _test_data, options=None,
