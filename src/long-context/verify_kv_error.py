@@ -1,24 +1,20 @@
+#!/usr/bin/env python3
 """
-Empirical verification for the first two checks in Proposition 3.1.
+Compute and store KV-error verification statistics for Proposition 3.1.
 
-Check 1: Spectral tail energy E_N^{(g)} = sum_{j>N} sigma_j^2(K^{(g)})
-  -> Compute singular value statistics per layer group, across multiple prefix lengths.
-
-Check 2: HiPPO projection residual ||(I - P_N) u_i^{(g)}||^2
-  -> Compute residual vs N on log-log scale and fit slope.
+This script only records data. Plotting is moved to verify_kv_plot.py.
 
 Usage:
   python verify_kv_error.py \
-    --model_name Qwen/Qwen2.5-1.5B-Instruct \
-    --dataset sst2 \
-    --k 50 --num_groups 4 \
-    --prefix_lengths 256,512,1024 \
-    --max_hippo_dim 128 \
-    --save_dir ./prop31_results
+      --model_name Qwen/Qwen2.5-7B-Instruct \
+      --dataset sst2 --k 50 --num_groups 4 --N_max 512 \
+      --output_dir prop31_results
 """
 
 import argparse
+import gc
 import os
+import random
 
 import numpy as np
 import torch
@@ -28,204 +24,169 @@ from utils.data import load_data
 
 
 # =====================================================================
-# HiPPO-LegS basis construction
+# Helpers
 # =====================================================================
-
-def build_hippo_basis(T, N, device="cpu"):
-    """
-    Build H_N by evaluating the first N HiPPO-LegS basis functions
-    on the discrete token grid t = 0, ..., T-1.
-
-    phi_n(t) = sqrt(2n+1) * P_n(2t/(T-1) - 1),  n = 0, ..., N-1
-
-    Returns: Q of shape [T, N] with orthonormal columns spanning H_N.
-    """
-    if N > T:
-        raise ValueError(f"N={N} cannot exceed T={T}.")
-
-    x = torch.linspace(-1.0, 1.0, T, device=device, dtype=torch.float64)
-
-    basis = torch.zeros(T, N, device=device, dtype=torch.float64)
-    if N >= 1:
-        basis[:, 0] = 1.0
-    if N >= 2:
-        basis[:, 1] = x
-    for n in range(2, N):
-        basis[:, n] = ((2 * n - 1) * x * basis[:, n - 1]
-                       - (n - 1) * basis[:, n - 2]) / n
-
-    scales = torch.sqrt(2.0 * torch.arange(N, device=device, dtype=torch.float64) + 1.0)
-    basis = basis * scales.unsqueeze(0)
-
-    Q, _ = torch.linalg.qr(basis)
-    return Q
-
-
-# =====================================================================
-# Extract exact KV cache
-# =====================================================================
-
-@torch.no_grad()
-def extract_kv_cache(model, input_ids):
-    out = model(input_ids=input_ids, use_cache=True)
-    past = out.past_key_values
-    kv_list = []
-    if hasattr(past, "key_cache"):
-        for l in range(len(past.key_cache)):
-            kv_list.append((past.key_cache[l].cpu(), past.value_cache[l].cpu()))
-    else:
-        for k, v in past:
-            kv_list.append((k.cpu(), v.cpu()))
-    return kv_list
-
-
-def partition_into_groups(kv_list, num_groups):
-    num_layers = len(kv_list)
-    if num_groups <= 0 or num_groups > num_layers:
-        raise ValueError(f"num_groups={num_groups} invalid for {num_layers} layers.")
-    base, rem = divmod(num_layers, num_groups)
-    groups, idx = [], 0
-    for g in range(num_groups):
-        size = base + (1 if g < rem else 0)
-        layers = []
-        for _ in range(size):
-            K_l = kv_list[idx][0]
-            T_len = K_l.shape[2]
-            K_flat = K_l[0].permute(1, 0, 2).reshape(T_len, -1)
-            layers.append(K_flat)
-            idx += 1
-        groups.append(torch.cat(layers, dim=1).to(torch.float64))
-    return groups
-
-
-# =====================================================================
-# Check 1: Singular value statistics
-# =====================================================================
-
-def compute_spectral_tail(groups):
-    group_stats = []
-    for g, K_g in enumerate(groups):
-        S_sq = torch.linalg.svdvals(K_g).numpy() ** 2
-        E_N = S_sq.sum() - np.cumsum(S_sq)
-        group_stats.append({
-            "group": g,
-            "singular_values_sq": S_sq.tolist(),
-            "tail_energy": E_N.tolist(),
-        })
-    return group_stats
-
-
-# =====================================================================
-# Check 2: HiPPO projection residual (fixed K singular vectors)
-# =====================================================================
-
-def compute_hippo_residual(groups, max_N, device="cpu"):
-    """
-    Fix the set of tracked singular vectors (top-K, K=max_N),
-    then sweep subspace dimension N = 4, 8, ..., max_N.
-
-    (a) max_{i<=K} ||(I - P_N) u_i||^2
-    (b) sum_{i=1}^{K} sigma_i^2 ||(I - P_N) u_i||^2
-    """
-    T = groups[0].shape[0]
-    K_fixed = max_N
-    print(f"Building HiPPO basis: T={T}, max_N={max_N} ...")
-    Q_full = build_hippo_basis(T, max_N, device=device)
-
-    N_values = sorted(set(n for n in range(4, max_N + 1, 4)))
-    if max_N not in N_values:
-        N_values.append(max_N)
-    N_values = sorted(N_values)
-
-    groups_out = []
-
-    for g, K_g in enumerate(groups):
-        print(f"  Group {g}: SVD on [{K_g.shape[0]} x {K_g.shape[1]}] ...")
-        U, S, _ = torch.linalg.svd(K_g, full_matrices=False)
-        S_sq = (S ** 2).to(torch.float64)
-
-        n_track = min(K_fixed, U.shape[1])
-        U_track = U[:, :n_track]
-        S_track = S_sq[:n_track]
-
-        max_res_list, wt_res_list = [], []
-
-        for N in N_values:
-            Q_N = Q_full[:, :N]
-            coeffs = Q_N.T @ U_track
-            residual = U_track - Q_N @ coeffs
-            res_sq = (residual ** 2).sum(dim=0)
-
-            max_res_list.append(res_sq.max().item())
-            wt_res_list.append((S_track * res_sq).sum().item())
-
-        N_arr = np.array(N_values, dtype=float)
-        max_arr = np.array(max_res_list)
-        wt_arr = np.array(wt_res_list)
-
-        slope_max = None
-        smoothness = None
-        slope_wt = None
-
-        valid = max_arr > 0
-        if valid.sum() >= 3:
-            c = np.polyfit(np.log(N_arr[valid]), np.log(max_arr[valid]), 1)
-            slope_max = float(c[0])
-            smoothness = float(-c[0] / 2.0)
-            print(f"    [max]  slope={slope_max:.3f}, s≈{smoothness:.3f}")
-
-        valid_w = wt_arr > 0
-        if valid_w.sum() >= 3:
-            c = np.polyfit(np.log(N_arr[valid_w]), np.log(wt_arr[valid_w]), 1)
-            slope_wt = float(c[0])
-            print(f"    [weighted] slope={slope_wt:.3f}")
-
-        groups_out.append({
-            "group": g,
-            "n_values": N_values,
-            "max_residual": max_res_list,
-            "weighted_residual": wt_res_list,
-            "slope_max": slope_max,
-            "smoothness_estimate": smoothness,
-            "slope_weighted": slope_wt,
-        })
-
-    return {
-        "max_N": max_N,
-        "K_fixed": K_fixed,
-        "groups": groups_out,
-    }
-
-
-# =====================================================================
-# Text / data utilities
-# =====================================================================
-
-def parse_prefix_lengths(raw, total_len):
-    if raw:
-        vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
-    else:
-        vals = [min(128, total_len), min(256, total_len),
-                min(512, total_len), total_len]
-    vals = sorted(set(v for v in vals if 16 <= v <= total_len))
-    return vals or [total_len]
-
 
 def setup_tokenizer(name):
-    tok = (GPT2Tokenizer.from_pretrained(name) if name.startswith("gpt2")
-           else AutoTokenizer.from_pretrained(name))
+    tok = (
+        GPT2Tokenizer.from_pretrained(name)
+        if name.startswith("gpt2")
+        else AutoTokenizer.from_pretrained(name)
+    )
+    if tok.padding_side == "left":
+        tok.padding_side = "right"
+    if tok.eos_token_id is None and tok.sep_token is not None:
+        tok.eos_token = tok.sep_token
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
 
 
-def build_demo_text(demos, add_newlines=True):
+def build_demo_text(demos, add_newlines):
     parts = []
     for i, dp in enumerate(demos):
-        q = dp["input"] if i == 0 else ("\n" + dp["input"])
+        q = dp["input"] if (i == 0 or not add_newlines) else ("\n" + dp["input"])
         a = ("\n" + dp["output"]) if add_newlines else dp["output"]
         parts.append(q + a)
     return "".join(parts)
+
+
+def build_discrete_legendre_basis(T: int, N_max: int) -> np.ndarray:
+    if T == 1:
+        return np.ones((1, min(N_max, 1)), dtype=np.float64)
+    x = np.linspace(-1.0, 1.0, T)
+    phi = np.zeros((T, N_max), dtype=np.float64)
+    phi[:, 0] = 1.0
+    if N_max > 1:
+        phi[:, 1] = x
+    for n in range(1, N_max - 1):
+        phi[:, n + 1] = ((2 * n + 1) * x * phi[:, n] - n * phi[:, n - 1]) / (n + 1)
+    q, r = np.linalg.qr(phi, mode="reduced")
+    signs = np.sign(np.diag(r))
+    signs[signs == 0] = 1.0
+    q *= signs[np.newaxis, :]
+    return q
+
+
+def extract_grouped_caches(model, input_ids, num_groups):
+    with torch.no_grad():
+        out = model(input_ids=input_ids, use_cache=True)
+    past = out.past_key_values
+    if hasattr(past, "to_legacy_cache"):
+        past = past.to_legacy_cache()
+    elif hasattr(past, "key_cache"):
+        past = [
+            (past.key_cache[i], past.value_cache[i])
+            for i in range(len(past.key_cache))
+        ]
+
+    num_layers = len(past)
+    T = past[0][0].shape[2]
+    base, rem = divmod(num_layers, num_groups)
+    ranges, s = [], 0
+    for g in range(num_groups):
+        e = s + base + (1 if g < rem else 0)
+        ranges.append((s, e))
+        s = e
+
+    grouped = []
+    for gs, ge in ranges:
+        cols = []
+        for l in range(gs, ge):
+            k, v = past[l]
+            k = k[0].permute(1, 0, 2).reshape(T, -1)
+            v = v[0].permute(1, 0, 2).reshape(T, -1)
+            cols.extend([k, v])
+        grouped.append(torch.cat(cols, dim=1).to(dtype=torch.float64, device="cpu"))
+
+    del out, past
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return grouped, ranges
+
+
+def infer_model_display_name(model_name: str) -> str:
+    name = model_name.lower()
+    if "qwen" in name:
+        return "Qwen-7B"
+    if "llama" in name:
+        return "Llama-8B"
+    return model_name.split("/")[-1]
+
+
+# =====================================================================
+# Analysis
+# =====================================================================
+
+def compute_per_group(grouped_caches, Q, N_vals):
+    """
+    Returns:
+      spectra: list of G arrays [N_max], mean |c_hat_{j,n}|^2 over columns
+      tail_energy: list of G arrays [len(N_vals)], E_N = sum_{n>=N} sum_j |c_hat_{j,n}|^2
+    """
+    q_t = torch.from_numpy(Q)
+    spectra = []
+    tail_energy = []
+
+    for g, c_g in enumerate(grouped_caches):
+        print(f"    Group {g}: projecting [{c_g.shape[0]} x {c_g.shape[1]}]...")
+        coeffs = q_t.T @ c_g
+
+        coeff_sq_per_mode = (coeffs ** 2).sum(dim=1).numpy()
+        spectra.append((coeffs ** 2).mean(dim=1).numpy())
+
+        total = coeff_sq_per_mode.sum()
+        cumsum = np.cumsum(coeff_sq_per_mode)
+        tail = np.zeros(len(N_vals))
+        for i, N in enumerate(N_vals):
+            if N <= 0:
+                tail[i] = total
+            elif N >= len(coeff_sq_per_mode):
+                tail[i] = 0.0
+            else:
+                tail[i] = total - cumsum[N - 1]
+        tail_energy.append(tail)
+
+    return spectra, tail_energy
+
+
+def print_tail_summary(tail_energy, N_vals, eff_N_max, model_display_name):
+    print(f"\n{'=' * 55}")
+    print(f"  Legendre Tail Energy Summary - {model_display_name}")
+    print(f"{'=' * 55}")
+    for g, tail in enumerate(tail_energy):
+        total = tail[0]
+        for N_show in [1, 10, 20, 50, 100, 200, 512]:
+            if N_show > eff_N_max:
+                break
+            idx = np.argmin(np.abs(N_vals - N_show))
+            pct = tail[idx] / total * 100 if total > 0 else 0
+            print(
+                f"  Group {g}: E_{N_vals[idx]:>3d} = "
+                f"{tail[idx]:.4e}  ({pct:5.1f}% of total)"
+            )
+        print()
+
+
+def save_results(path, args, T, eff_N_max, N_vals, ranges, spectra, tail_energy, model_title):
+    payload = {
+        "model_name": args.model_name,
+        "model_title": model_title,
+        "dataset": args.dataset,
+        "k": args.k,
+        "seed": args.seed,
+        "split": args.split,
+        "num_groups": args.num_groups,
+        "T": int(T),
+        "N_max": int(eff_N_max),
+        "N_vals": N_vals,
+        "ranges": ranges,
+        "spectra": spectra,
+        "tail_energy": tail_energy,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(payload, path)
+    print(f"Saved results: {path}")
 
 
 # =====================================================================
@@ -234,93 +195,102 @@ def build_demo_text(demos, add_newlines=True):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    p.add_argument("--model_name", type=str, required=True)
     p.add_argument("--dataset", type=str, default="sst2")
-    p.add_argument("--split", type=str, default="test")
     p.add_argument("--k", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--split", type=str, default="test")
     p.add_argument("--num_groups", type=int, default=4)
-    p.add_argument("--prefix_lengths", type=str, default="")
-    p.add_argument("--max_hippo_dim", type=int, default=128)
+    p.add_argument("--N_max", type=int, default=512)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--save_dir", type=str, default="./prop31_results")
-    p.add_argument("--results_name", type=str, default="verify_kv_results.pt")
+    p.add_argument("--output_dir", type=str, default="prop31_results")
+    p.add_argument("--results_path", type=str, default="")
     args = p.parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    device = args.device if torch.cuda.is_available() else "cpu"
+    os.makedirs(args.output_dir, exist_ok=True)
+    model_title = infer_model_display_name(args.model_name)
+    model_tag = model_title.lower().replace("-", "_")
+    results_path = (
+        args.results_path
+        if args.results_path
+        else os.path.join(args.output_dir, f"verify_kv_results_{model_tag}.pt")
+    )
 
-    print(f"Loading model: {args.model_name}")
-    tokenizer = setup_tokenizer(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    print("Loading data...")
+    retrieval_data = load_data(
+        task=None,
+        split=args.split,
+        k=args.k,
+        seed=args.seed,
+        datasets=args.dataset.split(","),
+        is_null=False,
+    )
+    rng = random.Random(args.seed)
+    indices = rng.sample(range(len(retrieval_data)), min(args.k, len(retrieval_data)))
+    demos = [retrieval_data[i] for i in indices]
+
+    add_nl = not args.model_name.startswith("gpt2")
+    tok = setup_tokenizer(args.model_name)
+    demo_text = build_demo_text(demos, add_newlines=add_nl)
+    demo_ids = tok(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    T = demo_ids.shape[1]
+    print(f"Demo tokens: T={T}")
+
+    print(f"Loading {args.model_name} (float32 for precision)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float32,
+        device_map=args.device,
+    )
     model.eval()
 
-    data = load_data(task=None, split=args.split, k=args.k,
-                     seed=args.seed, datasets=args.dataset.split(","), is_null=False)
-    if not data:
-        raise ValueError("No data loaded.")
-
-    import random
-    rng = random.Random(args.seed)
-    demos = [data[i] for i in rng.sample(range(len(data)), min(args.k, len(data)))]
-    add_nl = not args.model_name.startswith("gpt2")
-    demo_text = build_demo_text(demos, add_newlines=add_nl)
-
-    demo_ids = tokenizer(demo_text, return_tensors="pt",
-                         add_special_tokens=False)["input_ids"].to(device)
-    full_T = demo_ids.shape[1]
-    print(f"Demo sequence length: T_full = {full_T}")
-    prefix_lengths = parse_prefix_lengths(args.prefix_lengths, full_T)
-    print(f"Prefix length sweep for Check 1: {prefix_lengths}")
-
-    groups_for_term2 = None
-    term2_T = None
-    term1_results = []
-
-    # ── Check 1 ──
-    print("\n=== Check 1: Spectral tail analysis ===")
-    for L in prefix_lengths:
-        print(f"\n-- Prefix length L={L} --")
-        kv_list = extract_kv_cache(model, demo_ids[:, :L])
-        print(f"   {len(kv_list)} layers, K shape: {kv_list[0][0].shape}")
-        groups = partition_into_groups(kv_list, args.num_groups)
-        for g, K_g in enumerate(groups):
-            print(f"   Group {g}: {K_g.shape}")
-        term1_results.append({
-            "prefix_length": L,
-            "groups": compute_spectral_tail(groups),
-        })
-        if L == prefix_lengths[-1]:
-            groups_for_term2 = groups
-            term2_T = L
-        del kv_list
+    print("Extracting grouped KV caches...")
+    grouped, ranges = extract_grouped_caches(model, demo_ids.to(model.device), args.num_groups)
+    print(
+        "Groups: "
+        + str(
+            [
+                f"G{g}:[{s},{e}) D_g={grouped[g].shape[1]}"
+                for g, (s, e) in enumerate(ranges)
+            ]
+        )
+    )
 
     del model
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # ── Check 2 ──
-    max_N = min(args.max_hippo_dim, term2_T)
-    print(f"\n=== Check 2: HiPPO projection residual (L={term2_T}, max_N={max_N}) ===")
-    term2_results = compute_hippo_residual(groups_for_term2, max_N, device="cpu")
+    eff_N_max = min(args.N_max, T)
+    N_vals = np.unique(
+        np.concatenate(
+            [
+                np.arange(1, 20),
+                np.arange(20, 100, 5),
+                np.arange(100, eff_N_max + 1, 10),
+            ]
+        )
+    ).astype(int)
 
-    output = {
-        "meta": {
-            "model_name": args.model_name,
-            "dataset": args.dataset,
-            "split": args.split,
-            "k": args.k,
-            "seed": args.seed,
-            "num_groups": args.num_groups,
-            "prefix_lengths": prefix_lengths,
-            "max_hippo_dim": args.max_hippo_dim,
-            "term2_prefix_length": term2_T,
-        },
-        "term1": term1_results,
-        "term2": term2_results,
-    }
-    out_path = os.path.join(args.save_dir, args.results_name)
-    torch.save(output, out_path)
-    print(f"\nAll statistics saved to: {out_path}")
+    print(f"\nBuilding Legendre basis (T={T}, N_max={eff_N_max})...")
+    Q = build_discrete_legendre_basis(T, eff_N_max)
+
+    print("Computing spectra and tail energy...")
+    spectra, tail_energy = compute_per_group(grouped, Q, N_vals)
+
+    print_tail_summary(tail_energy, N_vals, eff_N_max, model_title)
+    save_results(
+        results_path,
+        args,
+        T,
+        eff_N_max,
+        N_vals,
+        ranges,
+        spectra,
+        tail_energy,
+        model_title,
+    )
+    print("Done.")
 
 
 if __name__ == "__main__":
