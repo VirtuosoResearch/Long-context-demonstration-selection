@@ -18,6 +18,9 @@ import numpy as np
 
 from tqdm import tqdm
 from collections import Counter, defaultdict
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 from transformers import GPT2Tokenizer, AutoTokenizer
@@ -151,6 +154,238 @@ def _gradicl_greedy_select(metaicl_data, metaicl_model, validation_rows, candida
         selection_trace.append({"step": int(step), "picked_index": int(best_idx), "val_loss": float(best_loss)})
 
     return selected, selection_trace
+
+
+def _is_prediction_correct(prediction, groundtruth):
+    pred = prediction.strip()
+    if isinstance(groundtruth, list):
+        return pred in [x.strip() for x in groundtruth]
+    return pred == groundtruth.strip()
+
+
+def _compute_accuracy_from_preds(preds, eval_data):
+    correct = 0
+    for pred, dp in zip(preds, eval_data):
+        correct += int(_is_prediction_correct(pred, dp["output"]))
+    total = len(eval_data)
+    acc = correct / total if total > 0 else 0.0
+    return acc, correct, total
+
+
+def _evaluate_selected_demos(metaicl_data, metaicl_model, eval_data, selected_demos, add_newlines, row_loss_fn, progress_desc=None):
+    selected_demo_examples_per_query = [selected_demos] * len(eval_data)
+    metaicl_data.tensorize_with_selected_demo_examples(
+        eval_data, selected_demo_examples_per_query, add_newlines=add_newlines
+    )
+    losses = row_loss_fn(metaicl_model, metaicl_data, progress_desc=progress_desc)
+    preds = metaicl_model.do_predict(metaicl_data, losses=losses)
+    acc, correct, total = _compute_accuracy_from_preds(preds, eval_data)
+    return losses, preds, acc, correct, total
+
+
+def _random_subset_indices(n_candidates, subset_min, subset_max):
+    if n_candidates <= 0:
+        return []
+    subset_max = max(1, min(subset_max, n_candidates))
+    subset_min = max(1, min(subset_min, subset_max))
+    subset_size = random.randint(subset_min, subset_max)
+    return sorted(random.sample(range(n_candidates), subset_size))
+
+
+def _subset_to_binary_vector(subset, n_candidates):
+    vec = np.zeros(n_candidates, dtype=np.float32)
+    if len(subset) > 0:
+        vec[np.asarray(subset, dtype=np.int64)] = 1.0
+    return vec
+
+
+def _sample_unseen_subset(n_candidates, subset_min, subset_max, seen_subsets, max_tries=256):
+    for _ in range(max_tries):
+        subset = tuple(_random_subset_indices(n_candidates, subset_min, subset_max))
+        if subset not in seen_subsets:
+            return list(subset)
+    return None
+
+
+def _bridge_optimize_subset(
+    logger,
+    metaicl_data,
+    metaicl_model,
+    candidates,
+    candidate_demo_tokens,
+    validation_rows,
+    validation_data,
+    k,
+    row_loss_fn,
+    bo_budget,
+    bo_init_points,
+    beta_min,
+    beta_max,
+    subset_min,
+    acq_num_candidates,
+):
+    n_candidates = len(candidates)
+    if n_candidates == 0:
+        return [], {"trace": [], "best_validation_acc": 0.0}
+
+    subset_max = max(1, min(k, n_candidates))
+    subset_min = max(1, min(subset_min, subset_max))
+    bo_budget = max(1, int(bo_budget))
+    bo_init_points = max(1, min(int(bo_init_points), bo_budget))
+    acq_num_candidates = max(32, int(acq_num_candidates))
+    beta_low = min(float(beta_min), float(beta_max))
+    beta_high = max(float(beta_min), float(beta_max))
+
+    seen_subsets = set()
+    observed_x = []
+    observed_g = []
+    observed_sizes = []
+    trace = []
+
+    def _evaluate(subset, step, stage, beta=None):
+        _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, subset)
+        val_losses = row_loss_fn(metaicl_model, metaicl_data)
+        preds = metaicl_model.do_predict(metaicl_data, losses=val_losses)
+        val_acc, val_correct, val_total = _compute_accuracy_from_preds(preds, validation_data)
+
+        observed_x.append(_subset_to_binary_vector(subset, n_candidates))
+        observed_g.append(float(val_acc))
+        observed_sizes.append(int(len(subset)))
+
+        current_best = float(max(observed_g)) if len(observed_g) > 0 else float(val_acc)
+        beta_value = None if beta is None else float(beta)
+        h_value = None
+        if beta is not None:
+            h_value = max(
+                beta * (float(val_acc) - current_best),
+                -(1.0 - beta) * float(len(subset)),
+            )
+
+        trace.append(
+            {
+                "step": int(step),
+                "stage": stage,
+                "subset_indices": [int(x) for x in subset],
+                "subset_size": int(len(subset)),
+                "validation_acc": float(val_acc),
+                "validation_correct": int(val_correct),
+                "validation_total": int(val_total),
+                "beta": beta_value,
+                "h_value": h_value,
+            }
+        )
+        return float(val_acc)
+
+    for step in tqdm(range(bo_budget), desc="bridge-optimize", leave=False):
+        subset = None
+        stage = "random_init"
+        sampled_beta = None
+
+        if step < bo_init_points:
+            subset = _sample_unseen_subset(n_candidates, subset_min, subset_max, seen_subsets)
+        else:
+            use_gp = len(observed_x) >= 2
+            if use_gp:
+                sampled_beta = random.uniform(beta_low, beta_high)
+                g_best = float(max(observed_g))
+                h_targets = np.asarray(
+                    [
+                        max(sampled_beta * (g - g_best), -(1.0 - sampled_beta) * size)
+                        for g, size in zip(observed_g, observed_sizes)
+                    ],
+                    dtype=np.float32,
+                )
+
+                try:
+                    kernel = (
+                        ConstantKernel(1.0, (1e-3, 1e3))
+                        * RBF(length_scale=max(1.0, n_candidates / 8.0), length_scale_bounds=(1e-2, 1e3))
+                        + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-8, 1e-1))
+                    )
+                    gp = GaussianProcessRegressor(
+                        kernel=kernel,
+                        alpha=1e-6,
+                        normalize_y=True,
+                        n_restarts_optimizer=1,
+                        random_state=0,
+                    )
+                    train_x = np.asarray(observed_x, dtype=np.float32)
+                    gp.fit(train_x, h_targets)
+
+                    local_candidates = []
+                    local_seen = set()
+                    for _ in range(acq_num_candidates):
+                        cand = tuple(_random_subset_indices(n_candidates, subset_min, subset_max))
+                        if cand in seen_subsets or cand in local_seen:
+                            continue
+                        local_seen.add(cand)
+                        local_candidates.append(list(cand))
+
+                    if len(local_candidates) > 0:
+                        x_cand = np.asarray(
+                            [_subset_to_binary_vector(cand, n_candidates) for cand in local_candidates],
+                            dtype=np.float32,
+                        )
+                        mu, sigma = gp.predict(x_cand, return_std=True)
+                        best_h = float(np.max(h_targets))
+                        improvement = mu - best_h
+                        safe_sigma = np.maximum(sigma, 1e-9)
+                        z = improvement / safe_sigma
+                        ei = improvement * norm.cdf(z) + safe_sigma * norm.pdf(z)
+                        subset = local_candidates[int(np.argmax(ei))]
+                        stage = "bo_ei"
+                except Exception as e:
+                    logger.warning("[bridge] GP fitting/acquisition failed at step=%d: %s", step, str(e))
+
+            if subset is None:
+                subset = _sample_unseen_subset(n_candidates, subset_min, subset_max, seen_subsets)
+
+        if subset is None:
+            logger.warning("[bridge] Exhausted unseen subsets at step=%d, stopping early.", step)
+            break
+
+        seen_subsets.add(tuple(subset))
+        _evaluate(subset, step=step, stage=stage, beta=sampled_beta)
+
+    if len(observed_g) == 0:
+        return [], {"trace": trace, "best_validation_acc": 0.0}
+
+    best_indices = [i for i, g in enumerate(observed_g) if g == max(observed_g)]
+    best_trial_idx = min(best_indices, key=lambda i: (observed_sizes[i], i))
+    best_subset = trace[best_trial_idx]["subset_indices"]
+    best_acc = float(observed_g[best_trial_idx])
+    best_correct = int(trace[best_trial_idx].get("validation_correct", 0))
+    best_total = int(trace[best_trial_idx].get("validation_total", 0))
+
+    return best_subset, {
+        "trace": trace,
+        "best_validation_acc": best_acc,
+        "best_validation_correct": best_correct,
+        "best_validation_total": best_total,
+        "best_trial_index": int(best_trial_idx),
+    }
+
+
+def _bridge_generate_pool(metaicl_data, metaicl_model, retrieval_data, selected_demos, add_newlines, row_loss_fn):
+    _, preds, generated_acc, generated_correct, generated_total = _evaluate_selected_demos(
+        metaicl_data,
+        metaicl_model,
+        retrieval_data,
+        selected_demos,
+        add_newlines,
+        row_loss_fn,
+        progress_desc="bridge-generate",
+    )
+    new_pool = []
+    for dp, pred in zip(retrieval_data, preds):
+        if _is_prediction_correct(pred, dp["output"]):
+            new_pool.append(dp)
+    return new_pool, {
+        "generated_acc_on_retrieval": float(generated_acc),
+        "generated_correct": int(generated_correct),
+        "generated_total": int(generated_total),
+        "new_pool_size": int(len(new_pool)),
+    }
 
 
 def _precompute_candidate_demo_tokens(metaicl_data, candidates, add_newlines):
@@ -935,6 +1170,238 @@ def main(logger, args):
             results.append({"dataset": dataset_name, "accuracy": acc, "correct": correct, "total": total})
             continue
 
+        if args.bridge:
+            if len(validation_data) == 0:
+                raise ValueError("bridge requires non-empty validation_data. Use --filter_candidate_set.")
+
+            if metaicl_model.is_none():
+                metaicl_model.load(checkpoint, model_name=args.model_name, is_quant=args.is_quant)
+                metaicl_model.cuda()
+                metaicl_model.eval()
+            if "Llama" in args.model_name:
+                metaicl_model.resize(tokenizer)
+            sidecar, align_true_positions = _build_ssm_sidecar(metaicl_model, args, logger)
+            flops_tracker = _new_flops_tracker(args.flops, logger)
+            row_loss_fn = (
+                (lambda m, d, progress_desc=None: _ssm_row_losses(
+                    m, d, sidecar, args.sink_tokens, align_true_positions, progress_desc=progress_desc,
+                    flops_tracker=flops_tracker,
+                ))
+                if args.ssm else (
+                    lambda m, d, progress_desc=None: _kv_cached_row_losses(
+                        m, d, progress_desc=progress_desc,
+                        flops_tracker=flops_tracker,
+                    )
+                )
+            )
+
+            base_candidates = retrieval_data
+            candidates_before_filter = len(base_candidates)
+            base_candidates = _filter_candidates_by_topk(
+                metaicl_data, base_candidates, eval_data,
+                args.retrieval_split, tensorize_eval_split, args.filter,
+            )
+            if args.filter > 0:
+                logger.info(
+                    "[bridge] pre-filter topk=%d candidates: %d -> %d",
+                    args.filter, candidates_before_filter, len(base_candidates),
+                )
+            if len(base_candidates) == 0:
+                raise ValueError("No candidate data after filtering")
+            for idx, dp in enumerate(base_candidates):
+                if "output" not in dp:
+                    raise ValueError(
+                        f"[bridge] candidate at index {idx} missing ground-truth 'output'; "
+                        "generate step requires labeled candidates."
+                    )
+
+            current_pool = base_candidates
+            best_subset_global = []
+            best_demos_global = []
+            best_val_acc_global = -1.0
+            rounds_trace = []
+            last_round_generated_applied = False
+
+            for round_idx in range(max(1, int(args.bridge_rounds))):
+                if len(current_pool) == 0:
+                    logger.warning("[bridge] Empty pool at round=%d, stopping.", round_idx)
+                    break
+
+                pool_size_before_optimize = len(current_pool)
+                candidate_demo_tokens = _precompute_candidate_demo_tokens(metaicl_data, current_pool, add_newlines)
+                validation_rows = _precompute_eval_items(metaicl_data, validation_data, add_newlines)
+                selected_subset, optimize_info = _bridge_optimize_subset(
+                    logger=logger,
+                    metaicl_data=metaicl_data,
+                    metaicl_model=metaicl_model,
+                    candidates=current_pool,
+                    candidate_demo_tokens=candidate_demo_tokens,
+                    validation_rows=validation_rows,
+                    validation_data=validation_data,
+                    k=args.k,
+                    row_loss_fn=row_loss_fn,
+                    bo_budget=args.bridge_bo_budget,
+                    bo_init_points=args.bridge_init_points,
+                    beta_min=args.bridge_beta_min,
+                    beta_max=args.bridge_beta_max,
+                    subset_min=args.bridge_subset_min,
+                    acq_num_candidates=args.bridge_acq_candidates,
+                )
+                if len(selected_subset) == 0:
+                    logger.warning("[bridge] No subset selected at round=%d, stopping.", round_idx)
+                    break
+
+                selected_demos = [current_pool[idx] for idx in selected_subset]
+                selected_global_ids = [int(dp["__global_id"]) for dp in selected_demos]
+                val_acc = float(optimize_info.get("best_validation_acc", 0.0))
+                val_correct = int(optimize_info.get("best_validation_correct", 0))
+                val_total = int(optimize_info.get("best_validation_total", 0))
+                if val_acc > best_val_acc_global:
+                    best_val_acc_global = float(val_acc)
+                    best_subset_global = list(selected_subset)
+                    best_demos_global = selected_demos
+
+                generated_pool, generate_stats = _bridge_generate_pool(
+                    metaicl_data,
+                    metaicl_model,
+                    base_candidates,
+                    selected_demos,
+                    add_newlines,
+                    row_loss_fn,
+                )
+                if len(generated_pool) < args.bridge_min_pool_size:
+                    logger.info(
+                        "[bridge] round=%d generated pool too small (%d < %d), keep previous pool.",
+                        round_idx,
+                        len(generated_pool),
+                        args.bridge_min_pool_size,
+                    )
+                    last_round_generated_applied = False
+                else:
+                    current_pool = generated_pool
+                    last_round_generated_applied = True
+
+                rounds_trace.append(
+                    {
+                        "round": int(round_idx),
+                        "pool_size_before_optimize": int(pool_size_before_optimize),
+                        "selected_subset_indices": [int(i) for i in selected_subset],
+                        "selected_subset_global_ids": selected_global_ids,
+                        "selected_subset_size": int(len(selected_subset)),
+                        "validation_acc": float(val_acc),
+                        "validation_correct": int(val_correct),
+                        "validation_total": int(val_total),
+                        "generate": generate_stats,
+                        "optimize": optimize_info,
+                    }
+                )
+                logger.info(
+                    "[bridge] round=%d subset_size=%d val_acc=%.4f new_pool=%d",
+                    round_idx,
+                    len(selected_subset),
+                    val_acc,
+                    len(current_pool),
+                )
+
+            # Let the final generate stage (e.g., 2g/3g) compete for global best.
+            if last_round_generated_applied and len(current_pool) > 0:
+                logger.info("[bridge] probing final generated pool for global-best competition.")
+                final_candidate_demo_tokens = _precompute_candidate_demo_tokens(metaicl_data, current_pool, add_newlines)
+                final_validation_rows = _precompute_eval_items(metaicl_data, validation_data, add_newlines)
+                final_subset, final_optimize_info = _bridge_optimize_subset(
+                    logger=logger,
+                    metaicl_data=metaicl_data,
+                    metaicl_model=metaicl_model,
+                    candidates=current_pool,
+                    candidate_demo_tokens=final_candidate_demo_tokens,
+                    validation_rows=final_validation_rows,
+                    validation_data=validation_data,
+                    k=args.k,
+                    row_loss_fn=row_loss_fn,
+                    bo_budget=args.bridge_bo_budget,
+                    bo_init_points=args.bridge_init_points,
+                    beta_min=args.bridge_beta_min,
+                    beta_max=args.bridge_beta_max,
+                    subset_min=args.bridge_subset_min,
+                    acq_num_candidates=args.bridge_acq_candidates,
+                )
+                if len(final_subset) > 0:
+                    final_demos = [current_pool[idx] for idx in final_subset]
+                    final_val_acc = float(final_optimize_info.get("best_validation_acc", 0.0))
+                    final_val_correct = int(final_optimize_info.get("best_validation_correct", 0))
+                    final_val_total = int(final_optimize_info.get("best_validation_total", 0))
+                    if final_val_acc > best_val_acc_global:
+                        best_val_acc_global = final_val_acc
+                        best_subset_global = list(final_subset)
+                        best_demos_global = final_demos
+
+                    rounds_trace.append(
+                        {
+                            "round": int(max(1, int(args.bridge_rounds))),
+                            "stage": "final_generate_competition",
+                            "pool_size_before_optimize": int(len(current_pool)),
+                            "selected_subset_indices": [int(i) for i in final_subset],
+                            "selected_subset_global_ids": [int(dp["__global_id"]) for dp in final_demos],
+                            "selected_subset_size": int(len(final_subset)),
+                            "validation_acc": float(final_val_acc),
+                            "validation_correct": int(final_val_correct),
+                            "validation_total": int(final_val_total),
+                            "optimize": final_optimize_info,
+                        }
+                    )
+
+            if len(best_demos_global) == 0:
+                raise ValueError("bridge failed to find a non-empty selected subset")
+
+            logger.info("[bridge] best validation acc=%.4f subset_size=%d", best_val_acc_global, len(best_demos_global))
+            for rank, demo_dp in enumerate(best_demos_global):
+                logger.info(
+                    "[bridge] rank=%d global_id=%d content=%s",
+                    rank,
+                    int(demo_dp["__global_id"]),
+                    _format_demo_preview(demo_dp),
+                )
+
+            losses, preds, acc, correct, total = _evaluate_selected_demos(
+                metaicl_data,
+                metaicl_model,
+                eval_data,
+                best_demos_global,
+                add_newlines,
+                row_loss_fn,
+                progress_desc="bridge-test",
+            )
+            _log_total_flops(flops_tracker, logger, prefix="bridge")
+
+            score_path = os.path.join(
+                args.out_dir,
+                f"{dataset_name}-{tensorize_eval_split}-ret={args.retrieval_split}-bridge-trace-s={seed}.json",
+            )
+            with open(score_path, "w") as f:
+                json.dump(
+                    {
+                        "best_validation_acc": float(best_val_acc_global),
+                        "best_subset_indices": [int(x) for x in best_subset_global],
+                        "best_subset_global_ids": [int(dp["__global_id"]) for dp in best_demos_global],
+                        "rounds": rounds_trace,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            logger.info("Saved bridge trace to %s", score_path)
+
+            cache_path = os.path.join(
+                args.out_dir,
+                f"{dataset_name}-{tensorize_eval_split}-ret={args.retrieval_split}-bridge-k={args.k}-s={seed}.pkl",
+            )
+            with open(cache_path, "wb") as f:
+                pkl.dump(losses, f)
+            logger.info("Saved bridge losses to %s", cache_path)
+            logger.info("Dataset=%s Accuracy=%.4f (%d/%d)", dataset_name, acc, correct, total)
+            results.append({"dataset": dataset_name, "accuracy": acc, "correct": correct, "total": total})
+            continue
+
         # Fallback: topk / randomk / bm25 via the run() function.
         result = run(logger, dataset_name, metaicl_data, metaicl_model,
                      retrieval_data, eval_data, validation_data, seed, checkpoint,
@@ -972,6 +1439,7 @@ def run(logger, dataset, metaicl_data, metaicl_model, retrieval_data, eval_data,
         "-randomk" if args.randomk else "",
         "-kv-final" if args.kv_final else "",
         "-gradicl" if args.gradicl else "",
+        "-bridge" if args.bridge else "",
         "-bm25" if args.bm25 else "",
         "-ssm" if args.ssm else "",
         "-k={}".format(args.k),
@@ -1004,7 +1472,7 @@ def run(logger, dataset, metaicl_data, metaicl_model, retrieval_data, eval_data,
     elif args.bm25:
         metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None, add_newlines=add_newlines)
     else:
-        raise ValueError("Please choose one selection method: --topk, --kv_final, --gradicl, --randomk, or --bm25")
+        raise ValueError("Please choose one selection method: --topk, --kv_final, --gradicl, --bridge, --randomk, or --bm25")
 
     metaicl_data.print_tensorized_example()
     logger.info(cache_path)
@@ -1117,13 +1585,30 @@ if __name__ == '__main__':
     parser.add_argument("--topk", default=False, action="store_true")
     parser.add_argument("--kv_final", default=False, action="store_true")
     parser.add_argument("--gradicl", default=False, action="store_true")
+    parser.add_argument("--bridge", default=False, action="store_true")
     parser.add_argument("--ssm", default=False, action="store_true",
                         help="Use SSM sidecar virtual-token scoring backend for inference.")
     parser.add_argument("--flops", default=False, action="store_true",
                         help="Profile one forward pass FLOPs with thop.profile.")
     parser.add_argument("--kv_final_subset_multiplier", type=float, default=1.0)
+    parser.add_argument("--bridge_rounds", type=int, default=2,
+                        help="Number of BRIDGE optimize-generate rounds.")
+    parser.add_argument("--bridge_bo_budget", type=int, default=32,
+                        help="BO evaluations per BRIDGE optimize round.")
+    parser.add_argument("--bridge_init_points", type=int, default=16,
+                        help="Random initialization count before BO acquisition.")
+    parser.add_argument("--bridge_beta_min", type=float, default=0.25,
+                        help="Lower bound of beta sampled in BRIDGE scalarized objective.")
+    parser.add_argument("--bridge_beta_max", type=float, default=1.0,
+                        help="Upper bound of beta sampled in BRIDGE scalarized objective.")
+    parser.add_argument("--bridge_subset_min", type=int, default=1,
+                        help="Minimum subset size explored by BRIDGE optimize.")
+    parser.add_argument("--bridge_acq_candidates", type=int, default=256,
+                        help="Random subset proposals scored by EI at each BO step.")
+    parser.add_argument("--bridge_min_pool_size", type=int, default=1,
+                        help="Keep previous pool if generate step produces fewer samples.")
     parser.add_argument("--filter", type=int, default=100,
-                        help="Top-k pre-filter size for kv_final/gradicl candidates. 0 disables pre-filter.")
+                        help="Top-k pre-filter size for kv_final/gradicl/bridge candidates. 0 disables pre-filter.")
     parser.add_argument("--randomk", default=False, action="store_true")
     parser.add_argument("--bm25", default=False, action="store_true")
 
