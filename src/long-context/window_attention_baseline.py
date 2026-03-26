@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-StreamingLLM baseline (Xiao et al., ICLR 2024) for comparison with LCC.
+Window Attention baseline: keep only the most recent L tokens' KV cache.
+No sink tokens, no compression — just truncate everything before the window.
 
-Keeps the KV cache of the first `sink_tokens` tokens (attention sinks)
-plus the last `recent_tokens` tokens from the demonstration prefix.
-Total cache size = sink_tokens + recent_tokens.
+This is the "Window Attention" baseline from StreamingLLM (Xiao et al., ICLR 2024),
+which they show collapses when initial tokens are evicted.
 
 Usage:
-  python streaming_llm_baseline.py \
+  python window_attention_baseline.py \
       --dataset sst2 \
-      --model_name Qwen/Qwen2.5-7B-Instruct \
-      --k 50 --sink_tokens 4 --recent_tokens 128 \
+      --model_name Qwen/Qwen2.5-1.5B-Instruct \
+      --k 50 --window_size 128 \
       --eval_split dev --retrieval_split test
 
-  # Compare multiple cache budgets:
-  python streaming_llm_baseline.py \
+  # Sweep window sizes:
+  python window_attention_baseline.py \
       --dataset sst2 \
-      --model_name Qwen/Qwen2.5-7B-Instruct \
-      --k 50 --sink_tokens 4 \
-      --recent_tokens_list 16,32,64,128,256 \
+      --model_name Qwen/Qwen2.5-1.5B-Instruct \
+      --k 50 --window_sizes 16,32,64,128,256 \
       --eval_split dev --retrieval_split test
 """
 
-import argparse, copy, gc, math, random, time
-from typing import Dict, List, Optional, Tuple
+import argparse, copy, gc, random
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +34,7 @@ from utils.data import load_data
 
 
 # =====================================================================
-# Tokenizer / text utilities (reused from main codebase)
+# Text / tokenizer utilities
 # =====================================================================
 
 def setup_tokenizer(name):
@@ -98,9 +97,6 @@ def strip_leading_format_tokens(ans_ids, tokenizer):
 # =====================================================================
 
 def _get_model_flop_params(model):
-    """
-    Extract architectural parameters needed for analytical FLOPs calculation.
-    """
     cfg = model.config
     hidden = getattr(cfg, "hidden_size", 0)
     num_layers = getattr(cfg, "num_hidden_layers", 0)
@@ -130,23 +126,6 @@ def _get_model_flop_params(model):
 
 
 def _analytical_flops(fp, new_tokens, ctx_tokens=0):
-    """
-    Compute analytical FLOPs for a transformer forward pass.
-
-    Args:
-        fp: dict from _get_model_flop_params
-        new_tokens: number of new input tokens being processed
-        ctx_tokens: number of tokens already in KV cache (0 for full forward)
-
-    Per-layer FLOPs breakdown (factor of 2 per matmul for multiply-accumulate):
-      QKV projection:  2 * new * hidden * (num_q_heads + 2*num_kv_heads) * head_dim
-      Output proj:     2 * new * hidden * hidden
-      Attention QK^T:  2 * num_q_heads * head_dim * attn_pairs
-      Attention AV:    2 * num_q_heads * head_dim * attn_pairs
-      MLP (gated):     3 * 2 * new * hidden * intermediate
-      MLP (standard):  2 * 2 * new * hidden * intermediate
-    Plus LM head:      2 * new * hidden * vocab_size
-    """
     h = fp["hidden"]
     L = fp["num_layers"]
     nq = fp["num_q_heads"]
@@ -159,13 +138,11 @@ def _analytical_flops(fp, new_tokens, ctx_tokens=0):
     if n == 0:
         return 0.0
 
-    # Attention pairs (causal)
     if ctx_tokens == 0:
         attn_pairs = n * (n + 1) / 2.0
     else:
         attn_pairs = n * ctx_tokens + n * (n + 1) / 2.0
 
-    # Per-layer
     qkv_flops = 2.0 * n * h * (nq * hd + 2 * nkv * hd)
     o_flops = 2.0 * n * h * h
     attn_flops = 2.0 * 2.0 * nq * hd * attn_pairs
@@ -176,19 +153,15 @@ def _analytical_flops(fp, new_tokens, ctx_tokens=0):
 
     per_layer = qkv_flops + o_flops + attn_flops + mlp_flops
     total = L * per_layer
-
-    # LM head
     total += 2.0 * n * h * vocab
     return total
 
 
 def _analytical_flops_full(fp, seq_len):
-    """FLOPs for a single full forward pass (no cache) on seq_len tokens."""
     return _analytical_flops(fp, new_tokens=seq_len, ctx_tokens=0)
 
 
 def _analytical_flops_inc(fp, new_tokens, ctx_tokens):
-    """FLOPs for incremental forward: new_tokens with ctx_tokens in KV cache."""
     return _analytical_flops(fp, new_tokens=new_tokens, ctx_tokens=ctx_tokens)
 
 
@@ -217,12 +190,14 @@ def _pos_ids(start, length, device, bsz=1):
 # RoPE utilities
 # =====================================================================
 
+_ROPE_MODEL_TYPES = [
+    "llama", "qwen", "qwen2", "mistral", "falcon", "phi", "gemma",
+    "gpt_neox", "pythia", "deepseek", "yi", "internlm", "baichuan",
+    "cohere", "starcoder2",
+]
+
+
 def _detect_rope_layout(model):
-    """
-    Detect whether the model uses interleaved or half-split RoPE layout.
-    - Interleaved: [r0, i0, r1, i1, ...] (e.g., GPT-NeoX, Pythia, Falcon)
-    - Half-split:  [r0, r1, ..., i0, i1, ...] (e.g., Llama, Qwen, Mistral)
-    """
     model_type = getattr(model.config, "model_type", "").lower()
 
     half_split_models = {
@@ -246,7 +221,6 @@ def _detect_rope_layout(model):
 
 
 def _get_rope_params(model):
-    """Extract RoPE parameters (inv_freq / head_dim) from the model."""
     config = model.config
     head_dim = config.hidden_size // config.num_attention_heads
     rope_base = getattr(config, "rope_theta", 10000.0)
@@ -257,7 +231,6 @@ def _get_rope_params(model):
 
 
 def _apply_rope_delta_half(key, old_positions, new_positions, inv_freq, device):
-    """Re-encode keys using HALF-SPLIT layout: [r0..r_{d/2-1}, i0..i_{d/2-1}]."""
     half_dim = key.shape[3] // 2
     delta_pos = (new_positions - old_positions).float().to(device)
     freqs = torch.outer(delta_pos, inv_freq.to(device))
@@ -272,7 +245,6 @@ def _apply_rope_delta_half(key, old_positions, new_positions, inv_freq, device):
 
 
 def _apply_rope_delta_interleaved(key, old_positions, new_positions, inv_freq, device):
-    """Re-encode keys using INTERLEAVED layout: [r0, i0, r1, i1, ...]."""
     delta_pos = (new_positions - old_positions).float().to(device)
     freqs = torch.outer(delta_pos, inv_freq.to(device))
     cos_f = torch.cos(freqs).unsqueeze(0).unsqueeze(0)
@@ -282,7 +254,6 @@ def _apply_rope_delta_interleaved(key, old_positions, new_positions, inv_freq, d
     k_odd  = key[..., 1::2]
     new_even = k_even * cos_f - k_odd * sin_f
     new_odd  = k_even * sin_f + k_odd * cos_f
-
     new_key = torch.stack([new_even, new_odd], dim=-1)
     return new_key.reshape(key.shape).to(key.dtype)
 
@@ -295,102 +266,121 @@ def _apply_rope_delta(key, old_positions, new_positions, inv_freq, device, layou
 
 
 # =====================================================================
-# StreamingLLM: build truncated KV cache
+# Window Attention: keep only last L tokens (online chunked eviction)
 # =====================================================================
 
-_ROPE_MODEL_TYPES = [
-    "llama", "qwen", "qwen2", "mistral", "falcon", "phi", "gemma",
-    "gpt_neox", "pythia", "deepseek", "yi", "internlm", "baichuan",
-    "cohere", "starcoder2",
-]
-
-
 @torch.no_grad()
-def build_streaming_cache(model, demo_ids, sink_tokens, recent_tokens, device):
+def build_window_cache(model, demo_ids, window_size, device, flop_params=None):
     """
-    Run full forward pass on demo_ids, then keep only:
-      - first `sink_tokens` KV states  (attention sinks)
-      - last  `recent_tokens` KV states (rolling window)
+    True online window attention: process demo_ids in chunks, evicting KV
+    states that fall outside the window BEFORE processing subsequent tokens.
 
-    For RoPE models, retained keys are re-rotated to contiguous positions
-    (0, 1, ..., cache_len-1) following StreamingLLM Section 3.2.
+    Later tokens' hidden states are computed WITHOUT access to early tokens
+    that have been evicted — matching real streaming window attention.
 
-    Returns: (cache, cache_len, true_demo_len)
+    For RoPE models, after each eviction the retained keys are re-rotated
+    to contiguous positions starting from 0.
+
+    Returns: (cache, cache_len, true_demo_len, demo_flops)
     """
     T = demo_ids.shape[1]
     true_demo_len = T
+    L = window_size
 
     model_type = getattr(model.config, "model_type", "")
     uses_rope = any(t in model_type for t in _ROPE_MODEL_TYPES)
 
     if uses_rope:
-        inv_freq, head_dim = _get_rope_params(model)
+        inv_freq = _get_rope_params(model)[0]
         rope_layout = _detect_rope_layout(model)
     else:
-        inv_freq, head_dim, rope_layout = None, None, None
+        inv_freq, rope_layout = None, None
 
-    out = model(input_ids=demo_ids, use_cache=True)
-    full_past = out.past_key_values
+    chunk_size = min(L, 256)
 
-    if hasattr(full_past, "to_legacy_cache"):
-        legacy = full_past.to_legacy_cache()
-    elif hasattr(full_past, "key_cache"):
-        legacy = [(full_past.key_cache[i], full_past.value_cache[i])
-                  for i in range(len(full_past.key_cache))]
-    else:
-        legacy = list(full_past)
+    cache = None
+    cache_len = 0
+    demo_flops = 0.0
 
-    s = min(sink_tokens, T)
-    r = min(recent_tokens, T - s)
-    cache_len = s + r
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        chunk_ids = demo_ids[:, start:end]
+        chunk_len = end - start
 
-    if r > 0:
-        old_positions = torch.cat([torch.arange(0, s), torch.arange(T - r, T)])
-    else:
-        old_positions = torch.arange(0, s)
-    new_positions = torch.arange(0, cache_len)
+        # Analytical FLOPs for this chunk
+        if flop_params is not None:
+            demo_flops += _analytical_flops_inc(flop_params, chunk_len, cache_len)
 
-    truncated = DynamicCache()
-    for layer_idx, (k, v) in enumerate(legacy):
-        if r > 0:
-            k_kept = torch.cat([k[:, :, :s, :], k[:, :, -r:, :]], dim=2)
-            v_kept = torch.cat([v[:, :, :s, :], v[:, :, -r:, :]], dim=2)
+        pos = _pos_ids(cache_len, chunk_len, device)
+        attn_len = cache_len + chunk_len
+        attn_mask = torch.ones(1, attn_len, dtype=torch.long, device=device)
+
+        if cache is not None:
+            out = model(input_ids=chunk_ids, past_key_values=cache,
+                        attention_mask=attn_mask, position_ids=pos, use_cache=True)
         else:
-            k_kept = k[:, :, :s, :]
-            v_kept = v[:, :, :s, :]
+            out = model(input_ids=chunk_ids, position_ids=pos, use_cache=True)
 
-        if uses_rope and inv_freq is not None:
-            k_kept = _apply_rope_delta(
-                k_kept, old_positions, new_positions, inv_freq, device,
-                layout=rope_layout,
-            )
-        truncated.update(k_kept, v_kept, layer_idx)
+        cache = out.past_key_values
+        cache_len = cache_len + chunk_len
 
-    del out, full_past, legacy
-    return truncated, cache_len, true_demo_len
+        # Evict if cache exceeds window size
+        if cache_len > L:
+            num_evict = cache_len - L
+
+            if hasattr(cache, "to_legacy_cache"):
+                legacy = cache.to_legacy_cache()
+            elif hasattr(cache, "key_cache"):
+                legacy = [(cache.key_cache[i], cache.value_cache[i])
+                          for i in range(len(cache.key_cache))]
+            else:
+                legacy = list(cache)
+
+            old_positions = torch.arange(num_evict, cache_len)
+            new_positions = torch.arange(0, L)
+
+            new_cache = DynamicCache()
+            for layer_idx, (k, v) in enumerate(legacy):
+                k_kept = k[:, :, num_evict:, :]
+                v_kept = v[:, :, num_evict:, :]
+
+                if uses_rope and inv_freq is not None:
+                    k_kept = _apply_rope_delta(
+                        k_kept, old_positions, new_positions, inv_freq, device,
+                        layout=rope_layout,
+                    )
+                new_cache.update(k_kept, v_kept, layer_idx)
+
+            cache = new_cache
+            cache_len = L
+            del legacy
+
+        del out
+
+    return cache, cache_len, true_demo_len, demo_flops
 
 
 # =====================================================================
-# StreamingLLM Scorer
+# Window Attention Scorer
 # =====================================================================
 
-class StreamingLLMScorer:
-    def __init__(self, model, tokenizer, device, sink_tokens=4, recent_tokens=128):
+class WindowAttentionScorer:
+    def __init__(self, model, tokenizer, device, window_size):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.sink_tokens = sink_tokens
-        self.recent_tokens = recent_tokens
+        self.window_size = window_size
         self.demo_cache = None
         self.cache_len = 0
         self.true_demo_len = 0
+        self.demo_flops = 0.0
 
     @torch.no_grad()
-    def build_demo_cache(self, demo_ids):
-        self.demo_cache, self.cache_len, self.true_demo_len = \
-            build_streaming_cache(
-                self.model, demo_ids,
-                self.sink_tokens, self.recent_tokens, self.device
+    def build_demo_cache(self, demo_ids, flop_params=None):
+        self.demo_cache, self.cache_len, self.true_demo_len, self.demo_flops = \
+            build_window_cache(
+                self.model, demo_ids, self.window_size, self.device,
+                flop_params=flop_params,
             )
 
     @torch.no_grad()
@@ -454,14 +444,13 @@ class StreamingLLMScorer:
 # Evaluation
 # =====================================================================
 
-def run_eval(args, recent_tokens):
+def run_eval(args, window_size):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     track_cuda_peak_mem = device.startswith("cuda")
     tokenizer = setup_tokenizer(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     model.eval()
 
-    # Model weight memory (constant overhead)
     model_mem_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
     model_mem_gb = model_mem_bytes / (1024 ** 3)
 
@@ -477,8 +466,8 @@ def run_eval(args, recent_tokens):
     per_query_random = (args.num_eval_demo_sets > 1)
     rng_eval = random.Random(args.seed + 7777)
 
-    full_kv_preds, stream_preds = [], []
-    full_losses, stream_losses = [], []
+    full_kv_preds, win_preds = [], []
+    full_losses, win_losses = [], []
     query_logit_mses = []
     ds_results = {}
     n_queries = max(1, len(eval_data))
@@ -486,22 +475,22 @@ def run_eval(args, recent_tokens):
 
     # Analytical FLOPs accumulators
     full_kv_total_flops = 0.0
-    stream_query_total_flops = 0.0
-    stream_demo_flops = 0.0
+    win_demo_flops = 0.0           # one-time: chunked demo build
+    win_query_total_flops = 0.0    # sum of per-query (prefill + scoring)
 
-    # Peak memory tracking
+    # Peak memory
     full_kv_peak_mem_bytes = 0
-    stream_demo_peak_mem_bytes = 0
-    stream_query_peak_mem_bytes = 0
+    win_demo_peak_mem_bytes = 0
+    win_query_peak_mem_bytes = 0
 
-    for qi, dp in enumerate(tqdm(eval_data, desc=f"eval sink={args.sink_tokens} recent={recent_tokens}")):
+    for qi, dp in enumerate(tqdm(eval_data, desc=f"eval window={window_size}")):
         q_text, ans_text = normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
         a_ids = tokenizer(ans_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
         q_full_kv_flops = 0.0
-        q_stream_flops = 0.0
+        q_win_flops = 0.0
 
         # Pick demos
         if per_query_random:
@@ -548,7 +537,7 @@ def run_eval(args, recent_tokens):
         if track_cuda_peak_mem:
             full_kv_peak_mem_bytes = max(full_kv_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
-        # Full-KV CE on answer
+        # Full-KV CE
         t_logits_s = None
         first_token_id = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
@@ -557,7 +546,7 @@ def run_eval(args, recent_tokens):
                 out = model(input_ids=all_ids, use_cache=False)
                 dl = demo_ids.shape[1]
                 ql = q_ids.shape[1]
-                t_logits = out.logits[:, dl + ql - 1: dl + ql - 1 + a_ids.shape[1], :]
+                t_logits = out.logits[:, dl + ql - 1:dl + ql - 1 + a_ids.shape[1], :]
                 a_stripped, n_stripped = strip_leading_format_tokens(a_ids, tokenizer)
                 if a_stripped.numel() > 0:
                     t_logits_s = t_logits[:, n_stripped:, :]
@@ -568,49 +557,45 @@ def run_eval(args, recent_tokens):
                     ).item()
                     full_losses.append(t_ce)
 
-        # ─── StreamingLLM ───
-        scorer = StreamingLLMScorer(
-            model, tokenizer, device,
-            sink_tokens=args.sink_tokens,
-            recent_tokens=recent_tokens
-        )
+        # ─── Window Attention ───
+        scorer = WindowAttentionScorer(model, tokenizer, device, window_size)
 
         # Demo cache build: track peak mem only on first query
         if track_cuda_peak_mem and qi == 0:
             torch.cuda.reset_peak_memory_stats()
-        scorer.build_demo_cache(demo_ids)
+        scorer.build_demo_cache(demo_ids, flop_params=flop_params)
         if track_cuda_peak_mem and qi == 0:
-            stream_demo_peak_mem_bytes = torch.cuda.max_memory_allocated()
+            win_demo_peak_mem_bytes = torch.cuda.max_memory_allocated()
 
         # Demo FLOPs: computed once, amortized
         if qi == 0:
-            stream_demo_flops = _analytical_flops_full(flop_params, demo_len)
+            win_demo_flops = scorer.demo_flops
 
         # Per-query inference: reset peak tracker
         if track_cuda_peak_mem:
             torch.cuda.reset_peak_memory_stats()
 
         first, q_past, q_len_runtime = scorer.prefill_question(q_text)
-        q_stream_flops += _analytical_flops_inc(flop_params, q_len_runtime, scorer.cache_len)
+        q_win_flops += _analytical_flops_inc(flop_params, q_len_runtime, scorer.cache_len)
 
         opt_texts = [normalize_option(o, add_nl) for o in opts]
         scores_t = scorer.score_options_nll(first, q_past, q_len_runtime, opt_texts)
         scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
         for opt_text in opt_texts:
             opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
-            q_stream_flops += _analytical_flops_inc(
+            q_win_flops += _analytical_flops_inc(
                 flop_params, opt_len, scorer.cache_len + q_len_runtime)
-        stream_preds.append(min(scores, key=scores.get))
+        win_preds.append(min(scores, key=scores.get))
 
         if track_cuda_peak_mem:
-            stream_query_peak_mem_bytes = max(stream_query_peak_mem_bytes, torch.cuda.max_memory_allocated())
+            win_query_peak_mem_bytes = max(win_query_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
-        # StreamingLLM CE on answer
+        # Window CE
         s_logits_s = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
             with torch.no_grad():
-                cache, cache_len, _ = build_streaming_cache(
-                    model, demo_ids, args.sink_tokens, recent_tokens, device)
+                cache, cache_len, _, _ = build_window_cache(
+                    model, demo_ids, window_size, device)
                 pos_q = _pos_ids(cache_len, q_ids.shape[1], device)
                 attn_q = torch.ones(1, cache_len + q_ids.shape[1],
                                     dtype=torch.long, device=device)
@@ -637,7 +622,7 @@ def run_eval(args, recent_tokens):
                         s_logits_s.reshape(-1, s_logits_s.size(-1)),
                         a_stripped.reshape(-1), reduction="mean"
                     ).item()
-                    stream_losses.append(s_ce)
+                    win_losses.append(s_ce)
 
         # Per-query logit MSE
         if t_logits_s is not None and s_logits_s is not None and first_token_id is not None:
@@ -652,88 +637,81 @@ def run_eval(args, recent_tokens):
         # Per-dataset tracking
         ds = dp.get("task", dp.get("dataset", "unknown"))
         if ds not in ds_results:
-            ds_results[ds] = {"full_p": [], "stream_p": [], "gt": []}
+            ds_results[ds] = {"full_p": [], "win_p": [], "gt": []}
         ds_results[ds]["full_p"].append(full_kv_preds[-1])
-        ds_results[ds]["stream_p"].append(stream_preds[-1])
+        ds_results[ds]["win_p"].append(win_preds[-1])
         ds_results[ds]["gt"].append(dp["output"])
         full_kv_total_flops += q_full_kv_flops
-        stream_query_total_flops += q_stream_flops
+        win_query_total_flops += q_win_flops
 
     # ─── Aggregate ───
     gts = [dp["output"] for dp in eval_data]
     full_acc = accuracy(full_kv_preds, gts)
-    stream_acc = accuracy(stream_preds, gts)
+    win_acc = accuracy(win_preds, gts)
     mean_full_ce = sum(full_losses) / max(1, len(full_losses))
-    mean_stream_ce = sum(stream_losses) / max(1, len(stream_losses))
+    mean_win_ce = sum(win_losses) / max(1, len(win_losses))
     per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
 
     # Analytical FLOPs: total to process all queries
     total_full_flops = full_kv_total_flops
-    total_stream_flops = stream_demo_flops + stream_query_total_flops
-    flops_reduction = (total_full_flops / total_stream_flops) if total_stream_flops > 0 else 0.0
-
-    cache_size = args.sink_tokens + recent_tokens
+    total_win_flops = win_demo_flops + win_query_total_flops
+    flops_reduction = (total_full_flops / total_win_flops) if total_win_flops > 0 else 0.0
 
     result = {
-        "sink_tokens": args.sink_tokens,
-        "recent_tokens": recent_tokens,
-        "cache_size": cache_size,
+        "window_size": window_size,
         "full_kv_acc": full_acc,
-        "stream_acc": stream_acc,
-        "acc_gap": full_acc - stream_acc,
+        "window_acc": win_acc,
+        "acc_gap": full_acc - win_acc,
         "full_ce": mean_full_ce,
-        "stream_ce": mean_stream_ce,
-        "ce_gap": mean_stream_ce - mean_full_ce,
+        "window_ce": mean_win_ce,
+        "ce_gap": mean_win_ce - mean_full_ce,
         "per_sample_mean_MSE": per_sample_mse,
-        "avg_full_flops": total_full_flops / n_queries,
-        "avg_stream_flops": total_stream_flops / n_queries,
         "total_full_flops": total_full_flops,
-        "total_stream_flops": total_stream_flops,
-        "stream_demo_flops": stream_demo_flops,
+        "total_win_flops": total_win_flops,
+        "win_demo_flops": win_demo_flops,
         "flops_reduction": flops_reduction,
         "full_kv_peak_mem_bytes": full_kv_peak_mem_bytes,
         "full_kv_peak_mem_gb": full_kv_peak_mem_bytes / (1024 ** 3),
-        "stream_demo_peak_mem_bytes": stream_demo_peak_mem_bytes,
-        "stream_demo_peak_mem_gb": stream_demo_peak_mem_bytes / (1024 ** 3),
-        "stream_query_peak_mem_bytes": stream_query_peak_mem_bytes,
-        "stream_query_peak_mem_gb": stream_query_peak_mem_bytes / (1024 ** 3),
+        "win_demo_peak_mem_bytes": win_demo_peak_mem_bytes,
+        "win_demo_peak_mem_gb": win_demo_peak_mem_bytes / (1024 ** 3),
+        "win_query_peak_mem_bytes": win_query_peak_mem_bytes,
+        "win_query_peak_mem_gb": win_query_peak_mem_bytes / (1024 ** 3),
         "model_mem_bytes": model_mem_bytes,
         "model_mem_gb": model_mem_gb,
         "ds_results": ds_results,
     }
 
     print(f"\n{'='*60}")
-    print(f"  StreamingLLM: sink={args.sink_tokens}, recent={recent_tokens}, "
-          f"cache={cache_size}")
+    print(f"  Window Attention: window_size={window_size}")
     print(f"{'='*60}")
-    print(f"Full-KV Accuracy      = {full_acc:.4f}")
-    print(f"StreamingLLM Accuracy = {stream_acc:.4f}")
-    print(f"Accuracy gap          = {full_acc - stream_acc:+.4f}")
-    print(f"Full-KV CE            = {mean_full_ce:.4f}")
-    print(f"StreamingLLM CE       = {mean_stream_ce:.4f}")
-    print(f"CE gap                = {mean_stream_ce - mean_full_ce:+.4f}")
-    print(f"per_sample_mean_MSE   = {per_sample_mse:.6f}")
+    print(f"Full-KV Accuracy     = {full_acc:.4f}")
+    print(f"Window Accuracy      = {win_acc:.4f}")
+    print(f"Accuracy gap         = {full_acc - win_acc:+.4f}")
+    print(f"Full-KV CE           = {mean_full_ce:.4f}")
+    print(f"Window CE            = {mean_win_ce:.4f}")
+    print(f"CE gap               = {mean_win_ce - mean_full_ce:+.4f}")
+    print(f"per_sample_mean_MSE  = {per_sample_mse:.6f}")
     if track_cuda_peak_mem:
-        print(f"model_weights_mem     = {model_mem_gb:.3f} GB")
-        print(f"full_kv_peak_mem      = {result['full_kv_peak_mem_gb']:.3f} GB "
+        print(f"model_weights_mem    = {model_mem_gb:.3f} GB")
+        print(f"full_kv_peak_mem     = {result['full_kv_peak_mem_gb']:.3f} GB "
               f"(+{result['full_kv_peak_mem_gb'] - model_mem_gb:.3f} GB over model)")
-        print(f"stream_demo_peak_mem  = {result['stream_demo_peak_mem_gb']:.3f} GB "
-              f"(+{result['stream_demo_peak_mem_gb'] - model_mem_gb:.3f} GB over model, one-time)")
-        print(f"stream_query_peak_mem = {result['stream_query_peak_mem_gb']:.3f} GB "
-              f"(+{result['stream_query_peak_mem_gb'] - model_mem_gb:.3f} GB over model, per-query)")
-    print(f"total_full_flops      = {total_full_flops:.3e} ({n_queries} queries)")
-    print(f"total_stream_flops    = {total_stream_flops:.3e} ({n_queries} queries)")
-    if total_stream_flops > 0:
-        print(f"flops_reduction       = {flops_reduction:.4f}x")
+        print(f"win_demo_peak_mem    = {result['win_demo_peak_mem_gb']:.3f} GB "
+              f"(+{result['win_demo_peak_mem_gb'] - model_mem_gb:.3f} GB over model, one-time)")
+        print(f"win_query_peak_mem   = {result['win_query_peak_mem_gb']:.3f} GB "
+              f"(+{result['win_query_peak_mem_gb'] - model_mem_gb:.3f} GB over model, per-query)")
+    print(f"total_full_flops     = {total_full_flops:.3e} ({n_queries} queries)")
+    print(f"total_win_flops      = {total_win_flops:.3e} ({n_queries} queries)")
+    if total_win_flops > 0:
+        print(f"flops_reduction      = {flops_reduction:.4f}x")
 
-    print(f"\n{'Dataset':<20} {'N':>5} {'FullKV':>10} {'Stream':>10} {'Gap':>10}")
+    print(f"\n{'Dataset':<20} {'N':>5} {'FullKV':>10} {'Window':>10} {'Gap':>10}")
     print(f"{'-'*55}")
     for ds in sorted(ds_results.keys()):
         r = ds_results[ds]
         n = len(r["gt"])
         fa = accuracy(r["full_p"], r["gt"])
-        sa = accuracy(r["stream_p"], r["gt"])
-        print(f"{ds:<20} {n:>5} {fa:>10.4f} {sa:>10.4f} {fa-sa:>+10.4f}")
+        wa = accuracy(r["win_p"], r["gt"])
+        print(f"{ds:<20} {n:>5} {fa:>10.4f} {wa:>10.4f} {fa-wa:>+10.4f}")
 
     del model
     gc.collect()
@@ -759,44 +737,42 @@ def main():
     p.add_argument("--num_eval_demo_sets", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda")
 
-    p.add_argument("--sink_tokens", type=int, default=4)
-    p.add_argument("--recent_tokens", type=int, default=128,
+    p.add_argument("--window_size", type=int, default=128,
                    help="Number of recent tokens to keep (single run)")
-    p.add_argument("--recent_tokens_list", type=str, default="",
+    p.add_argument("--window_sizes", type=str, default="",
                    help="Comma-separated list for sweep, e.g. '16,32,64,128,256'")
 
     args = p.parse_args()
 
-    if args.recent_tokens_list:
-        recent_list = [int(x.strip()) for x in args.recent_tokens_list.split(",")]
+    if args.window_sizes:
+        sizes = [int(x.strip()) for x in args.window_sizes.split(",")]
     else:
-        recent_list = [args.recent_tokens]
+        sizes = [args.window_size]
 
     all_results = []
-    for rt in recent_list:
-        res = run_eval(args, rt)
+    for ws in sizes:
+        res = run_eval(args, ws)
         all_results.append(res)
 
-    # Summary table
     if len(all_results) > 1:
         print(f"\n{'='*70}")
-        print(f"  Summary: StreamingLLM sweep (sink={args.sink_tokens})")
+        print(f"  Summary: Window Attention sweep")
         print(f"{'='*70}")
-        print(f"{'Recent':>8} {'Cache':>8} {'FullKV Acc':>12} {'Stream Acc':>12} "
-              f"{'Gap':>8} {'FullKV CE':>12} {'Stream CE':>12} {'CE Gap':>10} "
-              f"{'MSE':>12} {'Full FLOPs':>12} {'Strm FLOPs':>12} {'FLOPs Red.':>12} "
-              f"{'FullKV Mem':>11} {'S.Query Mem':>12}")
-        print(f"{'-'*170}")
+        print(f"{'Window':>8} {'FullKV Acc':>12} {'Window Acc':>12} "
+              f"{'Gap':>8} {'FullKV CE':>12} {'Window CE':>12} {'CE Gap':>10} "
+              f"{'MSE':>12} {'Full FLOPs':>12} {'Win FLOPs':>12} {'FLOPs Red.':>12} "
+              f"{'FullKV Mem':>11} {'W.Query Mem':>12}")
+        print(f"{'-'*155}")
         for r in all_results:
-            print(f"{r['recent_tokens']:>8} {r['cache_size']:>8} "
-                  f"{r['full_kv_acc']:>12.4f} {r['stream_acc']:>12.4f} "
+            print(f"{r['window_size']:>8} "
+                  f"{r['full_kv_acc']:>12.4f} {r['window_acc']:>12.4f} "
                   f"{r['acc_gap']:>+8.4f} {r['full_ce']:>12.4f} "
-                  f"{r['stream_ce']:>12.4f} {r['ce_gap']:>+10.4f} "
+                  f"{r['window_ce']:>12.4f} {r['ce_gap']:>+10.4f} "
                   f"{r['per_sample_mean_MSE']:>12.6f} "
-                  f"{r['total_full_flops']:>12.3e} {r['total_stream_flops']:>12.3e} "
+                  f"{r['total_full_flops']:>12.3e} {r['total_win_flops']:>12.3e} "
                   f"{r['flops_reduction']:>12.4f}x "
                   f"{r['full_kv_peak_mem_gb']:>10.3f}G "
-                  f"{r['stream_query_peak_mem_gb']:>11.3f}G")
+                  f"{r['win_query_peak_mem_gb']:>11.3f}G")
 
 
 if __name__ == "__main__":
