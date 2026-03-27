@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GPT2Tokenizer
 from transformers.cache_utils import DynamicCache
 
 from utils.data import load_data
@@ -360,6 +360,25 @@ def _freeze(model):
     model.eval()
 
 
+def _load_causal_lm(args, device):
+    if args.is_quant:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--is_quant requires CUDA (bitsandbytes 4-bit).")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        return AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+        )
+    return AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+
+
 def _generate_diverse_demo_texts(retrieval_data, k, num_sets, seed, add_newlines):
     rng = random.Random(seed)
     n = len(retrieval_data)
@@ -446,7 +465,7 @@ def _strip_leading_format_tokens(ans_ids, tokenizer):
 def run_distillation_training(args):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     tokenizer = _setup_tokenizer(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    model = _load_causal_lm(args, device)
     _freeze(model)
 
     align = args.align_true_positions
@@ -605,7 +624,7 @@ def run_distillation_training(args):
 def run_experiment(args, sidecar_state_dict=None):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     tokenizer = _setup_tokenizer(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    model = _load_causal_lm(args, device)
     model.eval()
 
     align = args.align_true_positions
@@ -812,7 +831,7 @@ def run_experiment(args, sidecar_state_dict=None):
 def run_loss_comparison(args, sidecar_state_dict=None):
     device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     tokenizer = _setup_tokenizer(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    model = _load_causal_lm(args, device)
     model.eval()
 
     align = args.align_true_positions
@@ -991,6 +1010,7 @@ if __name__ == "__main__":
     p.add_argument("--num_eval_demo_sets", type=int, default=1,
                    help=">1 enables per-query random demo sampling at eval time.")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--is_quant", default=False, action="store_true")
     p.add_argument("--run_mode", type=str, default="eval",
                    choices=["eval", "train", "train_eval", "compare_loss", "train_compare_loss"])
 
