@@ -1018,7 +1018,9 @@ class MetaICLData(object):
             if self.use_demonstrations:
                 query_terms = dp["input"].split()
                 scores = bm25.get_scores(query_terms)
-                scores[dp_idx] = -1e9
+                # Exclude self only when eval/retrieval are aligned to same example index.
+                if dp_idx < len(test_data) and test_data[dp_idx].get("input") == dp.get("input"):
+                    scores[dp_idx] = -1e9
 
                 topk_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:self.k]
                 top_k_neighbors = [test_data[i] for i in topk_indices]
@@ -1043,7 +1045,7 @@ class MetaICLData(object):
                 else:
                     demo_len = 0
                 encoded = prepro_sentence_pair_single(
-                    inputs_, [outputs_[2]], self.max_length, self.tokenizer,
+                    inputs_, outputs_, self.max_length, self.tokenizer,
                     self.tokenizer.bos_token_id, self.tokenizer.eos_token_id,
                     allow_truncation=self.use_demonstrations)
                 input_ids.append(encoded[0])

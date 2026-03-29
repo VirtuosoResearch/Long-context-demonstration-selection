@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import importlib
 import argparse
 import pickle as pkl
 import random
@@ -146,7 +147,15 @@ def _filter_candidates_for_task_by_topk(metaicl_data, candidates_task, eval_task
     return [candidates_task[i] for i in keep_indices]
 
 
-def _gradicl_greedy_select(metaicl_data, metaicl_model, validation_rows, candidate_demo_tokens, k, task_name):
+def _gradicl_greedy_select(
+    metaicl_data,
+    metaicl_model,
+    validation_rows,
+    candidate_demo_tokens,
+    k,
+    task_name,
+    flops_tracker=None,
+):
     n_candidates = len(candidate_demo_tokens)
     target_k = min(k, n_candidates)
     selected = []
@@ -163,7 +172,7 @@ def _gradicl_greedy_select(metaicl_data, metaicl_model, validation_rows, candida
         ):
             trial_subset = selected + [cand_idx]
             _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, trial_subset)
-            val_losses = _kv_cached_row_losses(metaicl_model, metaicl_data)
+            val_losses = _kv_cached_row_losses(metaicl_model, metaicl_data, flops_tracker=flops_tracker)
             subset_loss = _mean_gt_loss_for_eval(metaicl_data, val_losses)
             if best_loss is None or subset_loss < best_loss:
                 best_loss = subset_loss
@@ -266,7 +275,104 @@ def _first_label_pos(token_type_ids, valid_len):
     return valid_len
 
 
-def _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc=None):
+def _new_flops_tracker(enabled, logger):
+    return {
+        "enabled": bool(enabled),
+        "logger": logger,
+        "total_flops": 0.0,
+        "cache": {},
+        "thop_profile": None,
+        "thop_unavailable": False,
+    }
+
+
+def _maybe_profile_flops(module, input_tensor, logger, tag, extra_kwargs=None, input_key="input_ids"):
+    try:
+        thop_mod = importlib.import_module("thop")
+        profile = getattr(thop_mod, "profile")
+    except Exception as e:
+        if logger is not None:
+            logger.warning("FLOPs profiling skipped (%s): %s", tag, str(e))
+        return None, None
+
+    class _ProfileWrapper(torch.nn.Module):
+        def __init__(self, _module, _extra_kwargs, _input_key):
+            super().__init__()
+            self.inner = _module
+            self.extra_kwargs = dict(_extra_kwargs) if _extra_kwargs is not None else {}
+            self.input_key = _input_key
+
+        def forward(self, x):
+            if self.input_key is None:
+                out = self.inner(x, **self.extra_kwargs)
+            else:
+                out = self.inner(**{self.input_key: x}, **self.extra_kwargs)
+            if hasattr(out, "logits"):
+                return out.logits
+            if torch.is_tensor(out):
+                return out
+            if isinstance(out, (list, tuple)):
+                cur = out
+                while isinstance(cur, (list, tuple)) and len(cur) > 0:
+                    cur = cur[0]
+                if torch.is_tensor(cur):
+                    return cur
+            raise ValueError("Unsupported output type for FLOPs profiling")
+
+    wrapper = _ProfileWrapper(module, extra_kwargs, input_key).to(input_tensor.device)
+    wrapper.eval()
+    with torch.no_grad():
+        flops, params = profile(wrapper, inputs=(input_tensor,), verbose=False)
+    return flops, params
+
+
+def _track_flops(tracker, cache_key, module, input_tensor, tag, extra_kwargs=None, input_key="input_ids"):
+    if tracker is None or not tracker.get("enabled", False):
+        return
+
+    logger = tracker.get("logger", None)
+    cache = tracker["cache"]
+    if cache_key in cache:
+        tracker["total_flops"] += float(cache[cache_key])
+        return
+
+    if tracker.get("thop_unavailable", False):
+        return
+
+    if tracker.get("thop_profile", None) is None:
+        try:
+            thop_mod = importlib.import_module("thop")
+            tracker["thop_profile"] = getattr(thop_mod, "profile")
+        except Exception as e:
+            tracker["thop_unavailable"] = True
+            if logger is not None:
+                logger.warning("FLOPs profiling skipped (%s): %s", tag, str(e))
+            return
+
+    flops, _ = _maybe_profile_flops(
+        module,
+        input_tensor,
+        logger,
+        tag=tag,
+        extra_kwargs=extra_kwargs,
+        input_key=input_key,
+    )
+    if flops is None:
+        tracker["thop_unavailable"] = True
+        return
+    cache[cache_key] = float(flops)
+    tracker["total_flops"] += float(flops)
+
+
+def _log_total_flops(tracker, logger, prefix):
+    if tracker is None or not tracker.get("enabled", False):
+        return
+    if tracker.get("total_flops", 0.0) <= 0:
+        return
+    logger.info("[FLOPs][%s] TOTAL_FLOPs=%.3e", prefix, float(tracker["total_flops"]))
+
+
+def _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc=None, flops_tracker=None):
     model = metaicl_model.model
     inputs = metaicl_data.tensorized_inputs
     input_ids_all = inputs["input_ids"].to(metaicl_model.device)
@@ -297,6 +403,19 @@ def _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc=None):
             if label_pos >= valid_len:
                 losses[row_idx] = 0.0
                 continue
+
+            # FLOPs estimate aligned with mamba script style:
+            # profile one full-sequence forward per unique valid length.
+            seq = ids[:valid_len].unsqueeze(0)
+            _track_flops(
+                flops_tracker,
+                cache_key=("kv-full-seq", int(valid_len)),
+                module=model,
+                input_tensor=seq,
+                tag="kv-cached-row",
+                extra_kwargs={"use_cache": False},
+                input_key="input_ids",
+            )
 
             demo_len = int(demo_lens_all[row_idx].item())
             demo_end = min(1 + demo_len, label_pos)
@@ -361,6 +480,124 @@ def _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc=None):
             losses[row_idx] = float(token_losses.mean().item())
 
     return losses
+
+
+def _gradce_anchor_row_losses_and_grads(metaicl_model, metaicl_data, progress_desc=None, flops_tracker=None):
+    model = metaicl_model.model
+    embed_layer = model.get_input_embeddings()
+    inputs = metaicl_data.tensorized_inputs
+    input_ids_all = inputs["input_ids"].to(metaicl_model.device)
+    attention_mask_all = inputs["attention_mask"].to(metaicl_model.device)
+    token_type_all = inputs["token_type_ids"].to(metaicl_model.device)
+
+    losses = np.zeros(input_ids_all.size(0), dtype=np.float32)
+    row_grads = []
+    ce = torch.nn.CrossEntropyLoss(reduction="none")
+
+    row_iter = range(input_ids_all.size(0))
+    if progress_desc is not None:
+        row_iter = tqdm(row_iter, desc=progress_desc, leave=False)
+
+    for row_idx in row_iter:
+        model.zero_grad(set_to_none=True)
+        ids = input_ids_all[row_idx : row_idx + 1]
+        attn = attention_mask_all[row_idx : row_idx + 1]
+        ttype = token_type_all[row_idx : row_idx + 1]
+        valid_len = int(attn.sum().item())
+        if valid_len > 0:
+            seq = ids[:, :valid_len]
+            _track_flops(
+                flops_tracker,
+                cache_key=("gradce-anchor", int(valid_len)),
+                module=model,
+                input_tensor=seq,
+                tag="gradce-anchor",
+                extra_kwargs={"use_cache": False},
+                input_key="input_ids",
+            )
+
+        with torch.no_grad():
+            emb = embed_layer(ids)
+        emb = emb.detach().to(model.dtype)
+        emb.requires_grad_(True)
+
+        outputs = model(inputs_embeds=emb, attention_mask=attn, use_cache=False)
+        shift_logits = outputs.logits[:, :-1, :]
+        shift_labels = ids[:, 1:]
+        shift_mask = ((ttype[:, 1:] == 1) & (attn[:, 1:] == 1)).to(shift_logits.dtype)
+        denom = shift_mask.sum()
+        if float(denom.item()) <= 0.0:
+            losses[row_idx] = 0.0
+            row_grads.append(torch.zeros_like(emb[0], dtype=torch.float32).cpu())
+            continue
+
+        token_losses = ce(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1)).view_as(shift_labels)
+        row_loss = (token_losses * shift_mask).sum() / denom
+        row_loss.backward()
+        losses[row_idx] = float(row_loss.item())
+        row_grads.append(emb.grad.detach()[0].to(torch.float32).cpu())
+
+    return losses, torch.stack(row_grads, dim=0)
+
+
+def _gradce_estimate_singleton_losses(
+    metaicl_data,
+    metaicl_model,
+    validation_rows,
+    candidate_demo_tokens,
+    task_name,
+    seed,
+    flops_tracker=None,
+):
+    n_candidates = len(candidate_demo_tokens)
+    if n_candidates == 0:
+        return [], -1, {}
+
+    seed_base = int(seed) if str(seed).isdigit() else 0
+    rng = random.Random(seed_base + sum(ord(c) for c in task_name))
+    anchor_idx = rng.randrange(n_candidates)
+
+    _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, [anchor_idx])
+    anchor_input_ids_cpu = metaicl_data.tensorized_inputs["input_ids"].clone().cpu()
+    anchor_row_losses, anchor_row_grads = _gradce_anchor_row_losses_and_grads(
+        metaicl_model, metaicl_data, progress_desc=f"gradce-anchor-{task_name}", flops_tracker=flops_tracker
+    )
+
+    model = metaicl_model.model
+    embed_layer = model.get_input_embeddings()
+    device = metaicl_model.device
+    candidate_est_loss = {}
+    candidate_details = {}
+
+    for cand_idx in tqdm(range(n_candidates), desc=f"gradce-estimate-{task_name}", leave=False):
+        _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, [cand_idx])
+        cand_input_ids_cpu = metaicl_data.tensorized_inputs["input_ids"].clone().cpu()
+
+        if cand_idx == anchor_idx:
+            approx_row_losses = anchor_row_losses.copy()
+            correction_vec = np.zeros_like(anchor_row_losses)
+        else:
+            correction_vec = np.zeros(anchor_input_ids_cpu.size(0), dtype=np.float32)
+            for row_idx in range(anchor_input_ids_cpu.size(0)):
+                anchor_row_ids = anchor_input_ids_cpu[row_idx : row_idx + 1].to(device)
+                cand_row_ids = cand_input_ids_cpu[row_idx : row_idx + 1].to(device)
+                grad_row = anchor_row_grads[row_idx].to(device=device, dtype=model.dtype)
+                with torch.no_grad():
+                    anchor_emb = embed_layer(anchor_row_ids)
+                    cand_emb = embed_layer(cand_row_ids)
+                    delta = cand_emb - anchor_emb
+                    corr = torch.sum(grad_row.unsqueeze(0) * delta).item()
+                correction_vec[row_idx] = float(corr)
+            approx_row_losses = anchor_row_losses + correction_vec
+
+        subset_loss = _mean_gt_loss_for_eval(metaicl_data, approx_row_losses)
+        candidate_est_loss[cand_idx] = float(subset_loss)
+        candidate_details[cand_idx] = {
+            "estimated_validation_loss": float(subset_loss),
+            "mean_taylor_correction": float(np.mean(correction_vec)),
+        }
+
+    return candidate_est_loss, anchor_idx, candidate_details
 
 def main(logger, args):
     assert (args.dataset is not None and args.task is None) or (args.dataset is None and args.task is not None)
@@ -449,6 +686,7 @@ def main(logger, args):
         seed_total_count = 0
 
         if args.kv_final:
+            flops_tracker = _new_flops_tracker(args.flops, logger)
             if len(validation_data) == 0:
                 raise ValueError("kv_final requires non-empty validation_data from retrieval split.")
 
@@ -524,7 +762,7 @@ def main(logger, args):
                 for _ in tqdm(range(m), desc=f"affinity-subsets-{test_task}", leave=False):
                     subset = np.random.choice(n_candidates, size=subset_k, replace=False).tolist()
                     _tensorize_with_cached_tokens(metaicl_data, validation_rows, candidate_demo_tokens, subset)
-                    val_losses = _kv_cached_row_losses(metaicl_model, metaicl_data)
+                    val_losses = _kv_cached_row_losses(metaicl_model, metaicl_data, flops_tracker=flops_tracker)
                     subset_loss = _mean_gt_loss_for_eval(metaicl_data, val_losses)
                     for idx in subset:
                         loss_sum[idx] += subset_loss
@@ -646,7 +884,9 @@ def main(logger, args):
             metaicl_data.tensorize_with_selected_demo_examples(
                 eval_data_sorted, selected_demo_examples_per_query, add_newlines=add_newlines
             )
-            losses = _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc="kv-final-test")
+            losses = _kv_cached_row_losses(
+                metaicl_model, metaicl_data, progress_desc="kv-final-test", flops_tracker=flops_tracker
+            )
             preds = metaicl_model.do_predict(metaicl_data, losses=losses)
 
             cache_path = os.path.join(
@@ -698,9 +938,196 @@ def main(logger, args):
                     "Seed %s overall accuracy => %.2f%% (%d/%d)",
                     seed, 100.0 * overall_acc, seed_total_correct, seed_total_count
                 )
+            _log_total_flops(flops_tracker, logger, prefix="kv-final")
+            continue
+
+        if args.gradce:
+            flops_tracker = _new_flops_tracker(args.flops, logger)
+            if len(validation_data) == 0:
+                raise ValueError("gradce requires non-empty validation_data from retrieval split.")
+
+            if metaicl_model.is_none():
+                metaicl_model.load(checkpoint, model_name=args.model_name, is_quant=args.is_quant)
+                metaicl_model.cuda()
+                metaicl_model.eval()
+            if "Llama" in args.model_name:
+                metaicl_model.resize(tokenizer)
+
+            candidate_by_task = defaultdict(list)
+            for dp in retrieval_data:
+                candidate_by_task[dp["task"]].append(dp)
+            task_local_idx_by_gid = {}
+            for task_name, rows in candidate_by_task.items():
+                for task_idx, row in enumerate(rows):
+                    gid = int(row.get("__global_id", -1))
+                    task_local_idx_by_gid[gid] = (task_name, task_idx)
+            validation_by_task = defaultdict(list)
+            for dp in validation_data:
+                validation_by_task[dp["task"]].append(dp)
+
+            task_demo_bank = {}
+            task_candidates_ref = {}
+
+            for test_task, eval_data_task in eval_by_task.items():
+                candidates_task = retrieval_data if args.kv_final_global_pool else candidate_by_task[test_task]
+                candidates_before_filter = len(candidates_task)
+                candidates_task = _filter_candidates_for_task_by_topk(
+                    metaicl_data,
+                    candidates_task,
+                    eval_data_task,
+                    args.retrieval_split,
+                    tensorize_eval_split,
+                    args.filter,
+                )
+                if args.filter > 0:
+                    logger.info(
+                        "[gradce] task=%s pre-filter topk=%d candidates: %d -> %d",
+                        test_task,
+                        args.filter,
+                        candidates_before_filter,
+                        len(candidates_task),
+                    )
+                validation_task = validation_by_task[test_task]
+                if len(candidates_task) == 0:
+                    raise ValueError(f"No candidate data for task={test_task}")
+                if len(validation_task) == 0:
+                    raise ValueError(f"No validation data for task={test_task}")
+
+                candidate_demo_tokens = _precompute_candidate_demo_tokens(metaicl_data, candidates_task, add_newlines)
+                validation_rows = _precompute_eval_items(metaicl_data, validation_task, add_newlines)
+                candidate_est_loss, anchor_idx, candidate_details = _gradce_estimate_singleton_losses(
+                    metaicl_data,
+                    metaicl_model,
+                    validation_rows,
+                    candidate_demo_tokens,
+                    test_task,
+                    seed,
+                    flops_tracker=flops_tracker,
+                )
+
+                selected_count = min(args.k, len(candidates_task))
+                selected = sorted(candidate_est_loss, key=lambda idx: candidate_est_loss[idx])[:selected_count]
+                task_candidates_ref[test_task] = candidates_task
+                task_demo_bank[test_task] = [candidates_task[idx] for idx in selected]
+
+                score_path = os.path.join(
+                    args.out_dir,
+                    f"{test_task}-{tensorize_eval_split}-ret={args.retrieval_split}-gradce-scores-s={seed}.json",
+                )
+                score_rows = []
+                for rank, idx in enumerate(selected):
+                    dp = candidates_task[idx]
+                    gid = int(dp["__global_id"])
+                    detail = candidate_details.get(idx, {})
+                    score_rows.append(
+                        {
+                            "rank": rank,
+                            "candidate_index_in_filtered_pool": int(idx),
+                            "candidate_global_id": gid,
+                            "candidate_task": dp.get("task"),
+                            "candidate_feature_idx": int(dp.get("__feature_idx", -1)),
+                            "estimated_validation_loss": float(detail.get("estimated_validation_loss", candidate_est_loss[idx])),
+                            "mean_taylor_correction": float(detail.get("mean_taylor_correction", 0.0)),
+                            "is_anchor": bool(idx == anchor_idx),
+                            "anchor_index_in_filtered_pool": int(anchor_idx),
+                        }
+                    )
+                with open(score_path, "w") as f:
+                    json.dump(score_rows, f, ensure_ascii=False, indent=2)
+                logger.info("Saved gradce task scores to %s", score_path)
+                logger.info(
+                    "[gradce] selected demos for test_task=%s (count=%d, anchor_idx=%d)",
+                    test_task,
+                    len(selected),
+                    int(anchor_idx),
+                )
+                for rank, idx in enumerate(selected):
+                    dp = candidates_task[idx]
+                    gid = int(dp["__global_id"])
+                    candidate_task, task_local_idx = task_local_idx_by_gid.get(
+                        gid, (dp.get("task"), -1)
+                    )
+                    logger.info(
+                        "[gradce][%s] rank=%d candidate_task=%s task_local_idx=%d filtered_pool_idx=%d global_id=%d is_anchor=%s est_val_loss=%.6f content=%s",
+                        test_task,
+                        rank,
+                        candidate_task,
+                        int(task_local_idx),
+                        int(idx),
+                        gid,
+                        "yes" if idx == anchor_idx else "no",
+                        float(candidate_est_loss[idx]),
+                        _format_demo_preview(dp),
+                    )
+
+            pairs = [(dp, task_demo_bank[dp["task"]]) for dp in eval_data]
+            pairs.sort(
+                key=lambda x: tuple(int(d.get("__global_id", -1)) for d in x[1])
+            )
+            eval_data_sorted = [x[0] for x in pairs]
+            selected_demo_examples_per_query = [x[1] for x in pairs]
+            metaicl_data.tensorize_with_selected_demo_examples(
+                eval_data_sorted, selected_demo_examples_per_query, add_newlines=add_newlines
+            )
+            losses = _kv_cached_row_losses(
+                metaicl_model, metaicl_data, progress_desc="gradce-test", flops_tracker=flops_tracker
+            )
+            preds = metaicl_model.do_predict(metaicl_data, losses=losses)
+
+            cache_path = os.path.join(
+                args.out_dir,
+                f"multitask-{tensorize_eval_split}-ret={args.retrieval_split}-gradce-k={args.k}-s={seed}.pkl",
+            )
+            with open(cache_path, "wb") as f:
+                pkl.dump(losses, f)
+            logger.info("Saved gradce losses to %s", cache_path)
+
+            pred_by_task = defaultdict(list)
+            gt_by_task = defaultdict(list)
+            for pred, dp in zip(preds, eval_data_sorted):
+                pred_by_task[dp["task"]].append(pred)
+                gt_by_task[dp["task"]].append(dp["output"])
+
+            for test_task in sorted(pred_by_task.keys()):
+                correct = 0
+                gts = gt_by_task[test_task]
+                for pred, gt in zip(pred_by_task[test_task], gts):
+                    p = pred.strip()
+                    if isinstance(gt, list):
+                        ok = p in [x.strip() for x in gt]
+                    else:
+                        ok = p == gt.strip()
+                    correct += int(ok)
+                total = len(gts)
+                acc = correct / total if total > 0 else 0.0
+                seed_task_metrics[test_task] = {
+                    "task": test_task,
+                    "accuracy": acc,
+                    "correct": correct,
+                    "total": total,
+                }
+                seed_total_correct += correct
+                seed_total_count += total
+                results.append(seed_task_metrics[test_task])
+
+            if seed_task_metrics:
+                per_task_msg = ", ".join(
+                    [
+                        f"{task}: {100.0 * metric['accuracy']:.2f}% ({metric['correct']}/{metric['total']})"
+                        for task, metric in sorted(seed_task_metrics.items())
+                    ]
+                )
+                overall_acc = seed_total_correct / seed_total_count if seed_total_count > 0 else 0.0
+                logger.info("Seed %s per-task accuracy => %s", seed, per_task_msg)
+                logger.info(
+                    "Seed %s overall accuracy => %.2f%% (%d/%d)",
+                    seed, 100.0 * overall_acc, seed_total_correct, seed_total_count
+                )
+            _log_total_flops(flops_tracker, logger, prefix="gradce")
             continue
 
         if args.gradicl:
+            flops_tracker = _new_flops_tracker(args.flops, logger)
             if len(validation_data) == 0:
                 raise ValueError("gradicl requires non-empty validation_data from retrieval split.")
 
@@ -761,6 +1188,7 @@ def main(logger, args):
                     candidate_demo_tokens,
                     args.k,
                     test_task,
+                    flops_tracker=flops_tracker,
                 )
                 task_candidates_ref[test_task] = candidates_task
                 task_demo_bank[test_task] = [candidates_task[idx] for idx in selected]
@@ -815,7 +1243,9 @@ def main(logger, args):
             metaicl_data.tensorize_with_selected_demo_examples(
                 eval_data_sorted, selected_demo_examples_per_query, add_newlines=add_newlines
             )
-            losses = _kv_cached_row_losses(metaicl_model, metaicl_data, progress_desc="gradicl-test")
+            losses = _kv_cached_row_losses(
+                metaicl_model, metaicl_data, progress_desc="gradicl-test", flops_tracker=flops_tracker
+            )
             preds = metaicl_model.do_predict(metaicl_data, losses=losses)
 
             cache_path = os.path.join(
@@ -867,6 +1297,7 @@ def main(logger, args):
                     "Seed %s overall accuracy => %.2f%% (%d/%d)",
                     seed, 100.0 * overall_acc, seed_total_correct, seed_total_count
                 )
+            _log_total_flops(flops_tracker, logger, prefix="gradicl")
             continue
 
         for test_task, eval_data_task in eval_by_task.items():
@@ -939,6 +1370,7 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
         "-topk" if args.topk else "",
         "-randomk" if args.randomk else "",
         "-kv-final" if args.kv_final else "",
+        "-gradce" if args.gradce else "",
         "-gradicl" if args.gradicl else "",
         "-bm25" if args.bm25 else "",
         "-k={}".format(args.k),
@@ -989,7 +1421,7 @@ def run(logger, task, metaicl_data, metaicl_model, retrieval_data, eval_data, va
     elif args.bm25:
         metaicl_data.tensorize_bm25(retrieval_data, eval_data, options=None,  add_newlines=add_newlines)
     else:
-        raise ValueError("Please choose one selection method: --topk, --kv_final, --gradicl, --randomk, or --bm25")
+        raise ValueError("Please choose one selection method: --topk, --kv_final, --gradce, --gradicl, --randomk, or --bm25")
 
     metaicl_data.print_tensorized_example()
     logger.info(cache_path)
@@ -1083,11 +1515,12 @@ if __name__=='__main__':
 
     parser.add_argument("--topk",default=False, action="store_true")
     parser.add_argument("--kv_final", default=False, action="store_true")
+    parser.add_argument("--gradce", default=False, action="store_true")
     parser.add_argument("--gradicl", default=False, action="store_true")
     parser.add_argument("--kv_final_lambda", type=float, default=0.9)
     parser.add_argument("--kv_final_subset_multiplier", type=float, default=1.0)
     parser.add_argument("--filter", type=int, default=100,
-                        help="Per-task top-k pre-filter size for kv_final/gradicl candidates. 0 disables pre-filter.")
+                        help="Per-task top-k pre-filter size for kv_final/gradce/gradicl candidates. 0 disables pre-filter.")
     parser.add_argument("--kv_final_global_pool", dest="kv_final_global_pool", action="store_true")
     parser.add_argument("--no_kv_final_global_pool", dest="kv_final_global_pool", action="store_false")
     parser.add_argument("--randomk", default=False, action="store_true")
@@ -1095,6 +1528,8 @@ if __name__=='__main__':
     
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--is_quant", default=False, action="store_true")
+    parser.add_argument("--flops", default=False, action="store_true",
+                        help="Profile one forward-pass FLOPs with thop.profile and accumulate cached estimates.")
     parser.add_argument("--max_length", default=128, type=int)
     parser.add_argument("--multitask_filter_candidate_set", dest="multitask_filter_candidate_set", action="store_true")
     parser.add_argument("--no_multitask_filter_candidate_set", dest="multitask_filter_candidate_set", action="store_false")
