@@ -651,8 +651,8 @@ def run_experiment(args, sidecar_state_dict=None):
 
     full_kv_preds, ssm_preds = [], []
     full_losses, ssm_losses = [], []
+    logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
     query_logit_mses = []
-    teacher_first_token_logits, student_first_token_logits = [], []
     ds_results = {}  # ds -> {"full_p":[], "ssm_p":[], "gt":[]}
 
     if per_query_random:
@@ -761,14 +761,36 @@ def run_experiment(args, sidecar_state_dict=None):
                     ).item()
                     ssm_losses.append(s_ce)
 
+                    # Logit fidelity against full-KV teacher logits.
+                    t_logits_full = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+                    t_logits_stripped = t_logits_full[:, n_stripped:, :]
+                    min_t = min(t_logits_stripped.size(1), s_logits_s.size(1))
+                    if min_t > 0:
+                        tl = t_logits_stripped[:, :min_t, :]
+                        sl = s_logits_s[:, :min_t, :]
+
+                        logit_kls.append(F.kl_div(
+                            F.log_softmax(sl, dim=-1), F.softmax(tl, dim=-1),
+                            reduction="batchmean").item())
+                        logit_cossims.append(F.cosine_similarity(
+                            sl.reshape(-1, sl.size(-1)),
+                            tl.reshape(-1, tl.size(-1)), dim=-1).mean().item())
+                        top1_agrees.append(
+                            (sl.argmax(-1) == tl.argmax(-1)).float().mean().item())
+
+                        t5_t = tl.topk(5, dim=-1).indices
+                        t5_s = sl.topk(5, dim=-1).indices
+                        ovlp = sum(
+                            len(set(t5_t[0, t].tolist()) & set(t5_s[0, t].tolist())) / 5.0
+                            for t in range(min_t))
+                        top5_overlaps.append(ovlp / min_t)
+
         # Per-query relative squared error on the correct answer's first-token logit.
         if t_logits_s is not None and s_logits_s is not None and first_token_id is not None:
             t_first = t_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
             s_first = s_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
             t_first_val = float(t_first.item())
             s_first_val = float(s_first.item())
-            teacher_first_token_logits.append(t_first_val)
-            student_first_token_logits.append(s_first_val)
             denom = max(s_first_val, t_first_val)
             rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
             query_logit_mses.append(rel_sq)
@@ -785,8 +807,16 @@ def run_experiment(args, sidecar_state_dict=None):
     full_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
     ssm_acc = _accuracy(ssm_preds, [dp["output"] for dp in eval_data])
 
-    mean_full_ce = sum(full_losses) / max(1, len(full_losses))
-    mean_ssm_ce = sum(ssm_losses) / max(1, len(ssm_losses))
+    valid_ces = [(f, s) for f, s in zip(full_losses, ssm_losses) if not (math.isnan(f) or math.isnan(s))]
+    valid_full = [f for f, _ in valid_ces]
+    valid_ssm = [s for _, s in valid_ces]
+    mean_full_ce = sum(valid_full) / max(1, len(valid_full))
+    mean_ssm_ce = sum(valid_ssm) / max(1, len(valid_ssm))
+
+    mean_kl = sum(logit_kls) / max(1, len(logit_kls)) if logit_kls else float("nan")
+    mean_cos = sum(logit_cossims) / max(1, len(logit_cossims)) if logit_cossims else float("nan")
+    mean_top1 = sum(top1_agrees) / max(1, len(top1_agrees)) if top1_agrees else float("nan")
+    mean_top5 = sum(top5_overlaps) / max(1, len(top5_overlaps)) if top5_overlaps else float("nan")
 
     n_compare = len(query_logit_mses)
     per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
@@ -816,6 +846,10 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"\n{'='*60}")
     print(f"  Loss Comparison (content tokens only, format stripped)")
     print(f"{'='*60}")
+    print(f"KL(SSM||FullKV)     = {mean_kl:.6f}")
+    print(f"Cosine similarity   = {mean_cos:.6f}")
+    print(f"Top-1 agreement     = {mean_top1:.6f}")
+    print(f"Top-5 overlap       = {mean_top5:.6f}")
     print(f"num_samples         = {n_compare}")
     print(f"mean_CE_full_kv     = {mean_full_ce:.6f}")
     print(f"mean_CE_ssm         = {mean_ssm_ce:.6f}")
