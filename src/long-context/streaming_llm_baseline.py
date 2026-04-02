@@ -22,7 +22,7 @@ Usage:
       --eval_split dev --retrieval_split test
 """
 
-import argparse, copy, gc, math, random, time
+import argparse, copy, gc, math, random, re, time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -32,6 +32,60 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Tokenizer
 from transformers.cache_utils import DynamicCache
 
 from utils.data import load_data
+
+
+# =====================================================================
+# GSM8K data loading
+# =====================================================================
+
+DEFAULT_GSM8K_DOWNSAMPLE = {
+    "train": 1000,
+    "test": 199,
+}
+
+
+def _extract_answer_number(text: str) -> str:
+    match = re.search(r"####\s*(.+?)$", text.strip(), re.MULTILINE)
+    if match:
+        return match.group(1).strip().replace(",", "")
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
+    return nums[-1].replace(",", "") if nums else ""
+
+
+def _resolve_gsm8k_split(split: str) -> str:
+    return split if split in {"train", "test"} else "test"
+
+
+def load_gsm8k(split="train", max_samples=0):
+    from datasets import load_dataset
+    split = _resolve_gsm8k_split(split)
+    ds = load_dataset("openai/gsm8k", "main", split=split)
+    data = []
+    for ex in ds:
+        answer = ex["answer"]
+        data.append({
+            "input": ex["question"],
+            "output": answer,
+            "answer_number": _extract_answer_number(answer),
+            # Keep field compatibility with MCQ-style eval loop.
+            "options": [answer],
+            "task": "gsm8k",
+            "dataset": "gsm8k",
+        })
+    if max_samples <= 0:
+        max_samples = DEFAULT_GSM8K_DOWNSAMPLE.get(split, 0)
+    if max_samples > 0:
+        data = data[:max_samples]
+    return data
+
+
+def _load_dataset(args, split):
+    if args.dataset.strip().lower() == "gsm8k":
+        return load_gsm8k(split=split, max_samples=0)
+    return load_data(
+        task=None, split=split, k=args.k,
+        seed=args.seed, datasets=args.dataset.split(","), is_null=False
+    )
 
 
 # =====================================================================
@@ -467,10 +521,8 @@ def run_eval(args, recent_tokens):
 
     add_nl = not args.model_name.startswith("gpt2")
 
-    retrieval_data = load_data(task=None, split=args.retrieval_split, k=args.k,
-                               seed=args.seed, datasets=args.dataset.split(","), is_null=False)
-    eval_data = load_data(task=None, split=args.eval_split, k=args.k,
-                          seed=args.seed, datasets=args.dataset.split(","), is_null=False)
+    retrieval_data = _load_dataset(args, args.retrieval_split)
+    eval_data = _load_dataset(args, args.eval_split)
     if not retrieval_data or not eval_data:
         raise ValueError("Empty data.")
 

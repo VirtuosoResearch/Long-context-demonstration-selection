@@ -23,7 +23,7 @@ Usage:
       --run_mode identify_eval
 """
 
-import argparse, copy, gc, math, os, random, time, warnings
+import argparse, copy, gc, math, os, random, re, time, warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -34,6 +34,59 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Tokenizer
 from transformers.cache_utils import DynamicCache
 
 from utils.data import load_data
+
+
+# =====================================================================
+# GSM8K data loading
+# =====================================================================
+
+DEFAULT_GSM8K_DOWNSAMPLE = {
+    "train": 1000,
+    "test": 199,
+}
+
+
+def _extract_answer_number(text: str) -> str:
+    match = re.search(r"####\s*(.+?)$", text.strip(), re.MULTILINE)
+    if match:
+        return match.group(1).strip().replace(",", "")
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
+    return nums[-1].replace(",", "") if nums else ""
+
+
+def _resolve_gsm8k_split(split: str) -> str:
+    return split if split in {"train", "test"} else "test"
+
+
+def load_gsm8k(split="train", max_samples=0):
+    from datasets import load_dataset
+    split = _resolve_gsm8k_split(split)
+    ds = load_dataset("openai/gsm8k", "main", split=split)
+    data = []
+    for ex in ds:
+        answer = ex["answer"]
+        data.append({
+            "input": ex["question"],
+            "output": answer,
+            "answer_number": _extract_answer_number(answer),
+            "options": [answer],
+            "task": "gsm8k",
+            "dataset": "gsm8k",
+        })
+    if max_samples <= 0:
+        max_samples = DEFAULT_GSM8K_DOWNSAMPLE.get(split, 0)
+    if max_samples > 0:
+        data = data[:max_samples]
+    return data
+
+
+def _load_dataset(args, split):
+    if args.dataset.strip().lower() == "gsm8k":
+        return load_gsm8k(split=split, max_samples=0)
+    return load_data(
+        task=None, split=split, k=args.k,
+        seed=args.seed, datasets=args.dataset.split(","), is_null=False
+    )
 
 
 # =====================================================================
@@ -574,9 +627,7 @@ def identify_retrieval_heads(model, tokenizer, config, args, device):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ---- filler text for synthetic passkey samples ----
-    retrieval_data = load_data(task=None, split=args.retrieval_split, k=args.k,
-                               seed=args.seed, datasets=args.dataset.split(","),
-                               is_null=False)
+    retrieval_data = _load_dataset(args, args.retrieval_split)
     add_nl = not args.model_name.startswith("gpt2")
     filler_text = build_demo_text(retrieval_data[:args.k], add_newlines=add_nl)
 
@@ -1081,12 +1132,8 @@ def run_eval(args, model, tokenizer, gate_values, retrieval_ratio, device):
     add_nl = not args.model_name.startswith("gpt2")
     track_cuda_peak_mem = str(device).startswith("cuda")
 
-    retrieval_data = load_data(task=None, split=args.retrieval_split, k=args.k,
-                               seed=args.seed, datasets=args.dataset.split(","),
-                               is_null=False)
-    eval_data = load_data(task=None, split=args.eval_split, k=args.k,
-                          seed=args.seed, datasets=args.dataset.split(","),
-                          is_null=False)
+    retrieval_data = _load_dataset(args, args.retrieval_split)
+    eval_data = _load_dataset(args, args.eval_split)
 
     # Model weight memory (constant overhead)
     model_mem_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
@@ -1211,11 +1258,8 @@ def run_eval(args, model, tokenizer, gate_values, retrieval_ratio, device):
         scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
         for opt_text in opt_texts:
             opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
-            # Sequential scoring: first token uses first_logits (no forward),
-            # then one incremental forward on the remaining tokens.
-            run_len = max(0, opt_len - 1)
             q_duo_flops += _analytical_flops_duo_inc(
-                flop_params, run_len, r_kv, s_kv, ret_q_heads_per_layer
+                flop_params, opt_len, r_kv, s_kv, ret_q_heads_per_layer
             )
         duo_preds.append(min(scores, key=scores.get))
         if track_cuda_peak_mem:
