@@ -39,6 +39,15 @@ DEFAULT_GSM8K_DOWNSAMPLE = {
     "test": 199,
 }
 
+MMLU_COLLEGE_SUBJECTS = [
+    "college_biology",
+    "college_chemistry",
+    "college_computer_science",
+    "college_mathematics",
+    "college_medicine",
+    "college_physics",
+]
+
 
 def _extract_answer_number(text: str) -> str:
     match = re.search(r"####\s*(.+?)$", text.strip(), re.MULTILINE)
@@ -74,9 +83,82 @@ def load_gsm8k(split="train", max_samples=0):
     return data
 
 
+def _mmlu_answer_to_index(answer) -> int:
+    if isinstance(answer, int):
+        return answer
+    if isinstance(answer, str):
+        s = answer.strip().upper()
+        if s.isdigit():
+            return int(s)
+        if len(s) == 1 and "A" <= s <= "Z":
+            return ord(s) - ord("A")
+    raise ValueError(f"Unsupported MMLU answer format: {answer!r}")
+
+
+def _build_mmlu_college_data():
+    from datasets import load_dataset
+
+    data = []
+    for subject in MMLU_COLLEGE_SUBJECTS:
+        ds = load_dataset("cais/mmlu", subject, split="test")
+        for ex in ds:
+            choices = list(ex["choices"])
+            ans_idx = _mmlu_answer_to_index(ex["answer"])
+            if ans_idx < 0 or ans_idx >= len(choices):
+                raise ValueError(
+                    f"Invalid answer index {ans_idx} for subject={subject} "
+                    f"with {len(choices)} choices."
+                )
+            data.append({
+                "input": ex["question"],
+                "output": choices[ans_idx],
+                "options": choices,
+                "task": subject,
+                "dataset": "mmlu",
+            })
+    return data
+
+
+def load_mmlu_college_split(args, split):
+    cache_key = (
+        args.seed,
+        args.retrieval_split,
+        args.eval_split,
+    )
+    if not hasattr(load_mmlu_college_split, "_cache"):
+        load_mmlu_college_split._cache = {}
+    cache = load_mmlu_college_split._cache
+    if cache_key not in cache:
+        all_data = _build_mmlu_college_data()
+        rng = random.Random(args.seed)
+        rng.shuffle(all_data)
+
+        retrieval_size = int(len(all_data) * 5 / 6)
+        retrieval_size = min(max(1, retrieval_size), max(1, len(all_data) - 1))
+        retrieval_data = all_data[:retrieval_size]
+        eval_data = all_data[retrieval_size:]
+
+        cache[cache_key] = {
+            "all": all_data,
+            args.retrieval_split: retrieval_data,
+            args.eval_split: eval_data,
+        }
+
+        print(
+            f"[MMLU] merged college subsets: total={len(all_data)}, "
+            f"{args.retrieval_split}={len(retrieval_data)}, "
+            f"{args.eval_split}={len(eval_data)} (5:1 split)"
+        )
+
+    split_data = cache[cache_key].get(split, cache[cache_key]["all"])
+    return list(split_data)
+
+
 def _load_dataset(args, split):
     if args.dataset.strip().lower() == "gsm8k":
         return load_gsm8k(split=split, max_samples=0)
+    if args.dataset.strip().lower() == "mmlu":
+        return load_mmlu_college_split(args, split)
     return load_data(
         task=None, split=split, k=args.k,
         seed=args.seed, datasets=args.dataset.split(","), is_null=False
