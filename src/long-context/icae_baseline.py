@@ -19,7 +19,7 @@ Evaluation:
 =============================================================
 """
 
-import argparse, copy, gc, math, random, re, time
+import argparse, copy, gc, math, os, random, re, time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -41,6 +41,15 @@ DEFAULT_GSM8K_DOWNSAMPLE = {
     "train": 1000,
     "test": 199,
 }
+
+MMLU_COLLEGE_SUBJECTS = [
+    "college_biology",
+    "college_chemistry",
+    "college_computer_science",
+    "college_mathematics",
+    "college_medicine",
+    "college_physics",
+]
 
 
 def _extract_answer_number(text: str) -> str:
@@ -80,9 +89,82 @@ def load_gsm8k(split="train", max_samples=0):
     return data
 
 
+def _mmlu_answer_to_index(answer) -> int:
+    if isinstance(answer, int):
+        return answer
+    if isinstance(answer, str):
+        s = answer.strip().upper()
+        if s.isdigit():
+            return int(s)
+        if len(s) == 1 and "A" <= s <= "Z":
+            return ord(s) - ord("A")
+    raise ValueError(f"Unsupported MMLU answer format: {answer!r}")
+
+
+def _build_mmlu_college_data():
+    from datasets import load_dataset
+
+    data = []
+    for subject in MMLU_COLLEGE_SUBJECTS:
+        ds = load_dataset("cais/mmlu", subject, split="test")
+        for ex in ds:
+            choices = list(ex["choices"])
+            ans_idx = _mmlu_answer_to_index(ex["answer"])
+            if ans_idx < 0 or ans_idx >= len(choices):
+                raise ValueError(
+                    f"Invalid answer index {ans_idx} for subject={subject} "
+                    f"with {len(choices)} choices."
+                )
+            data.append({
+                "input": ex["question"],
+                "output": choices[ans_idx],
+                "options": choices,
+                "task": subject,
+                "dataset": "mmlu",
+            })
+    return data
+
+
+def load_mmlu_college_split(args, split):
+    cache_key = (
+        args.seed,
+        args.retrieval_split,
+        args.eval_split,
+    )
+    if not hasattr(load_mmlu_college_split, "_cache"):
+        load_mmlu_college_split._cache = {}
+    cache = load_mmlu_college_split._cache
+    if cache_key not in cache:
+        all_data = _build_mmlu_college_data()
+        rng = random.Random(args.seed)
+        rng.shuffle(all_data)
+
+        retrieval_size = int(len(all_data) * 5 / 6)
+        retrieval_size = min(max(1, retrieval_size), max(1, len(all_data) - 1))
+        retrieval_data = all_data[:retrieval_size]
+        eval_data = all_data[retrieval_size:]
+
+        cache[cache_key] = {
+            "all": all_data,
+            args.retrieval_split: retrieval_data,
+            args.eval_split: eval_data,
+        }
+
+        print(
+            f"[MMLU] merged college subsets: total={len(all_data)}, "
+            f"{args.retrieval_split}={len(retrieval_data)}, "
+            f"{args.eval_split}={len(eval_data)} (5:1 split)"
+        )
+
+    split_data = cache[cache_key].get(split, cache[cache_key]["all"])
+    return list(split_data)
+
+
 def _load_dataset(args, split, k=None):
     if args.dataset.strip().lower() == "gsm8k":
         return load_gsm8k(split=split, max_samples=0)
+    if args.dataset.strip().lower() == "mmlu":
+        return load_mmlu_college_split(args, split)
     use_k = args.k if k is None else k
     return load_data(
         task=None, split=split, k=use_k,
@@ -96,15 +178,17 @@ def _load_dataset(args, split, k=None):
 
 class LoRALinear(nn.Module):
     """Drop-in replacement for nn.Linear with a low-rank residual."""
-    def __init__(self, orig: nn.Linear, rank: int = 128, alpha: float = 1.0):
+    def __init__(self, orig: nn.Linear, rank: int = 64, alpha: float = 1.0):
         super().__init__()
         self.orig = orig
         self.rank = rank
         self.alpha = alpha
         self.scale = alpha / rank
         in_f, out_f = orig.in_features, orig.out_features
-        self.lora_A = nn.Parameter(torch.empty(in_f, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, out_f))
+        param_device = orig.weight.device
+        # Keep trainable LoRA weights in fp32 for optimizer stability.
+        self.lora_A = nn.Parameter(torch.empty(in_f, rank, device=param_device, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.zeros(rank, out_f, device=param_device, dtype=torch.float32))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         orig.weight.requires_grad = False
         if orig.bias is not None:
@@ -115,7 +199,9 @@ class LoRALinear(nn.Module):
         base = self.orig(x)
         if not self._enabled:
             return base
-        return base + (x @ self.lora_A @ self.lora_B).to(base.dtype) * self.scale
+        # Compute LoRA update in fp32 for stability, then cast back.
+        x_lora = x.to(self.lora_A.dtype)
+        return base + (x_lora @ self.lora_A @ self.lora_B).to(base.dtype) * self.scale
 
 
 # ── helpers to find Q / V projections across architectures ──
@@ -123,7 +209,7 @@ class LoRALinear(nn.Module):
 _QV_NAMES = {'q_proj', 'v_proj',       # LLaMA / Qwen / Mistral
              'query', 'value'}          # some older HF models
 
-def _apply_lora(model, rank=128, alpha=1.0):
+def _apply_lora(model, rank=64, alpha=1.0):
     """Inject LoRA into every Q and V linear layer. Returns list[LoRALinear]."""
     lora_layers: List[LoRALinear] = []
     for name, mod in list(model.named_modules()):
@@ -179,16 +265,21 @@ class ICAE(nn.Module):
     Decoder: same LLM *without* LoRA, conditions on memory slots via
              inputs_embeds.
     """
-    def __init__(self, model, num_memory_slots=128, lora_rank=128, lora_alpha=1.0):
+    def __init__(self, model, num_memory_slots=128, lora_rank=64, lora_alpha=1.0):
         super().__init__()
         self.model = model
         self.H = model.config.hidden_size
         self.k = num_memory_slots
+        emb_weight = model.get_input_embeddings().weight
 
         # Learnable memory-token embeddings  (em(m_i) in the paper)
-        self.mem_emb = nn.Parameter(torch.randn(num_memory_slots, self.H) * 0.02)
+        self.mem_emb = nn.Parameter(
+            torch.randn(num_memory_slots, self.H, device=emb_weight.device, dtype=torch.float32) * 0.02
+        )
         # Special [AE] token embedding
-        self.ae_emb = nn.Parameter(torch.randn(1, self.H) * 0.02)
+        self.ae_emb = nn.Parameter(
+            torch.randn(1, self.H, device=emb_weight.device, dtype=torch.float32) * 0.02
+        )
 
         self.lora_layers = _apply_lora(model, rank=lora_rank, alpha=lora_alpha)
 
@@ -364,6 +455,28 @@ def _normalize_option(opt, add_newlines):
     return ("\n" + opt) if add_newlines else opt
 
 
+def _default_ckpt_path(dataset, stage, preferred_path=""):
+    """
+    Checkpoint path policy:
+      1) Always save under ./checkpoint/icae/
+      2) Filename must include task name
+    """
+    task = re.sub(r"[^A-Za-z0-9._-]+", "_", str(dataset)).strip("._-")
+    if not task:
+        task = "unknown_task"
+    out_dir = os.path.join(".", "checkpoint", "icae")
+    os.makedirs(out_dir, exist_ok=True)
+    if preferred_path:
+        base = os.path.basename(preferred_path)
+        stem, ext = os.path.splitext(base)
+        if not ext:
+            ext = ".pt"
+        if task not in stem:
+            stem = f"{task}_{stem}" if stem else f"{task}_icae_{stage}"
+        return os.path.join(out_dir, f"{stem}{ext}")
+    return os.path.join(out_dir, f"{task}_icae_{stage}.pt")
+
+
 def _build_demo_text(demos, add_newlines):
     parts = []
     for i, dp in enumerate(demos):
@@ -401,12 +514,37 @@ def _freeze(model):
 
 
 def _load_causal_lm(args, device):
+    if device.startswith("cuda"):
+        preferred_dtype = torch.float32
+        common_kwargs = {"device_map": "auto", "torch_dtype": preferred_dtype}
+        if args.is_quant:
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=preferred_dtype,
+                                     bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
+            return AutoModelForCausalLM.from_pretrained(
+                args.model_name, quantization_config=bnb, **common_kwargs
+            )
+        return AutoModelForCausalLM.from_pretrained(args.model_name, **common_kwargs)
+
     if args.is_quant:
         bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
                                  bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
         return AutoModelForCausalLM.from_pretrained(args.model_name, quantization_config=bnb,
                                                     device_map="auto", torch_dtype=torch.float16)
     return AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+
+
+def _resolve_runtime_device(device_arg: str) -> str:
+    if not torch.cuda.is_available():
+        return "cpu"
+    if device_arg == "auto":
+        return "cuda"
+    if device_arg.startswith("cuda"):
+        return device_arg
+    return "cpu"
+
+
+def _model_input_device(model):
+    return model.get_input_embeddings().weight.device
 
 
 @torch.no_grad()
@@ -532,13 +670,16 @@ def _build_ft_triples(retrieval_data, train_data, k, num_triples, seed, add_newl
 # =====================================================================
 
 def run_pretrain(args):
-    device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    device = _resolve_runtime_device(args.device)
     tokenizer = _setup_tokenizer(args.model_name)
     model = _load_causal_lm(args, device)
+    io_device = _model_input_device(model)
+    if hasattr(model, "hf_device_map"):
+        print(f"[Model] hf_device_map={model.hf_device_map}")
     _freeze(model)
 
     icae = ICAE(model, num_memory_slots=args.num_memory_slots,
-                lora_rank=args.lora_rank).to(device)
+                lora_rank=args.lora_rank)
     print(f"[ICAE] trainable params: {icae.num_trainable():,}")
 
     # ── data: use raw text from retrieval data + train data for self-supervised pretrain ──
@@ -566,7 +707,7 @@ def run_pretrain(args):
         rng.shuffle(order)
         for ti in tqdm(order, desc=f"pretrain-{epoch+1}"):
             ids = tokenizer(texts[ti], return_tensors="pt", add_special_tokens=False,
-                            max_length=max_len * 2, truncation=True)["input_ids"].to(device)
+                            max_length=max_len * 2, truncation=True)["input_ids"].to(io_device)
             L = min(ids.shape[1], max_len)
             if L < 10:
                 continue
@@ -576,17 +717,17 @@ def run_pretrain(args):
 
             # ── AE loss ──
             ae_logits = icae.decode_ae(mem_slots, ctx_ids)
-            loss_ae = F.cross_entropy(ae_logits.reshape(-1, ae_logits.size(-1)),
+            loss_ae = F.cross_entropy(ae_logits.float().reshape(-1, ae_logits.size(-1)),
                                       ctx_ids.reshape(-1), reduction="mean")
 
             # ── LM loss (if continuation available) ──
-            loss_lm = torch.tensor(0.0, device=device)
+            loss_lm = torch.tensor(0.0, device=io_device)
             cont_len = ids.shape[1] - L
             if cont_len >= 5:
                 N = min(cont_len, max_len)
                 cont_ids = ids[:, L: L + N]
                 lm_logits = icae.decode_lm(mem_slots, cont_ids)
-                loss_lm = F.cross_entropy(lm_logits.reshape(-1, lm_logits.size(-1)),
+                loss_lm = F.cross_entropy(lm_logits.float().reshape(-1, lm_logits.size(-1)),
                                           cont_ids.reshape(-1), reduction="mean")
 
             loss = lam * loss_ae + (1 - lam) * loss_lm
@@ -617,9 +758,11 @@ def run_pretrain(args):
     state = {k: v.detach().cpu() for k, v in icae.state_dict().items()
              if any(k.startswith(p) for p in ("mem_emb", "ae_emb", "lora_layers"))
              or "lora_" in k}
-    if args.save_pretrain_path:
-        torch.save({"icae": state, "args": vars(args)}, args.save_pretrain_path)
-        print(f"Saved pretrained ICAE: {args.save_pretrain_path}")
+    save_pretrain_path = _default_ckpt_path(
+        args.dataset, "pretrain", preferred_path=args.save_pretrain_path
+    )
+    torch.save({"icae": state, "args": vars(args)}, save_pretrain_path)
+    print(f"Saved pretrained ICAE: {save_pretrain_path}")
     return icae, state
 
 
@@ -632,17 +775,18 @@ def run_pretrain(args):
 # =====================================================================
 
 def run_finetune(args, icae=None, model=None, tokenizer=None):
-    device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    device = _resolve_runtime_device(args.device)
     if tokenizer is None:
         tokenizer = _setup_tokenizer(args.model_name)
     if model is None:
         model = _load_causal_lm(args, device)
         _freeze(model)
+    io_device = _model_input_device(model)
     if icae is None:
         icae = ICAE(model, num_memory_slots=args.num_memory_slots,
-                    lora_rank=args.lora_rank).to(device)
+                    lora_rank=args.lora_rank)
         if args.load_pretrain_path:
-            ckpt = torch.load(args.load_pretrain_path, map_location=device)
+            ckpt = torch.load(args.load_pretrain_path, map_location="cpu")
             icae.load_state_dict(ckpt["icae"], strict=False)
             print(f"Loaded pretrained ICAE from: {args.load_pretrain_path}")
 
@@ -683,11 +827,11 @@ def run_finetune(args, icae=None, model=None, tokenizer=None):
             ctx_text, q_text, a_text = triples[ti]
 
             ctx_ids = tokenizer(ctx_text, return_tensors="pt",
-                                add_special_tokens=False)["input_ids"].to(device)
+                                add_special_tokens=False)["input_ids"].to(io_device)
             q_ids = tokenizer(q_text, return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
+                              add_special_tokens=False)["input_ids"].to(io_device)
             a_ids = tokenizer(a_text, return_tensors="pt",
-                              add_special_tokens=False)["input_ids"].to(device)
+                              add_special_tokens=False)["input_ids"].to(io_device)
 
             if ctx_ids.numel() == 0 or q_ids.numel() == 0 or a_ids.numel() == 0:
                 continue
@@ -697,7 +841,7 @@ def run_finetune(args, icae=None, model=None, tokenizer=None):
 
             # Decode: predict response given (memory_slots, prompt)
             logits = icae.decode_instruction(mem_slots, q_ids, a_ids)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+            loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
                                    a_ids.reshape(-1), reduction="mean")
 
             optimizer.zero_grad(set_to_none=True)
@@ -723,9 +867,11 @@ def run_finetune(args, icae=None, model=None, tokenizer=None):
 
     state = {k: v.detach().cpu() for k, v in icae.state_dict().items()
              if "lora_" in k or k in ("mem_emb", "ae_emb")}
-    if args.save_sidecar_path:
-        torch.save({"icae": state, "args": vars(args)}, args.save_sidecar_path)
-        print(f"Saved fine-tuned ICAE: {args.save_sidecar_path}")
+    save_sidecar_path = _default_ckpt_path(
+        args.dataset, "finetune", preferred_path=args.save_sidecar_path
+    )
+    torch.save({"icae": state, "args": vars(args)}, save_sidecar_path)
+    print(f"Saved fine-tuned ICAE: {save_sidecar_path}")
     return icae, state
 
 
@@ -734,12 +880,15 @@ def run_finetune(args, icae=None, model=None, tokenizer=None):
 # =====================================================================
 
 def run_experiment(args, icae=None, model=None, tokenizer=None):
-    device = "cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    device = _resolve_runtime_device(args.device)
     track_cuda_peak_mem = device.startswith("cuda")
     if tokenizer is None:
         tokenizer = _setup_tokenizer(args.model_name)
     if model is None:
         model = _load_causal_lm(args, device)
+    io_device = _model_input_device(model)
+    if hasattr(model, "hf_device_map"):
+        print(f"[Model] hf_device_map={model.hf_device_map}")
     model.eval()
     model_mem_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
     model_mem_gb = model_mem_bytes / (1024 ** 3)
@@ -751,9 +900,9 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
 
     if icae is None:
         icae = ICAE(model, num_memory_slots=args.num_memory_slots,
-                    lora_rank=args.lora_rank).to(device)
+                    lora_rank=args.lora_rank)
         if args.load_sidecar_path:
-            ckpt = torch.load(args.load_sidecar_path, map_location=device)
+            ckpt = torch.load(args.load_sidecar_path, map_location="cpu")
             st = ckpt["icae"] if isinstance(ckpt, dict) and "icae" in ckpt else ckpt
             icae.load_state_dict(st, strict=False)
             print(f"Loaded ICAE from: {args.load_sidecar_path}")
@@ -761,12 +910,13 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
             print("WARN: no ICAE checkpoint; results may be random.")
     icae.eval()
 
-    scorer = ICAEScorer(model, icae, tokenizer, device)
+    scorer = ICAEScorer(model, icae, tokenizer, io_device)
     per_query_random = (args.num_eval_demo_sets > 1)
     rng_eval = random.Random(args.seed + 7777)
 
     full_kv_preds, icae_preds = [], []
     full_losses, icae_losses = [], []
+    query_logit_mses = []
     logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
     ds_results = {}
     n_queries = max(1, len(eval_data))
@@ -784,9 +934,9 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
     for qi, dp in enumerate(tqdm(eval_data, desc="eval")):
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
+                          add_special_tokens=False)["input_ids"].to(io_device)
         a_ids = tokenizer(ans_text, return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
+                          add_special_tokens=False)["input_ids"].to(io_device)
         q_len = q_ids.shape[1]
         opts = dp["options"]
         q_full_kv_flops = 0.0
@@ -805,7 +955,7 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
 
         demo_text = _build_demo_text(demos, add_newlines=add_nl)
         demo_ids = tokenizer(demo_text, return_tensors="pt",
-                             add_special_tokens=False)["input_ids"].to(device)
+                             add_special_tokens=False)["input_ids"].to(io_device)
         demo_len = demo_ids.shape[1]
 
         # ── Full-KV baseline ──
@@ -815,7 +965,7 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
         for opt in opts:
             opt_text = _normalize_option(opt, add_newlines=add_nl)
             opt_ids = tokenizer(opt_text, return_tensors="pt",
-                                add_special_tokens=False)["input_ids"].to(device)
+                                add_special_tokens=False)["input_ids"].to(io_device)
             if opt_ids.numel() == 0:
                 opt_scores[opt] = float("inf")
                 continue
@@ -835,12 +985,14 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
 
         # Full-KV CE on gold answer
         t_logits_s = None
+        first_token_id = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
             with torch.no_grad():
                 t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
                 a_stripped, n_s = _strip_leading_format_tokens(a_ids, tokenizer)
                 if a_stripped.numel() > 0:
                     t_logits_s = t_logits[:, n_s:, :]
+                    first_token_id = a_stripped[:, 0].unsqueeze(1)
                     full_losses.append(F.cross_entropy(
                         t_logits_s.reshape(-1, t_logits_s.size(-1)),
                         a_stripped.reshape(-1), reduction="mean").item())
@@ -906,6 +1058,16 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
                                        for t in range(mn))
                             top5_overlaps.append(ovlp / mn)
 
+        # Per-query logit MSE (aligned with streaming_llm_baseline.py)
+        if t_logits_s is not None and s_logits_s is not None and first_token_id is not None:
+            t_first = t_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
+            s_first = s_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
+            t_first_val = float(t_first.item())
+            s_first_val = float(s_first.item())
+            denom = max(abs(s_first_val), abs(t_first_val))
+            rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
+            query_logit_mses.append(rel_sq)
+
         ds = dp.get("task", dp.get("dataset", "unknown"))
         if ds not in ds_results:
             ds_results[ds] = {"full_p": [], "icae_p": [], "gt": []}
@@ -922,6 +1084,7 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
 
     mean_f = sum(full_losses) / max(1, len(full_losses))
     mean_i = sum(icae_losses) / max(1, len(icae_losses))
+    per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
     mean_kl = sum(logit_kls) / max(1, len(logit_kls)) if logit_kls else float("nan")
     mean_cos = sum(logit_cossims) / max(1, len(logit_cossims)) if logit_cossims else float("nan")
     mean_t1 = sum(top1_agrees) / max(1, len(top1_agrees)) if top1_agrees else float("nan")
@@ -929,6 +1092,39 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
     total_full_flops = full_kv_total_flops
     total_icae_flops = icae_demo_flops + icae_query_total_flops
     flops_reduction = (total_full_flops / total_icae_flops) if total_icae_flops > 0 else 0.0
+
+    result = {
+        # Keep schema aligned with streaming_llm_baseline.py for downstream scripts.
+        "full_kv_acc": full_acc,
+        "icae_acc": icae_acc,
+        "stream_acc": icae_acc,
+        "acc_gap": full_acc - icae_acc,
+        "full_ce": mean_f,
+        "icae_ce": mean_i,
+        "stream_ce": mean_i,
+        "ce_gap": mean_i - mean_f,
+        "per_sample_mean_MSE": per_sample_mse,
+        "avg_full_flops": total_full_flops / n_queries,
+        "avg_icae_flops": total_icae_flops / n_queries,
+        "total_full_flops": total_full_flops,
+        "total_icae_flops": total_icae_flops,
+        "icae_demo_flops": icae_demo_flops,
+        "flops_reduction": flops_reduction,
+        "full_kv_peak_mem_bytes": full_kv_peak_mem_bytes,
+        "full_kv_peak_mem_gb": full_kv_peak_mem_bytes / (1024 ** 3),
+        "icae_demo_peak_mem_bytes": icae_demo_peak_mem_bytes,
+        "icae_demo_peak_mem_gb": icae_demo_peak_mem_bytes / (1024 ** 3),
+        "icae_query_peak_mem_bytes": icae_query_peak_mem_bytes,
+        "icae_query_peak_mem_gb": icae_query_peak_mem_bytes / (1024 ** 3),
+        "model_mem_bytes": model_mem_bytes,
+        "model_mem_gb": model_mem_gb,
+        "ds_results": ds_results,
+        # ICAE-specific fidelity metrics are retained as extras.
+        "logit_kl_icae_vs_full": mean_kl,
+        "logit_cosine_similarity": mean_cos,
+        "top1_agreement": mean_t1,
+        "top5_overlap": mean_t5,
+    }
 
     print(f"\n{'='*60}")
     print(f"  ICAE Baseline Eval  (k_mem={args.num_memory_slots}, "
@@ -953,6 +1149,7 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
     print(f"mean_CE_full_kv   = {mean_f:.6f}")
     print(f"mean_CE_icae      = {mean_i:.6f}")
     print(f"CE_gap            = {mean_i - mean_f:+.6f}")
+    print(f"per_sample_mean_MSE   = {per_sample_mse:.6f}")
     print(f"KL(ICAE||FullKV)  = {mean_kl:.6f}")
     print(f"Cosine sim        = {mean_cos:.6f}")
     print(f"Top-1 agreement   = {mean_t1:.6f}")
@@ -969,6 +1166,13 @@ def run_experiment(args, icae=None, model=None, tokenizer=None):
     print(f"total_icae_flops  = {total_icae_flops:.3e} ({n_queries} queries)")
     if total_icae_flops > 0:
         print(f"flops_reduction   = {flops_reduction:.4f}x")
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
 
 
 # =====================================================================
@@ -997,7 +1201,7 @@ if __name__ == "__main__":
     # ICAE architecture
     p.add_argument("--num_memory_slots", type=int, default=128,
                    help="k in the paper. 128 → 4x compression for 512-token context.")
-    p.add_argument("--lora_rank", type=int, default=128)
+    p.add_argument("--lora_rank", type=int, default=64)
 
     # Pretraining
     p.add_argument("--pretrain_epochs", type=int, default=1)
@@ -1008,13 +1212,13 @@ if __name__ == "__main__":
 
     # Fine-tuning
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--num_ft_triples", type=int, default=5000,
+    p.add_argument("--num_ft_triples", type=int, default=2000,
                    help="Number of (context, prompt, response) triples to generate.")
     p.add_argument("--train_batch_size", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=2.0)
-    p.add_argument("--max_steps", type=int, default=0)
+    p.add_argument("--max_steps", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--empty_cache_every", type=int, default=50)
 
@@ -1046,7 +1250,7 @@ if __name__ == "__main__":
 
     elif args.run_mode == "finetune_eval":
         tok = _setup_tokenizer(args.model_name)
-        model = _load_causal_lm(args, args.device)
+        model = _load_causal_lm(args, _resolve_runtime_device(args.device))
         _freeze(model)
         icae, _ = run_finetune(args, model=model, tokenizer=tok)
         run_experiment(args, icae=icae, model=model, tokenizer=tok)
