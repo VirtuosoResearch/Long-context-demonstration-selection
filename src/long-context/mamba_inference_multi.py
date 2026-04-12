@@ -497,39 +497,72 @@ def _student_virtual_kv(model, sidecar, demo_ids):
 
 
 @torch.no_grad()
-def _teacher_qa_logits_nocache(model, demo_ids, q_ids, ans_ids):
+def _teacher_qa_forward(model, demo_ids, q_ids, ans_ids, output_hidden=False):
     """
-    Teacher logits on answer tokens via a single concatenated forward pass.
-    No KV cache involved — immune to all DynamicCache version issues.
+    Teacher forward: single concatenated pass, returns logits on answer tokens.
+    If output_hidden=True, also returns last-layer hidden states on answer tokens.
     """
     all_ids = torch.cat([demo_ids, q_ids, ans_ids], dim=1)
-    out = model(input_ids=all_ids, use_cache=False)
-    demo_len = demo_ids.shape[1]
-    q_len = q_ids.shape[1]
+    out = model(input_ids=all_ids, use_cache=False, output_hidden_states=output_hidden)
+    start = demo_ids.shape[1] + q_ids.shape[1] - 1
     ans_len = ans_ids.shape[1]
-    start = demo_len + q_len - 1
-    return out.logits[:, start:start + ans_len, :]
+    logits = out.logits[:, start:start + ans_len, :]
+    if output_hidden:
+        last_hidden = out.hidden_states[-1][:, start:start + ans_len, :]
+        return logits, last_hidden
+    return logits, None
 
 
-def _student_qa_logits(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
-                       align_true_positions, q_ids, ans_ids):
+def _student_qa_forward(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
+                        align_true_positions, q_ids, ans_ids, output_hidden=False):
+    """
+    Student forward with virtual KV cache. Returns logits on answer tokens.
+    If output_hidden=True, also returns last-layer hidden states on answer tokens.
+    """
     cache = _build_cache_from_kv_list(virtual_kv_list, sink_kv=sink_kv)
     pos_q_start = true_demo_len if align_true_positions else demo_len
     attn_q = torch.ones(1, demo_len + q_ids.shape[1], dtype=torch.long, device=q_ids.device)
     out_q = model(input_ids=q_ids, past_key_values=cache, attention_mask=attn_q,
                   position_ids=_pos_ids(pos_q_start, q_ids.shape[1], q_ids.device),
-                  use_cache=True)
-    first = out_q.logits[:, -1:]
+                  use_cache=True, output_hidden_states=False)
+    first_logit = out_q.logits[:, -1:]
     base = demo_len + q_ids.shape[1]
     pos_a_start = pos_q_start + q_ids.shape[1]
     attn_a = torch.ones(1, base + ans_ids.shape[1], dtype=torch.long, device=q_ids.device)
     out_a = model(input_ids=ans_ids, past_key_values=out_q.past_key_values,
                   attention_mask=attn_a,
                   position_ids=_pos_ids(pos_a_start, ans_ids.shape[1], q_ids.device),
-                  use_cache=False)
+                  use_cache=False, output_hidden_states=output_hidden)
     if ans_ids.shape[1] == 1:
-        return first
-    return torch.cat([first, out_a.logits[:, :-1]], dim=1)
+        logits = first_logit
+    else:
+        logits = torch.cat([first_logit, out_a.logits[:, :-1]], dim=1)
+    if output_hidden:
+        return logits, out_a.hidden_states[-1]
+    return logits, None
+
+
+@torch.no_grad()
+def _teacher_qa_logits_nocache(model, demo_ids, q_ids, ans_ids):
+    logits, _ = _teacher_qa_forward(model, demo_ids, q_ids, ans_ids, output_hidden=False)
+    return logits
+
+
+def _student_qa_logits(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
+                       align_true_positions, q_ids, ans_ids):
+    logits, _ = _student_qa_forward(model, virtual_kv_list, sink_kv, demo_len,
+                                    true_demo_len, align_true_positions, q_ids, ans_ids,
+                                    output_hidden=False)
+    return logits
+
+
+def hidden_state_loss(student_hidden, teacher_hidden):
+    min_t = min(student_hidden.size(1), teacher_hidden.size(1))
+    if min_t == 0:
+        return torch.tensor(0.0, device=student_hidden.device)
+    sh = student_hidden[:, :min_t, :].reshape(-1, student_hidden.size(-1))
+    th = teacher_hidden[:, :min_t, :].reshape(-1, teacher_hidden.size(-1))
+    return (1.0 - F.cosine_similarity(sh, th, dim=-1)).mean()
 
 
 def _strip_leading_format_tokens(ans_ids, tokenizer):
@@ -604,12 +637,20 @@ def run_distillation_training(args):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
     rng = random.Random(args.seed)
     step = 0
-    running = {"loss": 0.0, "kv": 0.0, "logit": 0.0}
+    running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "hid": 0.0, "ce": 0.0}
     qa_batch_size = max(1, args.train_batch_size)
+    use_kv = args.loss_w_kv > 0
+    use_logit = args.loss_w_logit > 0
+    use_hid = args.loss_w_hid > 0
+    use_ce = args.loss_w_ce > 0
+    need_qa = use_logit or use_hid or use_ce
 
     print(f"\n===== Training: epochs={args.epochs}, demo_sets={len(demo_texts)}, "
           f"ssm_dim={args.ssm_dim}, groups={args.num_groups}, "
-          f"vtokens={args.num_virtual_tokens}, sink={args.sink_tokens} =====\n")
+          f"vtokens={args.num_virtual_tokens}, sink={args.sink_tokens}")
+    print(f"  loss weights: kv={args.loss_w_kv}, logit={args.loss_w_logit}, "
+          f"hid={args.loss_w_hid}, ce={args.loss_w_ce}")
+    print()
 
     for epoch in range(args.epochs):
         order = list(range(len(demo_texts)))
@@ -622,7 +663,6 @@ def run_distillation_training(args):
                 continue
             true_demo_len = demo_ids.shape[1]
 
-            teacher_kv = _teacher_demo_kv(model, demo_ids)
             virtual_kv = _student_virtual_kv(model, sidecar, demo_ids)
 
             sink_kv = None
@@ -632,11 +672,16 @@ def run_distillation_training(args):
                     sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
             demo_len = st + sidecar.num_virtual_tokens
 
-            loss_kv = kv_matching_loss(virtual_kv, teacher_kv, sidecar.num_virtual_tokens,
-                                       loss_type=args.kv_loss_type)
+            loss_kv = torch.tensor(0.0, device=device)
+            if use_kv:
+                teacher_kv = _teacher_demo_kv(model, demo_ids)
+                loss_kv = kv_matching_loss(virtual_kv, teacher_kv, sidecar.num_virtual_tokens,
+                                           loss_type=args.kv_loss_type)
 
             loss_logit = torch.tensor(0.0, device=device)
-            if args.loss_w_logit > 0:
+            loss_hid = torch.tensor(0.0, device=device)
+            loss_ce = torch.tensor(0.0, device=device)
+            if need_qa:
                 qa_indices = rng.sample(range(len(train_data)), min(qa_batch_size, len(train_data)))
                 valid = 0
                 for qi in qa_indices:
@@ -650,27 +695,46 @@ def run_distillation_training(args):
                         continue
 
                     with torch.no_grad():
-                        t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                    s_logits = _student_qa_logits(
-                        model, virtual_kv, sink_kv, demo_len, true_demo_len, align, q_ids, a_ids,
-                    )
-                    temp = args.kd_temperature
-                    kl = F.kl_div(
-                        F.log_softmax(s_logits / temp, dim=-1),
-                        F.softmax(t_logits.detach() / temp, dim=-1),
-                        reduction="batchmean",
-                    ) * (temp ** 2)
-                    ce = F.cross_entropy(
-                        s_logits.reshape(-1, s_logits.size(-1)),
-                        a_ids.reshape(-1),
-                        reduction="mean",
-                    )
-                    loss_logit = loss_logit + kl + 0.5 * ce
+                        t_logits, t_hidden = _teacher_qa_forward(
+                            model, demo_ids, q_ids, a_ids, output_hidden=use_hid)
+                    s_logits, s_hidden = _student_qa_forward(
+                        model, virtual_kv, sink_kv, demo_len, true_demo_len,
+                        align, q_ids, a_ids, output_hidden=use_hid)
+
+                    if use_logit:
+                        temp = args.kd_temperature
+                        kl = F.kl_div(
+                            F.log_softmax(s_logits / temp, dim=-1),
+                            F.softmax(t_logits.detach() / temp, dim=-1),
+                            reduction="batchmean",
+                        ) * (temp ** 2)
+                        loss_logit = loss_logit + kl
+
+                    if use_hid and s_hidden is not None and t_hidden is not None:
+                        loss_hid = loss_hid + hidden_state_loss(s_hidden, t_hidden.detach())
+
+                    if use_ce:
+                        a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
+                        if a_stripped.numel() > 0:
+                            s_logits_stripped = s_logits[:, n_stripped:, :]
+                            min_t = min(s_logits_stripped.size(1), a_stripped.size(1))
+                            if min_t > 0:
+                                ce = F.cross_entropy(
+                                    s_logits_stripped[:, :min_t, :].reshape(-1, s_logits_stripped.size(-1)),
+                                    a_stripped[:, :min_t].reshape(-1),
+                                    reduction="mean",
+                                )
+                                loss_ce = loss_ce + ce
                     valid += 1
                 if valid > 0:
                     loss_logit = loss_logit / valid
+                    loss_hid = loss_hid / valid
+                    loss_ce = loss_ce / valid
 
-            loss = args.loss_w_kv * loss_kv + args.loss_w_logit * loss_logit
+            loss = (args.loss_w_kv * loss_kv
+                    + args.loss_w_logit * loss_logit
+                    + args.loss_w_hid * loss_hid
+                    + args.loss_w_ce * loss_ce)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -680,18 +744,21 @@ def run_distillation_training(args):
 
             step += 1
             running["loss"] += loss.item()
-            running["kv"] += loss_kv.item()
+            running["kv"] += (loss_kv.item() if isinstance(loss_kv, torch.Tensor) else loss_kv)
             running["logit"] += (loss_logit.item() if isinstance(loss_logit, torch.Tensor) else loss_logit)
+            running["hid"] += (loss_hid.item() if isinstance(loss_hid, torch.Tensor) else loss_hid)
+            running["ce"] += (loss_ce.item() if isinstance(loss_ce, torch.Tensor) else loss_ce)
 
             if step % args.log_every == 0:
                 d = float(args.log_every)
                 print(f"step={step} loss={running['loss']/d:.4f} "
                       f"kv={running['kv']/d:.4f} logit={running['logit']/d:.4f} "
+                      f"hid={running['hid']/d:.4f} ce={running['ce']/d:.4f} "
                       f"lr={scheduler.get_last_lr()[0]:.6f}")
-                running = {"loss": 0.0, "kv": 0.0, "logit": 0.0}
+                running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "hid": 0.0, "ce": 0.0}
 
             # Drop large per-step tensor references early; no effect on numerics.
-            del teacher_kv, virtual_kv, sink_kv, demo_ids, loss, loss_kv, loss_logit
+            del virtual_kv, sink_kv, demo_ids, loss, loss_kv, loss_logit, loss_hid, loss_ce
             if device.startswith("cuda") and args.empty_cache_every > 0 and (step % args.empty_cache_every == 0):
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -736,6 +803,7 @@ def run_experiment(args, sidecar_state_dict=None):
     ).to(device=device, dtype=model.get_input_embeddings().weight.dtype)
     _load_sidecar(sidecar, args, device, sidecar_state_dict)
     sidecar.eval()
+    flop_params = _get_model_flop_params(model) if args.flops else None
 
     rng_eval = random.Random(args.seed + 7777)
 
@@ -744,6 +812,9 @@ def run_experiment(args, sidecar_state_dict=None):
     logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
     query_logit_mses = []
     ds_results = {}  # ds -> {"full_p":[], "ssm_p":[], "gt":[]}
+    full_kv_total_flops = 0.0
+    ssm_demo_flops = 0.0
+    ssm_query_total_flops = 0.0
 
     if per_query_random:
         print(f"\nPer-query random demos (k={args.k}) from {len(retrieval_data)} candidates.")
@@ -773,6 +844,8 @@ def run_experiment(args, sidecar_state_dict=None):
                              add_special_tokens=False)["input_ids"].to(device)
         original_demo_len = demo_ids.shape[1]
         opts = dp["options"]
+        q_full_kv_flops = 0.0
+        q_ssm_flops = 0.0
 
         # ─── Full-KV: concatenated forward ───
         opt_scores = {}
@@ -783,6 +856,9 @@ def run_experiment(args, sidecar_state_dict=None):
             if opt_ids.numel() == 0:
                 opt_scores[opt] = float("inf")
                 continue
+            if args.flops:
+                total_len = original_demo_len + q_ids.shape[1] + opt_ids.shape[1]
+                q_full_kv_flops += _analytical_flops_full(flop_params, total_len)
             with torch.no_grad():
                 all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
                 out = model(input_ids=all_ids, use_cache=False)
@@ -829,9 +905,25 @@ def run_experiment(args, sidecar_state_dict=None):
         scorer.true_demo_len = original_demo_len
 
         first, q_past, q_len = scorer.prefill_question(q_text)
+        if args.flops:
+            q_ssm_flops += _analytical_flops_inc(flop_params, q_len, ssm_demo_len)
         opt_texts = [_normalize_option(o, add_nl) for o in opts]
         scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
         scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
+        if args.flops:
+            for opt_text in opt_texts:
+                opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
+                q_ssm_flops += _analytical_flops_inc(
+                    flop_params, opt_len, ssm_demo_len + q_len
+                )
+            if per_query_random:
+                ssm_demo_flops += _sidecar_analytical_flops(sidecar, original_demo_len)
+                if st > 0:
+                    ssm_demo_flops += _analytical_flops_full(flop_params, st)
+            elif len(ssm_preds) == 0:
+                ssm_demo_flops = _sidecar_analytical_flops(sidecar, original_demo_len)
+                if st > 0:
+                    ssm_demo_flops += _analytical_flops_full(flop_params, st)
         ssm_preds.append(min(scores, key=scores.get))
 
         # SSM CE
@@ -892,6 +984,9 @@ def run_experiment(args, sidecar_state_dict=None):
         ds_results[ds]["full_p"].append(full_kv_preds[-1])
         ds_results[ds]["ssm_p"].append(ssm_preds[-1])
         ds_results[ds]["gt"].append(dp["output"])
+        if args.flops:
+            full_kv_total_flops += q_full_kv_flops
+            ssm_query_total_flops += q_ssm_flops
 
     # ─── Aggregate ───
     full_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
@@ -912,6 +1007,9 @@ def run_experiment(args, sidecar_state_dict=None):
     per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
     d_means = max(mean_ssm_ce, mean_full_ce)
     mean_sq_loss = ((mean_ssm_ce - mean_full_ce) / d_means) ** 2 if d_means > 0 else 0.0
+    total_full_flops = full_kv_total_flops
+    total_ssm_flops = ssm_demo_flops + ssm_query_total_flops
+    flops_reduction = (total_full_flops / total_ssm_flops) if total_ssm_flops > 0 else 0.0
 
     mode_str = "per-query random" if per_query_random else "fixed"
     print(f"\n{'='*60}")
@@ -946,6 +1044,12 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"CE_gap (ssm-full)   = {mean_ssm_ce - mean_full_ce:+.6f}")
     print(f"mean_norm_sq_loss   = {mean_sq_loss:.6f}")
     print(f"per_sample_mean_MSE = {per_sample_mse:.6f}")
+    if args.flops:
+        n_queries = max(1, len(eval_data))
+        print(f"total_full_flops    = {total_full_flops:.3e} ({n_queries} queries)")
+        print(f"total_ssm_flops     = {total_ssm_flops:.3e} ({n_queries} queries)")
+        if total_ssm_flops > 0:
+            print(f"flops_reduction     = {flops_reduction:.4f}x")
 
 
 # =====================================================================
@@ -1095,6 +1199,108 @@ def _attn_proxy_inc(ctx, new):
     return new * ctx + new * (new + 1) // 2
 
 
+def _get_model_flop_params(model):
+    cfg = model.config
+    hidden = getattr(cfg, "hidden_size", 0)
+    num_layers = getattr(cfg, "num_hidden_layers", 0)
+    num_q_heads = getattr(cfg, "num_attention_heads", 0)
+    num_kv_heads = getattr(cfg, "num_key_value_heads", num_q_heads)
+    head_dim = hidden // max(1, num_q_heads)
+    intermediate = getattr(cfg, "intermediate_size", 4 * hidden)
+    vocab_size = getattr(cfg, "vocab_size", 0)
+
+    model_type = getattr(cfg, "model_type", "").lower()
+    gated_mlp_types = {
+        "llama", "qwen", "qwen2", "mistral", "gemma", "phi3", "deepseek",
+        "yi", "internlm", "internlm2", "baichuan", "cohere", "starcoder2",
+    }
+    is_gated_mlp = any(t in model_type for t in gated_mlp_types)
+
+    return {
+        "hidden": hidden,
+        "num_layers": num_layers,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "intermediate": intermediate,
+        "vocab_size": vocab_size,
+        "is_gated_mlp": is_gated_mlp,
+    }
+
+
+def _analytical_flops(fp, new_tokens, ctx_tokens=0):
+    h = fp["hidden"]
+    l = fp["num_layers"]
+    nq = fp["num_q_heads"]
+    nkv = fp["num_kv_heads"]
+    hd = fp["head_dim"]
+    inter = fp["intermediate"]
+    vocab = fp["vocab_size"]
+    n = new_tokens
+
+    if n == 0:
+        return 0.0
+
+    if ctx_tokens == 0:
+        attn_pairs = n * (n + 1) / 2.0
+    else:
+        attn_pairs = n * ctx_tokens + n * (n + 1) / 2.0
+
+    qkv_flops = 2.0 * n * h * (nq * hd + 2 * nkv * hd)
+    o_flops = 2.0 * n * h * h
+    attn_flops = 2.0 * 2.0 * nq * hd * attn_pairs
+    if fp["is_gated_mlp"]:
+        mlp_flops = 3.0 * 2.0 * n * h * inter
+    else:
+        mlp_flops = 2.0 * 2.0 * n * h * inter
+
+    per_layer = qkv_flops + o_flops + attn_flops + mlp_flops
+    total = l * per_layer
+    total += 2.0 * n * h * vocab
+    return total
+
+
+def _analytical_flops_full(fp, seq_len):
+    return _analytical_flops(fp, new_tokens=seq_len, ctx_tokens=0)
+
+
+def _analytical_flops_inc(fp, new_tokens, ctx_tokens):
+    return _analytical_flops(fp, new_tokens=new_tokens, ctx_tokens=ctx_tokens)
+
+
+def _sidecar_analytical_flops(sidecar, seq_len):
+    total = 0.0
+    t = seq_len
+
+    for group in sidecar.groups:
+        d = group.ssm_dim
+        hidden = sidecar.hidden_size
+        c = group.scan_chunk_size
+
+        total += 2.0 * t * hidden * d
+
+        pos = 0
+        while pos < t:
+            chunk_len = min(c, t - pos)
+            if chunk_len == 1:
+                total += 2.0 * d * d + d
+            else:
+                total += max(0, chunk_len - 2) * 2.0 * d * d * d
+                total += chunk_len * 2.0 * d * d
+                total += 2.0 * d * d * d
+                total += 2.0 * d * d
+            pos += chunk_len
+
+        inter = d * 4
+        per_layer_kv = 2 * group.num_kv_heads * group.num_virtual_tokens * group.head_dim
+        output_dim = group.num_layers_in_group * per_layer_kv
+        total += 2.0 * d * inter
+        total += 2.0 * inter * inter
+        total += 2.0 * inter * output_dim
+
+    return total
+
+
 def _load_sidecar(sidecar, args, device, state_dict=None):
     if state_dict is not None:
         # Filter out frozen buffers (A, eigenvalues, V, V_inv) that may differ
@@ -1133,6 +1339,8 @@ if __name__ == "__main__":
                    help=">1 enables per-query random demo sampling at eval time.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--is_quant", default=False, action="store_true")
+    p.add_argument("--flops", default=False, action="store_true",
+                   help="Enable analytical FLOPs accounting and print FLOPs reduction.")
     p.add_argument("--run_mode", type=str, default="eval",
                    choices=["eval", "train", "train_eval", "compare_loss", "train_compare_loss"])
 
@@ -1151,7 +1359,11 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--kd_temperature", type=float, default=2.0)
     p.add_argument("--loss_w_kv", type=float, default=1.0)
-    p.add_argument("--loss_w_logit", type=float, default=0.5)
+    p.add_argument("--loss_w_logit", type=float, default=0.0)
+    p.add_argument("--loss_w_hid", type=float, default=0.0,
+                   help="Weight for hidden-state matching loss (cosine distance on last layer).")
+    p.add_argument("--loss_w_ce", type=float, default=0.0,
+                   help="Weight for supervised cross-entropy loss on answer tokens.")
     p.add_argument("--kv_loss_type", type=str, default="cosine", choices=["cosine", "mse"])
     p.add_argument("--log_every", type=int, default=20)
 
