@@ -13,102 +13,65 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GPT2Tokenizer
 from transformers.cache_utils import DynamicCache
 
-from utils.data import load_data
-
 
 # =====================================================================
-# MMLU data loading
+# RULER data loading
 # =====================================================================
 
-MMLU_COLLEGE_SUBJECTS = [
-    "college_biology",
-    "college_chemistry",
-    "college_computer_science",
-    "college_mathematics",
-    "college_medicine",
-    "college_physics",
-]
-
-
-def _mmlu_answer_to_index(answer) -> int:
-    if isinstance(answer, int):
-        return answer
-    if isinstance(answer, str):
-        s = answer.strip().upper()
-        if s.isdigit():
-            return int(s)
-        if len(s) == 1 and "A" <= s <= "Z":
-            return ord(s) - ord("A")
-    raise ValueError(f"Unsupported MMLU answer format: {answer!r}")
-
-
-def _build_mmlu_college_data():
+def _load_ruler_data(args):
+    """
+    Load rbiswasfc/ruler dataset.
+      - Training: all 500 from qa_2_8k + first 391 from qa_2_4k
+      - Test:     last 109 from qa_2_4k
+    """
     from datasets import load_dataset
 
-    data = []
-    for subject in MMLU_COLLEGE_SUBJECTS:
-        ds = load_dataset("cais/mmlu", subject, split="test")
-        for ex in ds:
-            choices = list(ex["choices"])
-            ans_idx = _mmlu_answer_to_index(ex["answer"])
-            if ans_idx < 0 or ans_idx >= len(choices):
-                raise ValueError(
-                    f"Invalid answer index {ans_idx} for subject={subject} "
-                    f"with {len(choices)} choices."
-                )
-            data.append({
-                "input": ex["question"],
-                "output": choices[ans_idx],
-                "options": choices,
-                "task": subject,
-                "dataset": "mmlu",
-            })
-    return data
+    ds_8k = load_dataset("rbiswasfc/ruler", "qa_2_8k", split="validation")
+    ds_4k = load_dataset("rbiswasfc/ruler", "qa_2_4k", split="validation")
+    ds_4k_list = list(ds_4k)
+
+    train_data = []
+    for ex in ds_8k:
+        train_data.append({
+            "input": ex["input"],
+            "output": ex["outputs"][0] if ex["outputs"] else "",
+            "outputs": ex["outputs"],
+        })
+    for ex in ds_4k_list[:391]:
+        train_data.append({
+            "input": ex["input"],
+            "output": ex["outputs"][0] if ex["outputs"] else "",
+            "outputs": ex["outputs"],
+        })
+
+    test_data = []
+    for ex in ds_4k_list[391:]:
+        test_data.append({
+            "input": ex["input"],
+            "output": ex["outputs"][0] if ex["outputs"] else "",
+            "outputs": ex["outputs"],
+        })
+
+    print(f"[RULER] train={len(train_data)} (8k:{len(list(ds_8k))}+4k:{391}), "
+          f"test={len(test_data)}")
+    return train_data, test_data
 
 
-def load_mmlu_college_split(args, split):
-    cache_key = (
-        args.seed,
-        args.retrieval_split,
-        args.eval_split,
-    )
-    if not hasattr(load_mmlu_college_split, "_cache"):
-        load_mmlu_college_split._cache = {}
-    cache = load_mmlu_college_split._cache
-    if cache_key not in cache:
-        all_data = _build_mmlu_college_data()
-        rng = random.Random(args.seed)
-        rng.shuffle(all_data)
-
-        retrieval_size = int(len(all_data) * 5 / 6)
-        retrieval_size = min(max(1, retrieval_size), max(1, len(all_data) - 1))
-        retrieval_data = all_data[:retrieval_size]
-        eval_data = all_data[retrieval_size:]
-
-        cache[cache_key] = {
-            "all": all_data,
-            args.retrieval_split: retrieval_data,
-            args.eval_split: eval_data,
-        }
-
-        print(
-            f"[MMLU] merged college subsets: total={len(all_data)}, "
-            f"{args.retrieval_split}={len(retrieval_data)}, "
-            f"{args.eval_split}={len(eval_data)} (5:1 split)"
-        )
-
-    split_data = cache[cache_key].get(split, cache[cache_key]["all"])
-    return list(split_data)
-
-
-def _load_dataset(args, split):
-    if args.dataset.strip().lower() == "mmlu":
-        return load_mmlu_college_split(args, split)
-    # gsm8k and other datasets continue through the existing loader.
-    return load_data(
-        task=None, split=split, k=args.k,
-        seed=args.seed, datasets=args.dataset.split(","), is_null=False
-    )
+def _split_ruler_input(text):
+    """
+    Split ruler input into (prefix, query).
+      prefix: everything before the final "\\nQuestion:" — documents + instructions
+      query:  "\\nQuestion: ... \\nAnswer:" — the actual question to answer
+    """
+    marker = "\nQuestion:"
+    idx = text.rfind(marker)
+    if idx == -1:
+        # Fallback: no newline variant
+        marker = "Question:"
+        idx = text.rfind(marker)
+    if idx == -1:
+        return text, ""
+    return text[:idx], text[idx:]
 
 
 # =====================================================================
@@ -156,38 +119,18 @@ class LayerGroupSSM(nn.Module):
         )
 
     def _init_hippo_B(self, hidden_size, dt):
-        """
-        Initialize B with ZOH-discretized HiPPO-LegS scaling.
-
-        Continuous-time ODE:   dh/dt = A_c h + B_c x(t)
-        ZOH discretization:    h_t   = A_d h_{t-1} + B_d x_t
-
-        where:  A_d = exp(dt · A_c)                  (already computed as self.A)
-                B_d = A_c^{-1} (A_d - I) · B_c       (applied here)
-
-        We compute M = A_c^{-1}(A_d - I) in float64 for numerical stability,
-        then apply it to the weight matrix: B.weight ← M @ B.weight.
-        M is lower-triangular (since A_c is), well-conditioned (~10^3), and
-        computed only once at init.
-        """
+        """ZOH-discretized HiPPO-LegS B initialization: B_d = A_c^{-1}(A_d - I) · B_c."""
         with torch.no_grad():
-            # Step 1: random init + continuous-time HiPPO B scaling
             nn.init.normal_(self.B.weight, std=1.0 / math.sqrt(hidden_size))
             b = _hippo_legs_input_vector(self.ssm_dim, self.B.weight.device, self.B.weight.dtype)
             self.B.weight.mul_(b.unsqueeze(1))
-            # Now B.weight[n, :] ~ N(0, 1/√H) × √(2n+1)  — this is B_c
-
-            # Step 2: ZOH discretization  B_d = M @ B_c
-            # Compute M = A_c^{-1}(A_d - I) in float64
             A_c = _hippo_legs_matrix(self.ssm_dim, self.B.weight.device, torch.float64)
             A_d = torch.matrix_exp(dt * A_c)
             M = torch.linalg.solve(
                 A_c,
                 A_d - torch.eye(self.ssm_dim, device=A_c.device, dtype=torch.float64),
             )
-            # M: [D, D],  B.weight: [D, H]  →  B_d = M @ B_c_weight: [D, H]
             self.B.weight.copy_((M.to(self.B.weight.dtype)) @ self.B.weight)
-
             nn.init.zeros_(self.B.bias)
 
     def scan(self, x, chunk_size=None):
@@ -197,11 +140,9 @@ class LayerGroupSSM(nn.Module):
         device = x.device
         orig_dtype = x.dtype
         D = self.ssm_dim
-
         u_all = self.B(x).float()
         state = torch.zeros(bsz, D, device=device, dtype=torch.float32)
         A = self.A.to(device=device, dtype=torch.float32)
-
         for start in range(0, T, chunk_size):
             end = min(start + chunk_size, T)
             C = end - start
@@ -218,7 +159,6 @@ class LayerGroupSSM(nn.Module):
             total_contrib = torch.einsum('cdj,bcj->bd', weights, u_chunk)
             A_C = weights[0] @ A
             state = (state @ A_C.T) + total_contrib
-
         return state.to(orig_dtype)
 
     def forward(self, x):
@@ -231,17 +171,11 @@ class LayerGroupSSM(nn.Module):
 
 
 class LayerGroupSSMSidecar(nn.Module):
-    def __init__(self, config, ssm_dim=512, num_virtual_tokens=16, num_groups=4,
-                 dt=1.0, effective_num_kv_heads=None):
+    def __init__(self, config, ssm_dim=512, num_virtual_tokens=16, num_groups=4, dt=1.0):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
-        self.full_num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        if effective_num_kv_heads is None:
-            self.num_kv_heads = self.full_num_kv_heads
-        else:
-            # Keep sidecar output compact for quant runs while preserving full behavior otherwise.
-            self.num_kv_heads = max(1, min(self.full_num_kv_heads, int(effective_num_kv_heads)))
+        self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_virtual_tokens = num_virtual_tokens
         self.num_groups = num_groups
@@ -259,10 +193,8 @@ class LayerGroupSSMSidecar(nn.Module):
             for s, e in self.group_ranges
         ])
         info = ", ".join(f"G{g}:[{s},{e})" for g, (s, e) in enumerate(self.group_ranges))
-        print(
-            f"[Sidecar] {num_groups} groups, ssm_dim={ssm_dim}, vtokens={num_virtual_tokens}, "
-            f"kv_heads={self.num_kv_heads}/{self.full_num_kv_heads} | {info}"
-        )
+        print(f"[Sidecar] {num_groups} groups, ssm_dim={ssm_dim}, vtokens={num_virtual_tokens}, "
+              f"kv_heads={self.num_kv_heads} | {info}")
 
     def forward(self, embeddings):
         all_kv = []
@@ -290,51 +222,20 @@ def _cache_to_legacy(past):
     if hasattr(past, "to_legacy_cache"): return past.to_legacy_cache()
     return tuple(past)
 
-def _build_cache_from_kv_list(kv_list, sink_kv=None, target_dtype=None, expected_num_kv_heads=None):
+def _build_cache_from_kv_list(kv_list, sink_kv=None, target_dtype=None):
     cache = DynamicCache()
     sink_legacy = _cache_to_legacy(_ensure_cache_obj(sink_kv)) if sink_kv is not None else None
     for i, (vk, vv) in enumerate(kv_list):
         if target_dtype is not None:
             vk = vk.to(dtype=target_dtype)
             vv = vv.to(dtype=target_dtype)
-        # Ensure cache head shape matches what the backbone attention expects.
-        if expected_num_kv_heads is not None and expected_num_kv_heads > 0:
-            v_heads = vk.shape[1]
-            if v_heads != expected_num_kv_heads:
-                if expected_num_kv_heads > v_heads and (expected_num_kv_heads % v_heads == 0):
-                    rep = expected_num_kv_heads // v_heads
-                    vk = vk.repeat_interleave(rep, dim=1)
-                    vv = vv.repeat_interleave(rep, dim=1)
-                elif v_heads > expected_num_kv_heads and (v_heads % expected_num_kv_heads == 0):
-                    g = v_heads // expected_num_kv_heads
-                    vk = vk.view(vk.shape[0], expected_num_kv_heads, g, vk.shape[2], vk.shape[3]).mean(dim=2)
-                    vv = vv.view(vv.shape[0], expected_num_kv_heads, g, vv.shape[2], vv.shape[3]).mean(dim=2)
-                else:
-                    h = min(v_heads, expected_num_kv_heads)
-                    vk, vv = vk[:, :h], vv[:, :h]
         if sink_legacy is not None:
             sk, sv = sink_legacy[i]
             if target_dtype is not None:
                 sk = sk.to(dtype=target_dtype)
                 sv = sv.to(dtype=target_dtype)
-            # In quant mode we may cap sidecar KV heads (e.g. 4) while model sink KV
-            # keeps full heads (e.g. 8/32). Align sink heads to virtual heads before concat.
-            s_heads = sk.shape[1]
-            v_heads = vk.shape[1]
-            if s_heads != v_heads:
-                if s_heads > v_heads and (s_heads % v_heads == 0):
-                    g = s_heads // v_heads
-                    sk = sk.view(sk.shape[0], v_heads, g, sk.shape[2], sk.shape[3]).mean(dim=2)
-                    sv = sv.view(sv.shape[0], v_heads, g, sv.shape[2], sv.shape[3]).mean(dim=2)
-                elif v_heads > s_heads and (v_heads % s_heads == 0):
-                    rep = v_heads // s_heads
-                    sk = sk.repeat_interleave(rep, dim=1)
-                    sv = sv.repeat_interleave(rep, dim=1)
-                else:
-                    h = min(s_heads, v_heads)
-                    sk, sv = sk[:, :h], sv[:, :h]
-                    vk, vv = vk[:, :h], vv[:, :h]
-            k, v = torch.cat([sk, vk], dim=2), torch.cat([sv, vv], dim=2)
+            k = torch.cat([sk, vk], dim=2)
+            v = torch.cat([sv, vv], dim=2)
         else:
             k, v = vk, vv
         cache.update(k, v, i)
@@ -363,23 +264,6 @@ def kv_matching_loss(virtual_kv, teacher_kv, num_virtual_tokens, loss_type="cosi
     n_terms = 0
     for layer_idx, (vk, vv) in enumerate(virtual_kv):
         tk, tv = t_kv[layer_idx]
-        # When quant mode caps sidecar KV heads, student and teacher head counts can differ.
-        # Align teacher heads to student heads for a stable KV matching objective.
-        s_heads = vk.shape[1]
-        t_heads = tk.shape[1]
-        if s_heads != t_heads:
-            if t_heads > s_heads and (t_heads % s_heads == 0):
-                g = t_heads // s_heads
-                tk = tk.view(tk.shape[0], s_heads, g, tk.shape[2], tk.shape[3]).mean(dim=2)
-                tv = tv.view(tv.shape[0], s_heads, g, tv.shape[2], tv.shape[3]).mean(dim=2)
-            elif s_heads > t_heads and (s_heads % t_heads == 0):
-                g = s_heads // t_heads
-                vk = vk.view(vk.shape[0], t_heads, g, vk.shape[2], vk.shape[3]).mean(dim=2)
-                vv = vv.view(vv.shape[0], t_heads, g, vv.shape[2], vv.shape[3]).mean(dim=2)
-            else:
-                h = min(s_heads, t_heads)
-                vk, vv = vk[:, :h], vv[:, :h]
-                tk, tv = tk[:, :h], tv[:, :h]
         T_full = tk.shape[2]
         chunk = max(1, T_full // num_virtual_tokens)
         for vi in range(num_virtual_tokens):
@@ -402,176 +286,123 @@ def kv_matching_loss(virtual_kv, teacher_kv, num_virtual_tokens, loss_type="cosi
 
 
 # =====================================================================
-# Teacher / student forward with optional hidden states
+# Teacher / student forward
 # =====================================================================
 
 @torch.no_grad()
-def _teacher_qa_forward(model, demo_ids, q_ids, ans_ids, output_hidden=False):
-    """
-    Teacher forward: single concatenated pass, returns logits on answer tokens.
-    If output_hidden=True, also returns the last-layer hidden states on answer tokens.
-    """
-    all_ids = torch.cat([demo_ids, q_ids, ans_ids], dim=1)
-    out = model(input_ids=all_ids, use_cache=False, output_hidden_states=output_hidden)
-    start = demo_ids.shape[1] + q_ids.shape[1] - 1
-    ans_len = ans_ids.shape[1]
-    logits = out.logits[:, start:start + ans_len, :]
-    if output_hidden:
-        # last hidden layer, same positions as logits
-        last_hidden = out.hidden_states[-1][:, start:start + ans_len, :]
-        return logits, last_hidden
-    return logits, None
+def _teacher_qa_forward(model, prefix_ids, query_ids, ans_ids):
+    """Teacher: full concat forward, returns logits on answer tokens."""
+    all_ids = torch.cat([prefix_ids, query_ids, ans_ids], dim=1)
+    out = model(input_ids=all_ids, use_cache=False)
+    start = prefix_ids.shape[1] + query_ids.shape[1] - 1
+    return out.logits[:, start:start + ans_ids.shape[1], :]
 
 
-def _student_qa_forward(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
-                        align_true_positions, q_ids, ans_ids, output_hidden=False):
-    """
-    Student forward with virtual KV cache. Returns logits on answer tokens.
-    If output_hidden=True, also returns the last-layer hidden states on answer tokens.
-    """
+def _student_qa_forward(model, virtual_kv_list, sink_kv, demo_len, true_prefix_len,
+                        query_ids, ans_ids):
+    """Student: virtual KV + query + answer, returns logits on answer tokens."""
     model_kv_dtype = model.get_input_embeddings().weight.dtype
-    model_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-    cache = _build_cache_from_kv_list(
-        virtual_kv_list, sink_kv=sink_kv, target_dtype=model_kv_dtype,
-        expected_num_kv_heads=model_kv_heads
-    )
-    pos_q_start = true_demo_len if align_true_positions else demo_len
-    attn_q = torch.ones(1, demo_len + q_ids.shape[1], dtype=torch.long, device=q_ids.device)
-
-    out_q = model(input_ids=q_ids, past_key_values=cache, attention_mask=attn_q,
-                  position_ids=_pos_ids(pos_q_start, q_ids.shape[1], q_ids.device),
-                  use_cache=True, output_hidden_states=False)
+    cache = _build_cache_from_kv_list(virtual_kv_list, sink_kv=sink_kv,
+                                      target_dtype=model_kv_dtype)
+    # Query forward
+    attn_q = torch.ones(1, demo_len + query_ids.shape[1], dtype=torch.long, device=query_ids.device)
+    out_q = model(input_ids=query_ids, past_key_values=cache, attention_mask=attn_q,
+                  position_ids=_pos_ids(true_prefix_len, query_ids.shape[1], query_ids.device),
+                  use_cache=True)
     first_logit = out_q.logits[:, -1:]
 
-    base = demo_len + q_ids.shape[1]
-    pos_a_start = pos_q_start + q_ids.shape[1]
-    attn_a = torch.ones(1, base + ans_ids.shape[1], dtype=torch.long, device=q_ids.device)
-
+    # Answer forward
+    base = demo_len + query_ids.shape[1]
+    attn_a = torch.ones(1, base + ans_ids.shape[1], dtype=torch.long, device=query_ids.device)
     out_a = model(input_ids=ans_ids, past_key_values=out_q.past_key_values,
                   attention_mask=attn_a,
-                  position_ids=_pos_ids(pos_a_start, ans_ids.shape[1], q_ids.device),
-                  use_cache=False, output_hidden_states=output_hidden)
-
+                  position_ids=_pos_ids(true_prefix_len + query_ids.shape[1],
+                                        ans_ids.shape[1], query_ids.device),
+                  use_cache=False)
     if ans_ids.shape[1] == 1:
-        logits = first_logit
-    else:
-        logits = torch.cat([first_logit, out_a.logits[:, :-1]], dim=1)
-
-    if output_hidden:
-        last_hidden = out_a.hidden_states[-1]  # [1, ans_len, H]
-        return logits, last_hidden
-    return logits, None
+        return first_logit
+    return torch.cat([first_logit, out_a.logits[:, :-1]], dim=1)
 
 
-# Legacy wrappers for eval code that doesn't need hidden states
+# =====================================================================
+# Generation with compressed KV
+# =====================================================================
+
 @torch.no_grad()
-def _teacher_qa_logits_nocache(model, demo_ids, q_ids, ans_ids):
-    logits, _ = _teacher_qa_forward(model, demo_ids, q_ids, ans_ids, output_hidden=False)
-    return logits
+def _generate_with_virtual_kv(model, tokenizer, virtual_kv_list, sink_kv,
+                               demo_len, true_prefix_len, query_ids,
+                               max_new_tokens=64):
+    """Generate answer tokens autoregressively using compressed prefix."""
+    device = query_ids.device
+    model_kv_dtype = model.get_input_embeddings().weight.dtype
+    cache = _build_cache_from_kv_list(virtual_kv_list, sink_kv=sink_kv,
+                                      target_dtype=model_kv_dtype)
 
-def _student_qa_logits(model, virtual_kv_list, sink_kv, demo_len, true_demo_len,
-                       align_true_positions, q_ids, ans_ids):
-    logits, _ = _student_qa_forward(model, virtual_kv_list, sink_kv, demo_len,
-                                     true_demo_len, align_true_positions, q_ids, ans_ids,
-                                     output_hidden=False)
-    return logits
+    # Prefill with query
+    attn = torch.ones(1, demo_len + query_ids.shape[1], dtype=torch.long, device=device)
+    out = model(input_ids=query_ids, past_key_values=cache, attention_mask=attn,
+                position_ids=_pos_ids(true_prefix_len, query_ids.shape[1], device),
+                use_cache=True)
+    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    generated = [next_token]
+    past = out.past_key_values
+    cur_len = demo_len + query_ids.shape[1]
+
+    for _ in range(max_new_tokens - 1):
+        cur_len += 1
+        attn = torch.ones(1, cur_len, dtype=torch.long, device=device)
+        pos = _pos_ids(true_prefix_len + query_ids.shape[1] + len(generated) - 1, 1, device)
+        out = model(input_ids=next_token, past_key_values=past, attention_mask=attn,
+                    position_ids=pos, use_cache=True)
+        past = out.past_key_values
+        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+        generated.append(next_token)
+
+    token_ids = torch.cat(generated, dim=-1)
+    return tokenizer.decode(token_ids[0], skip_special_tokens=True).strip()
+
+
+@torch.no_grad()
+def _generate_full_kv(model, tokenizer, full_ids, max_new_tokens=64):
+    """Generate answer tokens with full KV (teacher baseline)."""
+    device = full_ids.device
+    out = model(input_ids=full_ids, use_cache=True)
+    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    generated = [next_token]
+    past = out.past_key_values
+    cur_len = full_ids.shape[1]
+
+    for _ in range(max_new_tokens - 1):
+        cur_len += 1
+        attn = torch.ones(1, cur_len, dtype=torch.long, device=device)
+        out = model(input_ids=next_token, past_key_values=past, attention_mask=attn,
+                    use_cache=True)
+        past = out.past_key_values
+        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+        generated.append(next_token)
+
+    token_ids = torch.cat(generated, dim=-1)
+    return tokenizer.decode(token_ids[0], skip_special_tokens=True).strip()
 
 
 # =====================================================================
-# Hidden-state matching loss
+# Evaluation metric
 # =====================================================================
 
-def hidden_state_loss(student_hidden, teacher_hidden):
+def _ruler_score(prediction, ground_truths):
     """
-    Cosine distance between student and teacher hidden states (last layer).
-    Both are [1, T, H] tensors.
+    Check if prediction contains any of the ground truth answers (case-insensitive).
+    This is the standard RULER evaluation: check if the answer string appears in the output.
     """
-    min_t = min(student_hidden.size(1), teacher_hidden.size(1))
-    if min_t == 0:
-        return torch.tensor(0.0, device=student_hidden.device)
-    sh = student_hidden[:, :min_t, :].reshape(-1, student_hidden.size(-1))
-    th = teacher_hidden[:, :min_t, :].reshape(-1, teacher_hidden.size(-1))
-    return (1.0 - F.cosine_similarity(sh, th, dim=-1)).mean()
-
-
-# =====================================================================
-# Scorer (eval only)
-# =====================================================================
-
-class SSMHybridICLScorer:
-    def __init__(self, model, tokenizer, device, sidecar, sink_tokens=0,
-                 align_true_positions=False):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.sidecar_dtype = next(sidecar.parameters()).dtype
-        self.sidecar = sidecar
-        self.sink_tokens = max(0, sink_tokens)
-        self.align_true_positions = align_true_positions
-        self.demo_cache = None
-        self.demo_len = 0
-        self.true_demo_len = 0
-
-    @torch.no_grad()
-    def build_demo_cache(self, demo_text):
-        ids = self.tokenizer(demo_text, return_tensors="pt",
-                             add_special_tokens=False)["input_ids"].to(self.device)
-        if ids.numel() == 0: raise ValueError("Empty demo text.")
-        self.true_demo_len = ids.shape[1]
-        emb = self.model.get_input_embeddings()(ids).to(dtype=self.sidecar_dtype)
-        virtual_kv = self.sidecar(emb)
-        sink_kv = None
-        st = min(self.sink_tokens, ids.shape[1])
-        if st > 0:
-            sink_kv = self.model(input_ids=ids[:, :st], use_cache=True).past_key_values
-        model_kv_dtype = self.model.get_input_embeddings().weight.dtype
-        model_kv_heads = getattr(self.model.config, "num_key_value_heads", self.model.config.num_attention_heads)
-        self.demo_cache = _build_cache_from_kv_list(
-            virtual_kv, sink_kv=sink_kv, target_dtype=model_kv_dtype,
-            expected_num_kv_heads=model_kv_heads
-        )
-        self.demo_len = st + self.sidecar.num_virtual_tokens
-
-    @torch.no_grad()
-    def prefill_question(self, question_text):
-        q_ids = self.tokenizer(question_text, return_tensors="pt",
-                               add_special_tokens=False)["input_ids"].to(self.device)
-        if q_ids.numel() == 0: raise ValueError("Empty question.")
-        cache = _fresh_cache_copy(self.demo_cache)
-        attn = torch.ones(1, self.demo_len + q_ids.shape[1], dtype=torch.long, device=self.device)
-        pos_start = self.true_demo_len if self.align_true_positions else self.demo_len
-        out = self.model(input_ids=q_ids, past_key_values=cache, attention_mask=attn,
-                         position_ids=_pos_ids(pos_start, q_ids.shape[1], self.device), use_cache=True)
-        return out.logits[:, -1, :], out.past_key_values, q_ids.shape[1]
-
-    @torch.no_grad()
-    def score_options_nll(self, first_logits, past_after_q, q_len, options):
-        tokenized = [self.tokenizer(o, add_special_tokens=False)["input_ids"] for o in options]
-        lengths = [len(t) for t in tokenized]
-        if any(l == 0 for l in lengths): raise ValueError("Empty option.")
-        bsz = len(options)
-        mx = max(lengths)
-        ids = torch.full((bsz, mx), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device)
-        mask = torch.zeros(bsz, mx, device=self.device)
-        for i, t in enumerate(tokenized):
-            ids[i, :len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
-            mask[i, :len(t)] = 1.0
-        bp = copy.deepcopy(_ensure_cache_obj(past_after_q))
-        bp.batch_repeat_interleave(bsz)
-        base = self.demo_len + q_len
-        attn = torch.ones(bsz, base + mx, dtype=torch.long, device=self.device)
-        opt_pos_start = (self.true_demo_len + q_len) if self.align_true_positions else base
-        pos = _pos_ids(opt_pos_start, mx, self.device, bsz)
-        for i, l in enumerate(lengths):
-            if l < mx: attn[i, base + l:] = 0
-        out = self.model(input_ids=ids, past_key_values=bp, attention_mask=attn,
-                         position_ids=pos, use_cache=False)
-        first = first_logits.expand(bsz, -1).unsqueeze(1)
-        pred = torch.cat([first, out.logits[:, :-1]], dim=1) if mx > 1 else first
-        losses = F.cross_entropy(pred.reshape(-1, pred.size(-1)), ids.reshape(-1),
-                                 reduction="none").view(bsz, mx)
-        nll = (losses * mask).sum(1)
-        return {o: float(nll[i]) for i, o in enumerate(options)}
+    pred_lower = prediction.lower().strip()
+    for gt in ground_truths:
+        if gt.lower().strip() in pred_lower:
+            return 1.0
+    return 0.0
 
 
 # =====================================================================
@@ -587,7 +418,7 @@ def _freeze(model):
 def _load_causal_lm(args, device):
     if args.is_quant:
         if not torch.cuda.is_available():
-            raise RuntimeError("--is_quant requires CUDA (bitsandbytes 4-bit).")
+            raise RuntimeError("--is_quant requires CUDA.")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
@@ -595,49 +426,39 @@ def _load_causal_lm(args, device):
             bnb_4bit_quant_type="nf4",
         )
         return AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.float16,
+            args.model_name, quantization_config=bnb_config,
+            device_map="auto", torch_dtype=torch.float16,
         )
     return AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
 
 
-def _resolve_sidecar_kv_heads(args, model_config):
-    full_heads = getattr(model_config, "num_key_value_heads", model_config.num_attention_heads)
-    # IMPORTANT: only activate this compression path for quantized runs.
-    if args.is_quant and args.quant_sidecar_kv_heads > 0:
-        return min(full_heads, int(args.quant_sidecar_kv_heads))
-    return full_heads
+def _setup_tokenizer(name):
+    tok = (GPT2Tokenizer.from_pretrained(name) if name.startswith("gpt2")
+           else AutoTokenizer.from_pretrained(name))
+    if tok.padding_side == "left": tok.padding_side = "right"
+    if tok.eos_token_id is None and tok.sep_token is not None:
+        tok.eos_token = tok.sep_token
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    if tok.bos_token_id is None: tok.bos_token = tok.eos_token
+    return tok
 
-def _generate_diverse_demo_texts(retrieval_data, k, num_sets, seed, add_newlines):
-    rng = random.Random(seed)
-    n = len(retrieval_data)
-    texts = []
-    for _ in range(num_sets):
-        indices = rng.sample(range(n), min(k, n))
-        demos = [retrieval_data[i] for i in indices]
-        texts.append(_build_demo_text(demos, add_newlines))
-    return texts
 
-def _teacher_demo_kv(model, demo_ids):
-    with torch.no_grad():
-        return _cache_to_legacy(model(input_ids=demo_ids, use_cache=True).past_key_values)
-
-def _student_virtual_kv(model, sidecar, demo_ids):
-    emb = model.get_input_embeddings()(demo_ids)
-    return sidecar(emb.float())
-
-def _strip_leading_format_tokens(ans_ids, tokenizer):
-    strip_tokens = set()
-    for ch in ["\n", " ", "\t"]:
-        strip_tokens.update(tokenizer(ch, add_special_tokens=False)["input_ids"])
-    idx = 0
-    while idx < ans_ids.shape[1] and ans_ids[0, idx].item() in strip_tokens:
-        idx += 1
-    if idx >= ans_ids.shape[1]:
-        return ans_ids, 0
-    return ans_ids[:, idx:], idx
+def _load_sidecar(sidecar, args, device, state_dict=None):
+    _FROZEN = ('.A', '.A_powers', '.eigenvalues', '.V', '.V_inv')
+    if state_dict is not None:
+        filtered = {k: v for k, v in state_dict.items()
+                    if not any(k.endswith(s) for s in _FROZEN)}
+        sidecar.load_state_dict(filtered, strict=False)
+        print("Loaded sidecar from in-memory state.")
+    elif args.load_sidecar_path:
+        ckpt = torch.load(args.load_sidecar_path, map_location=device)
+        st = ckpt["sidecar"] if isinstance(ckpt, dict) and "sidecar" in ckpt else ckpt
+        filtered = {k: v for k, v in st.items()
+                    if not any(k.endswith(s) for s in _FROZEN)}
+        sidecar.load_state_dict(filtered, strict=False)
+        print(f"Loaded sidecar from: {args.load_sidecar_path}")
+    else:
+        print("WARN: No sidecar checkpoint.")
 
 
 # =====================================================================
@@ -650,25 +471,13 @@ def run_distillation_training(args):
     model = _load_causal_lm(args, device)
     _freeze(model)
 
-    align = args.align_true_positions
-    if align and getattr(model.config, "model_type", "") == "qwen2":
-        print("WARN: align_true_positions disabled for Qwen2.")
-        align = False
-
-    add_nl = not args.model_name.startswith("gpt2")
-    retrieval_data = _load_dataset(args, args.retrieval_split)
-    train_data = _load_dataset(args, args.train_split)
-    if not retrieval_data or not train_data:
-        raise ValueError("Empty data.")
-
-    demo_texts = _generate_diverse_demo_texts(
-        retrieval_data, args.k, args.num_demo_sets, args.seed, add_nl)
-    print(f"Generated {len(demo_texts)} diverse demo texts (k={args.k}).")
+    train_data, _ = _load_ruler_data(args)
+    if not train_data:
+        raise ValueError("Empty training data.")
 
     sidecar = LayerGroupSSMSidecar(
         model.config, ssm_dim=args.ssm_dim, num_virtual_tokens=args.num_virtual_tokens,
         num_groups=args.num_groups, dt=args.dt,
-        effective_num_kv_heads=_resolve_sidecar_kv_heads(args, model.config),
     ).to(device=device, dtype=torch.float32)
 
     if args.load_sidecar_path:
@@ -677,7 +486,7 @@ def run_distillation_training(args):
 
     optimizer = torch.optim.AdamW(sidecar.parameters(), lr=args.learning_rate,
                                   weight_decay=args.weight_decay)
-    total_steps = args.epochs * len(demo_texts)
+    total_steps = args.epochs * len(train_data)
     warmup = min(100, total_steps // 10)
     def lr_fn(step):
         if step < warmup: return step / max(1, warmup)
@@ -686,113 +495,91 @@ def run_distillation_training(args):
 
     rng = random.Random(args.seed)
     step = 0
-    running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "hid": 0.0, "ce": 0.0}
-    qa_batch_size = max(1, args.train_batch_size)
+    running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "ce": 0.0}
 
     use_kv = args.loss_w_kv > 0
     use_logit = args.loss_w_logit > 0
-    use_hid = args.loss_w_hid > 0
     use_ce = args.loss_w_ce > 0
-    need_qa = use_logit or use_hid or use_ce
 
-    print(f"\n===== Training: epochs={args.epochs}, demo_sets={len(demo_texts)}, "
+    print(f"\n===== Training: epochs={args.epochs}, samples={len(train_data)}, "
           f"ssm_dim={args.ssm_dim}, groups={args.num_groups}, "
           f"vtokens={args.num_virtual_tokens}, sink={args.sink_tokens}, dt={args.dt}")
-    print(f"  loss weights: kv={args.loss_w_kv}, logit={args.loss_w_logit}, "
-          f"hid={args.loss_w_hid}, ce={args.loss_w_ce}")
+    print(f"  loss weights: kv={args.loss_w_kv}, logit={args.loss_w_logit}, ce={args.loss_w_ce}")
     print()
 
     for epoch in range(args.epochs):
-        order = list(range(len(demo_texts)))
+        order = list(range(len(train_data)))
         rng.shuffle(order)
         for di in tqdm(order, desc=f"epoch-{epoch+1}"):
-            demo_text = demo_texts[di]
-            demo_ids = tokenizer(demo_text, return_tensors="pt",
-                                 add_special_tokens=False)["input_ids"].to(device)
-            if demo_ids.numel() == 0: continue
-            true_demo_len = demo_ids.shape[1]
+            dp = train_data[di]
+            prefix_text, query_text = _split_ruler_input(dp["input"])
+            ans_text = dp["output"]
 
-            # Student virtual KV (with grad)
-            virtual_kv = _student_virtual_kv(model, sidecar, demo_ids)
+            if not prefix_text or not query_text or not ans_text:
+                continue
+
+            prefix_ids = tokenizer(prefix_text, return_tensors="pt",
+                                   add_special_tokens=False)["input_ids"].to(device)
+            query_ids = tokenizer(query_text, return_tensors="pt",
+                                  add_special_tokens=False)["input_ids"].to(device)
+            ans_ids = tokenizer(ans_text, return_tensors="pt",
+                                add_special_tokens=False)["input_ids"].to(device)
+
+            if prefix_ids.numel() == 0 or query_ids.numel() == 0 or ans_ids.numel() == 0:
+                continue
+
+            true_prefix_len = prefix_ids.shape[1]
+
+            # ── Student: SSM compress prefix ──
+            emb = model.get_input_embeddings()(prefix_ids)
+            virtual_kv = sidecar(emb.float())
 
             # Sink KV
             sink_kv = None
-            st = min(args.sink_tokens, demo_ids.shape[1])
+            st = min(args.sink_tokens, prefix_ids.shape[1])
             if st > 0:
                 with torch.no_grad():
-                    sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+                    sink_kv = model(input_ids=prefix_ids[:, :st],
+                                    use_cache=True).past_key_values
             demo_len = st + sidecar.num_virtual_tokens
 
-            # ── L_KV ──
+            # ── L_KV: match virtual KV to teacher prefix KV ──
             loss_kv = torch.tensor(0.0, device=device)
             if use_kv:
-                teacher_kv = _teacher_demo_kv(model, demo_ids)
-                loss_kv = kv_matching_loss(virtual_kv, teacher_kv, sidecar.num_virtual_tokens,
+                with torch.no_grad():
+                    teacher_kv = _cache_to_legacy(
+                        model(input_ids=prefix_ids, use_cache=True).past_key_values)
+                loss_kv = kv_matching_loss(virtual_kv, teacher_kv,
+                                           sidecar.num_virtual_tokens,
                                            loss_type=args.kv_loss_type)
 
-            # ── L_Logit + L_hid ──
+            # ── L_logit + L_CE: distill on answer tokens ──
             loss_logit = torch.tensor(0.0, device=device)
-            loss_hid = torch.tensor(0.0, device=device)
             loss_ce = torch.tensor(0.0, device=device)
-            if need_qa:
-                qa_indices = rng.sample(range(len(train_data)), min(qa_batch_size, len(train_data)))
-                valid = 0
-                for qi in qa_indices:
-                    dp = train_data[qi]
-                    q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-                    q_ids = tokenizer(q_text, return_tensors="pt",
-                                      add_special_tokens=False)["input_ids"].to(device)
-                    a_ids = tokenizer(ans_text, return_tensors="pt",
-                                      add_special_tokens=False)["input_ids"].to(device)
-                    if q_ids.numel() == 0 or a_ids.numel() == 0: continue
+            if use_logit or use_ce:
+                with torch.no_grad():
+                    t_logits = _teacher_qa_forward(model, prefix_ids, query_ids, ans_ids)
 
-                    # Teacher forward (no grad, optionally with hidden states)
-                    with torch.no_grad():
-                        t_logits, t_hidden = _teacher_qa_forward(
-                            model, demo_ids, q_ids, a_ids, output_hidden=use_hid)
+                s_logits = _student_qa_forward(
+                    model, virtual_kv, sink_kv, demo_len, true_prefix_len,
+                    query_ids, ans_ids)
 
-                    # Student forward (grad flows through virtual_kv)
-                    s_logits, s_hidden = _student_qa_forward(
-                        model, virtual_kv, sink_kv, demo_len, true_demo_len,
-                        align, q_ids, a_ids, output_hidden=use_hid)
+                if use_logit:
+                    temp = args.kd_temperature
+                    loss_logit = F.kl_div(
+                        F.log_softmax(s_logits / temp, dim=-1),
+                        F.softmax(t_logits.detach() / temp, dim=-1),
+                        reduction="batchmean") * (temp ** 2)
 
-                    # L_Logit: KL divergence
-                    if use_logit:
-                        temp = args.kd_temperature
-                        kl = F.kl_div(
-                            F.log_softmax(s_logits / temp, dim=-1),
-                            F.softmax(t_logits.detach() / temp, dim=-1),
-                            reduction="batchmean") * (temp ** 2)
-                        loss_logit = loss_logit + kl
+                if use_ce:
+                    loss_ce = F.cross_entropy(
+                        s_logits.reshape(-1, s_logits.size(-1)),
+                        ans_ids.reshape(-1),
+                        reduction="mean")
 
-                    # L_hid: cosine distance on last-layer hidden states
-                    if use_hid and s_hidden is not None and t_hidden is not None:
-                        loss_hid = loss_hid + hidden_state_loss(s_hidden, t_hidden.detach())
-
-                    # L_CE: answer token cross entropy on student logits
-                    if use_ce:
-                        a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                        if a_stripped.numel() > 0:
-                            s_logits_stripped = s_logits[:, n_stripped:, :]
-                            min_t = min(s_logits_stripped.size(1), a_stripped.size(1))
-                            if min_t > 0:
-                                ce = F.cross_entropy(
-                                    s_logits_stripped[:, :min_t, :].reshape(-1, s_logits_stripped.size(-1)),
-                                    a_stripped[:, :min_t].reshape(-1),
-                                    reduction="mean",
-                                )
-                                loss_ce = loss_ce + ce
-
-                    valid += 1
-                if valid > 0:
-                    loss_logit = loss_logit / valid
-                    loss_hid = loss_hid / valid
-                    loss_ce = loss_ce / valid
-
-            # ── Combined loss ──
+            # ── Combined ──
             loss = (args.loss_w_kv * loss_kv
                     + args.loss_w_logit * loss_logit
-                    + args.loss_w_hid * loss_hid
                     + args.loss_w_ce * loss_ce)
 
             optimizer.zero_grad(set_to_none=True)
@@ -805,19 +592,18 @@ def run_distillation_training(args):
             running["loss"] += loss.item()
             running["kv"] += (loss_kv.item() if isinstance(loss_kv, torch.Tensor) else loss_kv)
             running["logit"] += (loss_logit.item() if isinstance(loss_logit, torch.Tensor) else loss_logit)
-            running["hid"] += (loss_hid.item() if isinstance(loss_hid, torch.Tensor) else loss_hid)
             running["ce"] += (loss_ce.item() if isinstance(loss_ce, torch.Tensor) else loss_ce)
 
             if step % args.log_every == 0:
                 d = float(args.log_every)
                 print(f"step={step} loss={running['loss']/d:.4f} "
                       f"kv={running['kv']/d:.4f} logit={running['logit']/d:.4f} "
-                      f"hid={running['hid']/d:.4f} ce={running['ce']/d:.4f} "
-                      f"lr={scheduler.get_last_lr()[0]:.6f}")
-                running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "hid": 0.0, "ce": 0.0}
+                      f"ce={running['ce']/d:.4f} lr={scheduler.get_last_lr()[0]:.6f}")
+                running = {k: 0.0 for k in running}
 
-            del virtual_kv, sink_kv, demo_ids, loss, loss_kv, loss_logit, loss_hid, loss_ce
-            if device.startswith("cuda") and args.empty_cache_every > 0 and (step % args.empty_cache_every == 0):
+            del virtual_kv, sink_kv, prefix_ids, query_ids, ans_ids
+            del loss, loss_kv, loss_logit, loss_ce
+            if device.startswith("cuda") and args.empty_cache_every > 0 and step % args.empty_cache_every == 0:
                 gc.collect(); torch.cuda.empty_cache()
             if 0 < args.max_steps <= step: break
         if 0 < args.max_steps <= step: break
@@ -826,11 +612,12 @@ def run_distillation_training(args):
         torch.save({"sidecar": sidecar.state_dict(), "args": vars(args),
                      "model_name": args.model_name}, args.save_sidecar_path)
         print(f"Saved: {args.save_sidecar_path}")
+
     return {k: v.detach().cpu() for k, v in sidecar.state_dict().items()}
 
 
 # =====================================================================
-# Eval experiment
+# Eval
 # =====================================================================
 
 def run_experiment(args, sidecar_state_dict=None):
@@ -839,255 +626,114 @@ def run_experiment(args, sidecar_state_dict=None):
     model = _load_causal_lm(args, device)
     model.eval()
 
-    align = args.align_true_positions
-    if align and getattr(model.config, "model_type", "") == "qwen2":
-        print("WARN: align_true_positions disabled for Qwen2."); align = False
+    _, test_data = _load_ruler_data(args)
+    if not test_data:
+        raise ValueError("Empty test data.")
 
-    add_nl = not args.model_name.startswith("gpt2")
-    retrieval_data = _load_dataset(args, args.retrieval_split)
-    eval_data = _load_dataset(args, args.eval_split)
-
-    per_query_random = (args.num_eval_demo_sets > 1)
     sidecar = LayerGroupSSMSidecar(
         model.config, ssm_dim=args.ssm_dim, num_virtual_tokens=args.num_virtual_tokens,
         num_groups=args.num_groups, dt=args.dt,
-        effective_num_kv_heads=_resolve_sidecar_kv_heads(args, model.config),
     ).to(device=device, dtype=torch.float32)
     _load_sidecar(sidecar, args, device, sidecar_state_dict)
     sidecar.eval()
 
-    rng_eval = random.Random(args.seed + 7777)
-    full_kv_preds, ssm_preds = [], []
-    full_losses, ssm_losses = [], []
-    logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
-    query_logit_mses = []
-    ds_results = {}
+    full_scores, ssm_scores = [], []
+    full_preds, ssm_preds, gts = [], [], []
+    full_ces, ssm_ces = [], []
 
-    if per_query_random:
-        print(f"\nPer-query random demos (k={args.k}) from {len(retrieval_data)} candidates.")
-    else:
-        print(f"\nFixed demos (strategy={args.demo_strategy}).")
-        fixed_demos = _choose_fixed_demos(retrieval_data, args.k, args.demo_strategy, args.seed)
+    print(f"\nEvaluating on {len(test_data)} test samples...\n")
 
-    # ─── Pass 1: Full-KV ───
-    per_query_demo_ids = []
-    print()
-    for dp in tqdm(eval_data, desc="full-kv"):
-        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-        a_ids = tokenizer(ans_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-        if per_query_random:
-            indices = rng_eval.sample(range(len(retrieval_data)), min(args.k, len(retrieval_data)))
-            demos = [retrieval_data[i] for i in indices]
-        else:
-            demos = fixed_demos
-        demo_text = _build_demo_text(demos, add_newlines=add_nl)
-        demo_ids = tokenizer(demo_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-        per_query_demo_ids.append(demo_ids)
+    for dp in tqdm(test_data, desc="eval"):
+        prefix_text, query_text = _split_ruler_input(dp["input"])
+        ans_text = dp["output"]
+        ground_truths = dp["outputs"]
 
-        opts = dp["options"]
-        opt_scores = {}
-        for opt in opts:
-            opt_text = _normalize_option(opt, add_nl)
-            opt_ids = tokenizer(opt_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-            if opt_ids.numel() == 0: opt_scores[opt] = float("inf"); continue
-            with torch.no_grad():
-                all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
-                out = model(input_ids=all_ids, use_cache=False)
-                start = demo_ids.shape[1] + q_ids.shape[1] - 1
-                nll = F.cross_entropy(out.logits[:, start:start+opt_ids.shape[1]].reshape(-1, out.logits.size(-1)),
-                                      opt_ids.reshape(-1), reduction="sum").item()
-            opt_scores[opt] = nll
-        full_kv_preds.append(min(opt_scores, key=opt_scores.get))
+        if not prefix_text or not query_text:
+            continue
 
-        if q_ids.numel() > 0 and a_ids.numel() > 0:
-            with torch.no_grad():
-                t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                if a_stripped.numel() > 0:
-                    full_losses.append(F.cross_entropy(
-                        t_logits[:, n_stripped:].reshape(-1, t_logits.size(-1)),
-                        a_stripped.reshape(-1), reduction="mean").item())
-                else: full_losses.append(float("nan"))
-        else: full_losses.append(float("nan"))
+        prefix_ids = tokenizer(prefix_text, return_tensors="pt",
+                               add_special_tokens=False)["input_ids"].to(device)
+        query_ids = tokenizer(query_text, return_tensors="pt",
+                              add_special_tokens=False)["input_ids"].to(device)
+        ans_ids = tokenizer(ans_text, return_tensors="pt",
+                            add_special_tokens=False)["input_ids"].to(device)
+        true_prefix_len = prefix_ids.shape[1]
 
-    full_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
-    print(f"  Full-KV Accuracy = {full_acc:.4f}")
-
-    # ─── Pass 2: SSM ───
-    print()
-    for i, dp in enumerate(tqdm(eval_data, desc="ssm")):
-        q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-        a_ids = tokenizer(ans_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-        demo_ids = per_query_demo_ids[i]
-        original_demo_len = demo_ids.shape[1]
-
+        # ─── Full-KV baseline ───
+        full_input_ids = tokenizer(dp["input"], return_tensors="pt",
+                                   add_special_tokens=False)["input_ids"].to(device)
         with torch.no_grad():
-            emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
+            full_pred = _generate_full_kv(model, tokenizer, full_input_ids,
+                                          max_new_tokens=args.max_gen_tokens)
+        full_preds.append(full_pred)
+        full_scores.append(_ruler_score(full_pred, ground_truths))
+
+        # Full-KV CE
+        if ans_ids.numel() > 0:
+            with torch.no_grad():
+                t_logits = _teacher_qa_forward(model, prefix_ids, query_ids, ans_ids)
+                full_ce = F.cross_entropy(
+                    t_logits.reshape(-1, t_logits.size(-1)),
+                    ans_ids.reshape(-1), reduction="mean").item()
+                full_ces.append(full_ce)
+
+        # ─── SSM ───
+        with torch.no_grad():
+            emb = model.get_input_embeddings()(prefix_ids).to(
+                dtype=next(sidecar.parameters()).dtype)
             virtual_kv = sidecar(emb)
             sink_kv = None
-            st = min(args.sink_tokens, demo_ids.shape[1])
-            if st > 0: sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+            st = min(args.sink_tokens, prefix_ids.shape[1])
+            if st > 0:
+                sink_kv = model(input_ids=prefix_ids[:, :st],
+                                use_cache=True).past_key_values
             ssm_demo_len = st + sidecar.num_virtual_tokens
 
-        scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
-                                    sink_tokens=args.sink_tokens, align_true_positions=align)
-        model_kv_dtype = model.get_input_embeddings().weight.dtype
-        model_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-        scorer.demo_cache = _build_cache_from_kv_list(
-            virtual_kv, sink_kv=sink_kv, target_dtype=model_kv_dtype,
-            expected_num_kv_heads=model_kv_heads
-        )
-        scorer.demo_len = ssm_demo_len
-        scorer.true_demo_len = original_demo_len
+            # Generate
+            ssm_pred = _generate_with_virtual_kv(
+                model, tokenizer, virtual_kv, sink_kv,
+                ssm_demo_len, true_prefix_len, query_ids,
+                max_new_tokens=args.max_gen_tokens)
+        ssm_preds.append(ssm_pred)
+        ssm_scores.append(_ruler_score(ssm_pred, ground_truths))
 
-        first, q_past, q_len = scorer.prefill_question(q_text)
-        opt_texts = [_normalize_option(o, add_nl) for o in dp["options"]]
-        scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
-        scores = {o: scores_t[ot] for o, ot in zip(dp["options"], opt_texts)}
-        ssm_preds.append(min(scores, key=scores.get))
-
-        if q_ids.numel() > 0 and a_ids.numel() > 0:
+        # SSM CE
+        if ans_ids.numel() > 0:
             with torch.no_grad():
-                s_logits = _student_qa_logits(model, virtual_kv, sink_kv,
-                                              ssm_demo_len, original_demo_len, align, q_ids, a_ids)
-                a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                if a_stripped.numel() > 0:
-                    s_logits_stripped = s_logits[:, n_stripped:, :]
-                    ssm_losses.append(F.cross_entropy(
-                        s_logits_stripped.reshape(-1, s_logits_stripped.size(-1)),
-                        a_stripped.reshape(-1), reduction="mean").item())
+                s_logits = _student_qa_forward(
+                    model, virtual_kv, sink_kv, ssm_demo_len, true_prefix_len,
+                    query_ids, ans_ids)
+                ssm_ce = F.cross_entropy(
+                    s_logits.reshape(-1, s_logits.size(-1)),
+                    ans_ids.reshape(-1), reduction="mean").item()
+                ssm_ces.append(ssm_ce)
 
-                    # Logit fidelity
-                    t_logits_full = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                    t_logits_stripped = t_logits_full[:, n_stripped:, :]
-                    min_t = min(t_logits_stripped.size(1), s_logits_stripped.size(1))
-                    if min_t > 0:
-                        tl = t_logits_stripped[:, :min_t, :]
-                        sl = s_logits_stripped[:, :min_t, :]
-                        logit_kls.append(F.kl_div(F.log_softmax(sl, dim=-1), F.softmax(tl, dim=-1),
-                                                  reduction="batchmean").item())
-                        logit_cossims.append(F.cosine_similarity(
-                            sl.reshape(-1, sl.size(-1)), tl.reshape(-1, tl.size(-1)), dim=-1).mean().item())
-                        top1_agrees.append((sl.argmax(-1) == tl.argmax(-1)).float().mean().item())
-                        t5_t, t5_s = tl.topk(5, dim=-1).indices, sl.topk(5, dim=-1).indices
-                        ovlp = sum(len(set(t5_t[0,t].tolist()) & set(t5_s[0,t].tolist()))/5.0 for t in range(min_t))
-                        top5_overlaps.append(ovlp / min_t)
+        gts.append(ans_text)
 
-                        # Per-query relative squared error on the correct answer's first-token logit.
-                        first_token_id = a_stripped[:, 0].unsqueeze(1)
-                        t_first = tl[:, 0, :].gather(1, first_token_id).squeeze(1)
-                        s_first = sl[:, 0, :].gather(1, first_token_id).squeeze(1)
-                        t_first_val = float(t_first.item())
-                        s_first_val = float(s_first.item())
-                        denom = max(s_first_val, t_first_val)
-                        rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
-                        query_logit_mses.append(rel_sq)
-                else: ssm_losses.append(float("nan"))
-        else: ssm_losses.append(float("nan"))
+    # ─── Results ───
+    n = len(full_scores)
+    full_acc = sum(full_scores) / max(1, n)
+    ssm_acc = sum(ssm_scores) / max(1, n)
+    mean_full_ce = sum(full_ces) / max(1, len(full_ces))
+    mean_ssm_ce = sum(ssm_ces) / max(1, len(ssm_ces))
 
-        ds = dp.get("task", dp.get("dataset", "unknown"))
-        if ds not in ds_results: ds_results[ds] = {"full_p": [], "ssm_p": [], "gt": []}
-        ds_results[ds]["full_p"].append(full_kv_preds[i])
-        ds_results[ds]["ssm_p"].append(ssm_preds[-1])
-        ds_results[ds]["gt"].append(dp["output"])
-
-    ssm_acc = _accuracy(ssm_preds, [dp["output"] for dp in eval_data])
-    print(f"  SSM Accuracy = {ssm_acc:.4f}")
-
-    # ─── Aggregate ───
-    valid_ces = [(f, s) for f, s in zip(full_losses, ssm_losses) if not (math.isnan(f) or math.isnan(s))]
-    valid_full = [f for f, _ in valid_ces]
-    valid_ssm = [s for _, s in valid_ces]
-    mean_full_ce = sum(valid_full) / max(1, len(valid_full))
-    mean_ssm_ce = sum(valid_ssm) / max(1, len(valid_ssm))
-
-    mean_kl = sum(logit_kls) / max(1, len(logit_kls)) if logit_kls else float("nan")
-    mean_cos = sum(logit_cossims) / max(1, len(logit_cossims)) if logit_cossims else float("nan")
-    mean_top1 = sum(top1_agrees) / max(1, len(top1_agrees)) if top1_agrees else float("nan")
-    mean_top5 = sum(top5_overlaps) / max(1, len(top5_overlaps)) if top5_overlaps else float("nan")
-    n_compare = len(query_logit_mses)
-    per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
-
-    mode_str = "per-query random" if per_query_random else "fixed"
     print(f"\n{'='*65}")
-    print(f"  SSM Hybrid Eval  (demos: {mode_str}, k={args.k})")
+    print(f"  RULER QA Eval  (n={n})")
     print(f"{'='*65}")
-    print(f"Full-KV Accuracy    = {full_acc:.6f}")
-    print(f"SSM Accuracy        = {ssm_acc:.6f}")
-    print(f"Accuracy gap        = {full_acc - ssm_acc:+.6f}")
+    print(f"Full-KV Accuracy    = {full_acc:.4f}")
+    print(f"SSM Accuracy        = {ssm_acc:.4f}")
+    print(f"Accuracy gap        = {full_acc - ssm_acc:+.4f}")
+    print(f"mean_CE_full_kv     = {mean_full_ce:.4f}")
+    print(f"mean_CE_ssm         = {mean_ssm_ce:.4f}")
+    print(f"CE gap              = {mean_ssm_ce - mean_full_ce:+.4f}")
 
-    print(f"\n  Per-Dataset Breakdown")
-    print(f"{'Dataset':<20} {'N':>5} {'FullKV':>10} {'SSM':>10} {'Gap':>10}")
-    print(f"{'-'*55}")
-    for ds in sorted(ds_results.keys()):
-        r = ds_results[ds]; n = len(r["gt"])
-        fa, sa = _accuracy(r["full_p"], r["gt"]), _accuracy(r["ssm_p"], r["gt"])
-        print(f"{ds:<20} {n:>5} {fa:>10.4f} {sa:>10.4f} {fa-sa:>+10.4f}")
-
-    print(f"\n  Logit Fidelity (SSM vs Full-KV)")
-    print(f"KL(SSM||FullKV)     = {mean_kl:.6f}")
-    print(f"Cosine similarity   = {mean_cos:.6f}")
-    print(f"Top-1 agreement     = {mean_top1:.6f}")
-    print(f"Top-5 overlap       = {mean_top5:.6f}")
-
-    print(f"\n  CE Comparison (content tokens only)")
-    print(f"num_samples         = {n_compare}")
-    print(f"mean_CE_full_kv     = {mean_full_ce:.6f}")
-    print(f"mean_CE_ssm         = {mean_ssm_ce:.6f}")
-    print(f"CE_gap              = {mean_ssm_ce - mean_full_ce:+.6f}")
-    print(f"per_sample_mean_MSE = {per_sample_mse:.6f}")
-
-
-# =====================================================================
-# Text / data utilities
-# =====================================================================
-
-def _setup_tokenizer(name):
-    tok = GPT2Tokenizer.from_pretrained(name) if name.startswith("gpt2") else AutoTokenizer.from_pretrained(name)
-    if tok.padding_side == "left": tok.padding_side = "right"
-    if tok.eos_token_id is None and tok.sep_token is not None: tok.eos_token = tok.sep_token
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    if tok.bos_token_id is None: tok.bos_token = tok.eos_token
-    return tok
-
-def _normalize_text(dp, is_first, add_newlines):
-    q = ("\n" + dp["input"]) if (add_newlines and not is_first) else dp["input"]
-    a = ("\n" + dp["output"]) if add_newlines else dp["output"]
-    return q, a
-
-def _normalize_option(opt, add_newlines):
-    return ("\n" + opt) if add_newlines else opt
-
-def _build_demo_text(demos, add_newlines):
-    parts = []
-    for i, dp in enumerate(demos):
-        q, a = _normalize_text(dp, is_first=(i == 0), add_newlines=add_newlines)
-        parts.append(q + a)
-    return "".join(parts)
-
-def _choose_fixed_demos(data, k, strategy, seed):
-    if strategy == "first": return data[:k]
-    return [data[i] for i in random.Random(seed).sample(range(len(data)), k)]
-
-def _accuracy(preds, gts):
-    return sum(int(p.strip() == g.strip()) for p, g in zip(preds, gts)) / max(1, len(gts))
-
-def _load_sidecar(sidecar, args, device, state_dict=None):
-    _FROZEN = ('.A', '.A_powers', '.eigenvalues', '.V', '.V_inv')
-    if state_dict is not None:
-        filtered = {k: v for k, v in state_dict.items() if not any(k.endswith(s) for s in _FROZEN)}
-        sidecar.load_state_dict(filtered, strict=False)
-        print("Loaded sidecar from in-memory state.")
-    elif args.load_sidecar_path:
-        ckpt = torch.load(args.load_sidecar_path, map_location=device)
-        st = ckpt["sidecar"] if isinstance(ckpt, dict) and "sidecar" in ckpt else ckpt
-        filtered = {k: v for k, v in st.items() if not any(k.endswith(s) for s in _FROZEN)}
-        sidecar.load_state_dict(filtered, strict=False)
-        print(f"Loaded sidecar from: {args.load_sidecar_path}")
-    else:
-        print("WARN: No sidecar checkpoint.")
+    # Print some examples
+    print(f"\n  Sample predictions (first 5):")
+    for i in range(min(5, n)):
+        print(f"  [{i}] GT: {gts[i]}")
+        print(f"       Full-KV: {full_preds[i]}")
+        print(f"       SSM:     {ssm_preds[i]}")
+        print()
 
 
 # =====================================================================
@@ -1096,39 +742,22 @@ def _load_sidecar(sidecar, args, device, state_dict=None):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    p.add_argument("--k", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--retrieval_split", type=str, default="test")
-    p.add_argument("--eval_split", type=str, default="dev")
-    p.add_argument("--train_split", type=str, default="train")
-    p.add_argument("--demo_strategy", type=str, default="first")
-    p.add_argument("--num_eval_demo_sets", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--is_quant", default=False, action="store_true")
-    p.add_argument(
-        "--quant_sidecar_kv_heads", type=int, default=4,
-        help=(
-            "Only when --is_quant is set, cap sidecar KV heads to this value "
-            "(<=0 disables cap). Non-quant runs always use full KV heads."
-        ),
-    )
     p.add_argument("--run_mode", type=str, default="eval",
                    choices=["eval", "train", "train_eval"])
 
+    # SSM architecture
     p.add_argument("--num_virtual_tokens", type=int, default=16)
     p.add_argument("--sink_tokens", type=int, default=4)
     p.add_argument("--ssm_dim", type=int, default=512)
     p.add_argument("--num_groups", type=int, default=4)
-    p.add_argument("--align_true_positions", action="store_true")
     p.add_argument("--dt", type=float, default=1.0,
-                   help="Discretization step for HiPPO. Controls temporal memory: "
-                        "effective window ≈ ln(1e6)/(dt*chunk_size) chunks. "
-                        "dt=1.0 → ~1 chunk memory. dt=0.001 → full-sequence memory.")
+                   help="Discretization step for HiPPO.")
 
-    p.add_argument("--num_demo_sets", type=int, default=500)
-    p.add_argument("--train_batch_size", type=int, default=4)
+    # Training
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--learning_rate", type=float, default=3e-4)
@@ -1136,14 +765,16 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--kd_temperature", type=float, default=2.0)
     p.add_argument("--loss_w_kv", type=float, default=1.0)
-    p.add_argument("--loss_w_logit", type=float, default=0.0)
-    p.add_argument("--loss_w_hid", type=float, default=0.0,
-                   help="Weight for hidden-state matching loss (cosine distance on last layer).")
-    p.add_argument("--loss_w_ce", type=float, default=0.0,
-                   help="Weight for supervised cross-entropy loss on answer tokens.")
+    p.add_argument("--loss_w_logit", type=float, default=0.5)
+    p.add_argument("--loss_w_ce", type=float, default=0.5)
     p.add_argument("--kv_loss_type", type=str, default="cosine", choices=["cosine", "mse"])
     p.add_argument("--log_every", type=int, default=20)
 
+    # Eval
+    p.add_argument("--max_gen_tokens", type=int, default=64,
+                   help="Max tokens to generate during evaluation.")
+
+    # IO
     p.add_argument("--save_sidecar_path", type=str, default="")
     p.add_argument("--load_sidecar_path", type=str, default="")
     p.add_argument("--empty_cache_every", type=int, default=0)
