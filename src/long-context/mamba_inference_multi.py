@@ -785,6 +785,9 @@ def run_experiment(args, sidecar_state_dict=None):
     tokenizer = _setup_tokenizer(args.model_name)
     model = _load_causal_lm(args, device)
     model.eval()
+    track_cuda_peak_mem = device.startswith("cuda")
+    model_mem_bytes = sum(p.nelement() * p.element_size() for p in model.parameters())
+    model_mem_gb = model_mem_bytes / (1024 ** 3)
 
     align = args.align_true_positions
     if align and getattr(model.config, "model_type", "") == "qwen2":
@@ -796,6 +799,7 @@ def run_experiment(args, sidecar_state_dict=None):
     eval_data = _load_dataset(args, args.eval_split)
 
     per_query_random = (args.num_eval_demo_sets > 1)
+    n_queries = max(1, len(eval_data))
 
     sidecar = LayerGroupSSMSidecar(
         model.config, ssm_dim=args.ssm_dim, num_virtual_tokens=args.num_virtual_tokens,
@@ -803,6 +807,8 @@ def run_experiment(args, sidecar_state_dict=None):
     ).to(device=device, dtype=model.get_input_embeddings().weight.dtype)
     _load_sidecar(sidecar, args, device, sidecar_state_dict)
     sidecar.eval()
+    sidecar_mem_bytes = sum(p.nelement() * p.element_size() for p in sidecar.parameters())
+    sidecar_mem_gb = sidecar_mem_bytes / (1024 ** 3)
     flop_params = _get_model_flop_params(model) if args.flops else None
 
     rng_eval = random.Random(args.seed + 7777)
@@ -815,13 +821,16 @@ def run_experiment(args, sidecar_state_dict=None):
     full_kv_total_flops = 0.0
     ssm_demo_flops = 0.0
     ssm_query_total_flops = 0.0
+    full_kv_peak_mem_bytes = 0
+    ssm_demo_peak_mem_bytes = 0
+    ssm_query_peak_mem_bytes = 0
 
     if per_query_random:
         print(f"\nPer-query random demos (k={args.k}) from {len(retrieval_data)} candidates.")
     else:
         print(f"\nFixed demos (strategy={args.demo_strategy}).")
 
-    for dp in tqdm(eval_data, desc="eval"):
+    for qi, dp in enumerate(tqdm(eval_data, desc="eval")):
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
@@ -848,6 +857,8 @@ def run_experiment(args, sidecar_state_dict=None):
         q_ssm_flops = 0.0
 
         # ─── Full-KV: concatenated forward ───
+        if track_cuda_peak_mem:
+            torch.cuda.reset_peak_memory_stats()
         opt_scores = {}
         for opt in opts:
             opt_text = _normalize_option(opt, add_nl)
@@ -870,6 +881,8 @@ def run_experiment(args, sidecar_state_dict=None):
                 ).item()
             opt_scores[opt] = nll
         full_kv_preds.append(min(opt_scores, key=opt_scores.get))
+        if track_cuda_peak_mem:
+            full_kv_peak_mem_bytes = max(full_kv_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
         # Full-KV CE
         t_logits_s = None
@@ -888,6 +901,8 @@ def run_experiment(args, sidecar_state_dict=None):
                     full_losses.append(t_ce)
 
         # ─── SSM: compress this query's demos ───
+        if track_cuda_peak_mem and qi == 0:
+            torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
             virtual_kv = sidecar(emb)
@@ -896,6 +911,13 @@ def run_experiment(args, sidecar_state_dict=None):
             if st > 0:
                 sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
             ssm_demo_len = st + sidecar.num_virtual_tokens
+        if track_cuda_peak_mem and qi == 0:
+            ssm_demo_peak_mem_bytes = torch.cuda.max_memory_allocated()
+        # Demo FLOPs: one-time amortized cost, aligned with streaming baseline style.
+        if args.flops and qi == 0:
+            ssm_demo_flops = _sidecar_analytical_flops(sidecar, original_demo_len)
+            if st > 0:
+                ssm_demo_flops += _analytical_flops_full(flop_params, st)
 
         # SSM accuracy: build scorer on the fly for this query's demos
         scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
@@ -904,6 +926,8 @@ def run_experiment(args, sidecar_state_dict=None):
         scorer.demo_len = ssm_demo_len
         scorer.true_demo_len = original_demo_len
 
+        if track_cuda_peak_mem:
+            torch.cuda.reset_peak_memory_stats()
         first, q_past, q_len = scorer.prefill_question(q_text)
         if args.flops:
             q_ssm_flops += _analytical_flops_inc(flop_params, q_len, ssm_demo_len)
@@ -916,15 +940,9 @@ def run_experiment(args, sidecar_state_dict=None):
                 q_ssm_flops += _analytical_flops_inc(
                     flop_params, opt_len, ssm_demo_len + q_len
                 )
-            if per_query_random:
-                ssm_demo_flops += _sidecar_analytical_flops(sidecar, original_demo_len)
-                if st > 0:
-                    ssm_demo_flops += _analytical_flops_full(flop_params, st)
-            elif len(ssm_preds) == 0:
-                ssm_demo_flops = _sidecar_analytical_flops(sidecar, original_demo_len)
-                if st > 0:
-                    ssm_demo_flops += _analytical_flops_full(flop_params, st)
         ssm_preds.append(min(scores, key=scores.get))
+        if track_cuda_peak_mem:
+            ssm_query_peak_mem_bytes = max(ssm_query_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
         # SSM CE
         s_logits_s = None
@@ -973,7 +991,7 @@ def run_experiment(args, sidecar_state_dict=None):
             s_first = s_logits_s[:, 0, :].gather(1, first_token_id).squeeze(1)
             t_first_val = float(t_first.item())
             s_first_val = float(s_first.item())
-            denom = max(s_first_val, t_first_val)
+            denom = max(abs(s_first_val), abs(t_first_val))
             rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
             query_logit_mses.append(rel_sq)
 
@@ -1044,8 +1062,20 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"CE_gap (ssm-full)   = {mean_ssm_ce - mean_full_ce:+.6f}")
     print(f"mean_norm_sq_loss   = {mean_sq_loss:.6f}")
     print(f"per_sample_mean_MSE = {per_sample_mse:.6f}")
+    if track_cuda_peak_mem:
+        base_ssm_gb = model_mem_gb + sidecar_mem_gb
+        full_peak_gb = full_kv_peak_mem_bytes / (1024 ** 3)
+        ssm_demo_peak_gb = ssm_demo_peak_mem_bytes / (1024 ** 3)
+        ssm_query_peak_gb = ssm_query_peak_mem_bytes / (1024 ** 3)
+        print(f"model_weights_mem   = {model_mem_gb:.3f} GB")
+        print(f"sidecar_weights_mem = {sidecar_mem_gb:.3f} GB")
+        print(f"full_kv_peak_mem    = {full_peak_gb:.3f} GB "
+              f"(+{full_peak_gb - model_mem_gb:.3f} GB over model)")
+        print(f"ssm_demo_peak_mem   = {ssm_demo_peak_gb:.3f} GB "
+              f"(+{ssm_demo_peak_gb - base_ssm_gb:.3f} GB over model+sidecar, one-time)")
+        print(f"ssm_query_peak_mem  = {ssm_query_peak_gb:.3f} GB "
+              f"(+{ssm_query_peak_gb - base_ssm_gb:.3f} GB over model+sidecar, per-query)")
     if args.flops:
-        n_queries = max(1, len(eval_data))
         print(f"total_full_flops    = {total_full_flops:.3e} ({n_queries} queries)")
         print(f"total_ssm_flops     = {total_ssm_flops:.3e} ({n_queries} queries)")
         if total_ssm_flops > 0:
