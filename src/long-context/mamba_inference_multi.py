@@ -6,6 +6,7 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -816,6 +817,7 @@ def run_experiment(args, sidecar_state_dict=None):
     full_kv_preds, ssm_preds = [], []
     full_losses, ssm_losses = [], []
     logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
+    option_output_kls = []
     query_logit_mses = []
     ds_results = {}  # ds -> {"full_p":[], "ssm_p":[], "gt":[]}
     full_kv_total_flops = 0.0
@@ -934,6 +936,7 @@ def run_experiment(args, sidecar_state_dict=None):
         opt_texts = [_normalize_option(o, add_nl) for o in opts]
         scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
         scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
+        option_output_kls.append(_option_output_kl_from_nll(opt_scores, scores))
         if args.flops:
             for opt_text in opt_texts:
                 opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
@@ -1020,6 +1023,11 @@ def run_experiment(args, sidecar_state_dict=None):
     mean_cos = sum(logit_cossims) / max(1, len(logit_cossims)) if logit_cossims else float("nan")
     mean_top1 = sum(top1_agrees) / max(1, len(top1_agrees)) if top1_agrees else float("nan")
     mean_top5 = sum(top5_overlaps) / max(1, len(top5_overlaps)) if top5_overlaps else float("nan")
+    valid_option_kls = [x for x in option_output_kls if not math.isnan(x)]
+    mean_option_output_kl = (
+        sum(valid_option_kls) / len(valid_option_kls)
+        if len(valid_option_kls) > 0 else float("nan")
+    )
 
     n_compare = len(query_logit_mses)
     per_sample_mse = sum(query_logit_mses) / max(1, len(query_logit_mses))
@@ -1052,6 +1060,7 @@ def run_experiment(args, sidecar_state_dict=None):
     print(f"\n{'='*60}")
     print(f"  Loss Comparison (content tokens only, format stripped)")
     print(f"{'='*60}")
+    print(f"Output KL(SSM||Full) = {mean_option_output_kl:.6f}")
     print(f"KL(SSM||FullKV)     = {mean_kl:.6f}")
     print(f"Cosine similarity   = {mean_cos:.6f}")
     print(f"Top-1 agreement     = {mean_top1:.6f}")
@@ -1219,6 +1228,38 @@ def _choose_fixed_demos(data, k, strategy, seed):
 
 def _accuracy(preds, gts):
     return sum(int(p.strip() == g.strip()) for p, g in zip(preds, gts)) / max(1, len(gts))
+
+
+def _option_output_kl_from_nll(full_nll_by_option, ssm_nll_by_option):
+    """
+    KL divergence between final option output distributions:
+      KL(SSM || Full-KV)
+    """
+    common_opts = [opt for opt in full_nll_by_option if opt in ssm_nll_by_option]
+    if len(common_opts) <= 1:
+        return float("nan")
+
+    full_vals = np.asarray([float(full_nll_by_option[opt]) for opt in common_opts], dtype=np.float64)
+    ssm_vals = np.asarray([float(ssm_nll_by_option[opt]) for opt in common_opts], dtype=np.float64)
+    if not np.isfinite(full_vals).all() or not np.isfinite(ssm_vals).all():
+        return float("nan")
+
+    # Convert NLLs to option distributions.
+    full_logits = -full_vals
+    ssm_logits = -ssm_vals
+    full_logits = full_logits - np.max(full_logits)
+    ssm_logits = ssm_logits - np.max(ssm_logits)
+    p_full = np.exp(full_logits)
+    p_ssm = np.exp(ssm_logits)
+    p_full = p_full / np.sum(p_full)
+    p_ssm = p_ssm / np.sum(p_ssm)
+
+    eps = 1e-12
+    p_full = np.clip(p_full, eps, 1.0)
+    p_ssm = np.clip(p_ssm, eps, 1.0)
+    p_full = p_full / np.sum(p_full)
+    p_ssm = p_ssm / np.sum(p_ssm)
+    return float(np.sum(p_ssm * (np.log(p_ssm) - np.log(p_full))))
 
 
 def _attn_proxy_full(n):
