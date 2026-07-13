@@ -586,6 +586,19 @@ def _strip_leading_format_tokens(ans_ids, tokenizer):
     return ans_ids[:, idx:], idx
 
 
+def _is_cuda_oom_error(exc: RuntimeError) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return ("out of memory" in msg) and ("cuda" in msg)
+
+
+def _cleanup_after_oom(device: str):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 # =====================================================================
 # Training loop
 # =====================================================================
@@ -638,6 +651,8 @@ def run_distillation_training(args):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
     rng = random.Random(args.seed)
     step = 0
+    demo_oom_skips = 0
+    qa_oom_skips = 0
     running = {"loss": 0.0, "kv": 0.0, "logit": 0.0, "hid": 0.0, "ce": 0.0}
     qa_batch_size = max(1, args.train_batch_size)
     use_kv = args.loss_w_kv > 0
@@ -657,91 +672,108 @@ def run_distillation_training(args):
         order = list(range(len(demo_texts)))
         rng.shuffle(order)
         for di in tqdm(order, desc=f"epoch-{epoch+1}"):
-            demo_text = demo_texts[di]
-            demo_ids = tokenizer(demo_text, return_tensors="pt",
-                                 add_special_tokens=False)["input_ids"].to(device)
-            if demo_ids.numel() == 0:
-                continue
-            true_demo_len = demo_ids.shape[1]
+            try:
+                demo_text = demo_texts[di]
+                demo_ids = tokenizer(demo_text, return_tensors="pt",
+                                     add_special_tokens=False)["input_ids"].to(device)
+                if demo_ids.numel() == 0:
+                    continue
+                true_demo_len = demo_ids.shape[1]
 
-            virtual_kv = _student_virtual_kv(model, sidecar, demo_ids)
+                virtual_kv = _student_virtual_kv(model, sidecar, demo_ids)
 
-            sink_kv = None
-            st = min(args.sink_tokens, demo_ids.shape[1])
-            if st > 0:
-                with torch.no_grad():
-                    sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
-            demo_len = st + sidecar.num_virtual_tokens
-
-            loss_kv = torch.tensor(0.0, device=device)
-            if use_kv:
-                teacher_kv = _teacher_demo_kv(model, demo_ids)
-                loss_kv = kv_matching_loss(virtual_kv, teacher_kv, sidecar.num_virtual_tokens,
-                                           loss_type=args.kv_loss_type)
-
-            loss_logit = torch.tensor(0.0, device=device)
-            loss_hid = torch.tensor(0.0, device=device)
-            loss_ce = torch.tensor(0.0, device=device)
-            if need_qa:
-                qa_indices = rng.sample(range(len(train_data)), min(qa_batch_size, len(train_data)))
-                valid = 0
-                for qi in qa_indices:
-                    dp = train_data[qi]
-                    q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
-                    q_ids = tokenizer(q_text, return_tensors="pt",
-                                      add_special_tokens=False)["input_ids"].to(device)
-                    a_ids = tokenizer(ans_text, return_tensors="pt",
-                                      add_special_tokens=False)["input_ids"].to(device)
-                    if q_ids.numel() == 0 or a_ids.numel() == 0:
-                        continue
-
+                sink_kv = None
+                st = min(args.sink_tokens, demo_ids.shape[1])
+                if st > 0:
                     with torch.no_grad():
-                        t_logits, t_hidden = _teacher_qa_forward(
-                            model, demo_ids, q_ids, a_ids, output_hidden=use_hid)
-                    s_logits, s_hidden = _student_qa_forward(
-                        model, virtual_kv, sink_kv, demo_len, true_demo_len,
-                        align, q_ids, a_ids, output_hidden=use_hid)
+                        sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+                demo_len = st + sidecar.num_virtual_tokens
 
-                    if use_logit:
-                        temp = args.kd_temperature
-                        kl = F.kl_div(
-                            F.log_softmax(s_logits / temp, dim=-1),
-                            F.softmax(t_logits.detach() / temp, dim=-1),
-                            reduction="batchmean",
-                        ) * (temp ** 2)
-                        loss_logit = loss_logit + kl
+                loss_kv = torch.tensor(0.0, device=device)
+                if use_kv:
+                    teacher_kv = _teacher_demo_kv(model, demo_ids)
+                    loss_kv = kv_matching_loss(virtual_kv, teacher_kv, sidecar.num_virtual_tokens,
+                                               loss_type=args.kv_loss_type)
 
-                    if use_hid and s_hidden is not None and t_hidden is not None:
-                        loss_hid = loss_hid + hidden_state_loss(s_hidden, t_hidden.detach())
+                loss_logit = torch.tensor(0.0, device=device)
+                loss_hid = torch.tensor(0.0, device=device)
+                loss_ce = torch.tensor(0.0, device=device)
+                if need_qa:
+                    qa_indices = rng.sample(range(len(train_data)), min(qa_batch_size, len(train_data)))
+                    valid = 0
+                    for qi in qa_indices:
+                        try:
+                            dp = train_data[qi]
+                            q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
+                            q_ids = tokenizer(q_text, return_tensors="pt",
+                                              add_special_tokens=False)["input_ids"].to(device)
+                            a_ids = tokenizer(ans_text, return_tensors="pt",
+                                              add_special_tokens=False)["input_ids"].to(device)
+                            if q_ids.numel() == 0 or a_ids.numel() == 0:
+                                continue
 
-                    if use_ce:
-                        a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                        if a_stripped.numel() > 0:
-                            s_logits_stripped = s_logits[:, n_stripped:, :]
-                            min_t = min(s_logits_stripped.size(1), a_stripped.size(1))
-                            if min_t > 0:
-                                ce = F.cross_entropy(
-                                    s_logits_stripped[:, :min_t, :].reshape(-1, s_logits_stripped.size(-1)),
-                                    a_stripped[:, :min_t].reshape(-1),
-                                    reduction="mean",
-                                )
-                                loss_ce = loss_ce + ce
-                    valid += 1
-                if valid > 0:
-                    loss_logit = loss_logit / valid
-                    loss_hid = loss_hid / valid
-                    loss_ce = loss_ce / valid
+                            with torch.no_grad():
+                                t_logits, t_hidden = _teacher_qa_forward(
+                                    model, demo_ids, q_ids, a_ids, output_hidden=use_hid)
+                            s_logits, s_hidden = _student_qa_forward(
+                                model, virtual_kv, sink_kv, demo_len, true_demo_len,
+                                align, q_ids, a_ids, output_hidden=use_hid)
 
-            loss = (args.loss_w_kv * loss_kv
-                    + args.loss_w_logit * loss_logit
-                    + args.loss_w_hid * loss_hid
-                    + args.loss_w_ce * loss_ce)
+                            if use_logit:
+                                temp = args.kd_temperature
+                                kl = F.kl_div(
+                                    F.log_softmax(s_logits / temp, dim=-1),
+                                    F.softmax(t_logits.detach() / temp, dim=-1),
+                                    reduction="batchmean",
+                                ) * (temp ** 2)
+                                loss_logit = loss_logit + kl
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(sidecar.parameters(), max_norm=args.grad_clip)
-            optimizer.step()
-            scheduler.step()
+                            if use_hid and s_hidden is not None and t_hidden is not None:
+                                loss_hid = loss_hid + hidden_state_loss(s_hidden, t_hidden.detach())
+
+                            if use_ce:
+                                a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
+                                if a_stripped.numel() > 0:
+                                    s_logits_stripped = s_logits[:, n_stripped:, :]
+                                    min_t = min(s_logits_stripped.size(1), a_stripped.size(1))
+                                    if min_t > 0:
+                                        ce = F.cross_entropy(
+                                            s_logits_stripped[:, :min_t, :].reshape(-1, s_logits_stripped.size(-1)),
+                                            a_stripped[:, :min_t].reshape(-1),
+                                            reduction="mean",
+                                        )
+                                        loss_ce = loss_ce + ce
+                            valid += 1
+                        except RuntimeError as e:
+                            if _is_cuda_oom_error(e):
+                                qa_oom_skips += 1
+                                print(f"[OOM-SKIP][train-qa] epoch={epoch+1} demo_idx={di} qa_idx={qi}")
+                                _cleanup_after_oom(device)
+                                continue
+                            raise
+                    if valid > 0:
+                        loss_logit = loss_logit / valid
+                        loss_hid = loss_hid / valid
+                        loss_ce = loss_ce / valid
+
+                loss = (args.loss_w_kv * loss_kv
+                        + args.loss_w_logit * loss_logit
+                        + args.loss_w_hid * loss_hid
+                        + args.loss_w_ce * loss_ce)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(sidecar.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+                scheduler.step()
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    demo_oom_skips += 1
+                    print(f"[OOM-SKIP][train-demo] epoch={epoch+1} demo_idx={di}")
+                    optimizer.zero_grad(set_to_none=True)
+                    _cleanup_after_oom(device)
+                    continue
+                raise
 
             step += 1
             running["loss"] += loss.item()
@@ -768,6 +800,9 @@ def run_distillation_training(args):
                 break
         if 0 < args.max_steps <= step:
             break
+
+    if demo_oom_skips > 0 or qa_oom_skips > 0:
+        print(f"[OOM-SKIP][train-summary] demo_skips={demo_oom_skips}, qa_skips={qa_oom_skips}")
 
     if args.save_sidecar_path:
         torch.save({"sidecar": sidecar.state_dict(), "args": vars(args),
@@ -815,6 +850,7 @@ def run_experiment(args, sidecar_state_dict=None):
     rng_eval = random.Random(args.seed + 7777)
 
     full_kv_preds, ssm_preds = [], []
+    processed_gts = []
     full_losses, ssm_losses = [], []
     logit_kls, logit_cossims, top1_agrees, top5_overlaps = [], [], [], []
     option_output_kls = []
@@ -826,6 +862,7 @@ def run_experiment(args, sidecar_state_dict=None):
     full_kv_peak_mem_bytes = 0
     ssm_demo_peak_mem_bytes = 0
     ssm_query_peak_mem_bytes = 0
+    eval_oom_skips = 0
 
     if per_query_random:
         print(f"\nPer-query random demos (k={args.k}) from {len(retrieval_data)} candidates.")
@@ -833,6 +870,7 @@ def run_experiment(args, sidecar_state_dict=None):
         print(f"\nFixed demos (strategy={args.demo_strategy}).")
 
     for qi, dp in enumerate(tqdm(eval_data, desc="eval")):
+        oom_in_dp = False
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
@@ -872,16 +910,27 @@ def run_experiment(args, sidecar_state_dict=None):
             if args.flops:
                 total_len = original_demo_len + q_ids.shape[1] + opt_ids.shape[1]
                 q_full_kv_flops += _analytical_flops_full(flop_params, total_len)
-            with torch.no_grad():
-                all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
-                out = model(input_ids=all_ids, use_cache=False)
-                start = demo_ids.shape[1] + q_ids.shape[1] - 1
-                pred_logits = out.logits[:, start:start + opt_ids.shape[1], :]
-                nll = F.cross_entropy(
-                    pred_logits.reshape(-1, pred_logits.size(-1)),
-                    opt_ids.reshape(-1), reduction="sum",
-                ).item()
+            try:
+                with torch.no_grad():
+                    all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
+                    out = model(input_ids=all_ids, use_cache=False)
+                    start = demo_ids.shape[1] + q_ids.shape[1] - 1
+                    pred_logits = out.logits[:, start:start + opt_ids.shape[1], :]
+                    nll = F.cross_entropy(
+                        pred_logits.reshape(-1, pred_logits.size(-1)),
+                        opt_ids.reshape(-1), reduction="sum",
+                    ).item()
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    oom_in_dp = True
+                    break
+                raise
             opt_scores[opt] = nll
+        if oom_in_dp:
+            eval_oom_skips += 1
+            print(f"[OOM-SKIP][eval-dp] idx={qi} stage=full-kv")
+            _cleanup_after_oom(device)
+            continue
         full_kv_preds.append(min(opt_scores, key=opt_scores.get))
         if track_cuda_peak_mem:
             full_kv_peak_mem_bytes = max(full_kv_peak_mem_bytes, torch.cuda.max_memory_allocated())
@@ -890,29 +939,47 @@ def run_experiment(args, sidecar_state_dict=None):
         t_logits_s = None
         first_token_id = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
-            with torch.no_grad():
-                t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                if a_stripped.numel() > 0:
-                    t_logits_s = t_logits[:, n_stripped:, :]
-                    first_token_id = a_stripped[:, 0].unsqueeze(1)
-                    t_ce = F.cross_entropy(
-                        t_logits_s.reshape(-1, t_logits_s.size(-1)),
-                        a_stripped.reshape(-1), reduction="mean",
-                    ).item()
-                    full_losses.append(t_ce)
+            try:
+                with torch.no_grad():
+                    t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+                    a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
+                    if a_stripped.numel() > 0:
+                        t_logits_s = t_logits[:, n_stripped:, :]
+                        first_token_id = a_stripped[:, 0].unsqueeze(1)
+                        t_ce = F.cross_entropy(
+                            t_logits_s.reshape(-1, t_logits_s.size(-1)),
+                            a_stripped.reshape(-1), reduction="mean",
+                        ).item()
+                        full_losses.append(t_ce)
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=teacher-ce")
+                    _cleanup_after_oom(device)
+                    full_kv_preds.pop()
+                    continue
+                raise
 
         # ─── SSM: compress this query's demos ───
         if track_cuda_peak_mem and qi == 0:
             torch.cuda.reset_peak_memory_stats()
-        with torch.no_grad():
-            emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
-            virtual_kv = sidecar(emb)
-            sink_kv = None
-            st = min(args.sink_tokens, demo_ids.shape[1])
-            if st > 0:
-                sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
-            ssm_demo_len = st + sidecar.num_virtual_tokens
+        try:
+            with torch.no_grad():
+                emb = model.get_input_embeddings()(demo_ids).to(dtype=next(sidecar.parameters()).dtype)
+                virtual_kv = sidecar(emb)
+                sink_kv = None
+                st = min(args.sink_tokens, demo_ids.shape[1])
+                if st > 0:
+                    sink_kv = model(input_ids=demo_ids[:, :st], use_cache=True).past_key_values
+                ssm_demo_len = st + sidecar.num_virtual_tokens
+        except RuntimeError as e:
+            if _is_cuda_oom_error(e):
+                eval_oom_skips += 1
+                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-compress")
+                _cleanup_after_oom(device)
+                full_kv_preds.pop()
+                continue
+            raise
         if track_cuda_peak_mem and qi == 0:
             ssm_demo_peak_mem_bytes = torch.cuda.max_memory_allocated()
         # Demo FLOPs: one-time amortized cost, aligned with streaming baseline style.
@@ -930,11 +997,29 @@ def run_experiment(args, sidecar_state_dict=None):
 
         if track_cuda_peak_mem:
             torch.cuda.reset_peak_memory_stats()
-        first, q_past, q_len = scorer.prefill_question(q_text)
+        try:
+            first, q_past, q_len = scorer.prefill_question(q_text)
+        except RuntimeError as e:
+            if _is_cuda_oom_error(e):
+                eval_oom_skips += 1
+                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-prefill")
+                _cleanup_after_oom(device)
+                full_kv_preds.pop()
+                continue
+            raise
         if args.flops:
             q_ssm_flops += _analytical_flops_inc(flop_params, q_len, ssm_demo_len)
         opt_texts = [_normalize_option(o, add_nl) for o in opts]
-        scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
+        try:
+            scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
+        except RuntimeError as e:
+            if _is_cuda_oom_error(e):
+                eval_oom_skips += 1
+                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-options")
+                _cleanup_after_oom(device)
+                full_kv_preds.pop()
+                continue
+            raise
         scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
         option_output_kls.append(_option_output_kl_from_nll(opt_scores, scores))
         if args.flops:
@@ -950,43 +1035,53 @@ def run_experiment(args, sidecar_state_dict=None):
         # SSM CE
         s_logits_s = None
         if q_ids.numel() > 0 and a_ids.numel() > 0:
-            with torch.no_grad():
-                s_logits = _student_qa_logits(
-                    model, virtual_kv, sink_kv,
-                    ssm_demo_len, original_demo_len, align, q_ids, a_ids,
-                )
-                a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
-                if a_stripped.numel() > 0:
-                    s_logits_s = s_logits[:, n_stripped:, :]
-                    s_ce = F.cross_entropy(
-                        s_logits_s.reshape(-1, s_logits_s.size(-1)),
-                        a_stripped.reshape(-1), reduction="mean",
-                    ).item()
-                    ssm_losses.append(s_ce)
+            try:
+                with torch.no_grad():
+                    s_logits = _student_qa_logits(
+                        model, virtual_kv, sink_kv,
+                        ssm_demo_len, original_demo_len, align, q_ids, a_ids,
+                    )
+                    a_stripped, n_stripped = _strip_leading_format_tokens(a_ids, tokenizer)
+                    if a_stripped.numel() > 0:
+                        s_logits_s = s_logits[:, n_stripped:, :]
+                        s_ce = F.cross_entropy(
+                            s_logits_s.reshape(-1, s_logits_s.size(-1)),
+                            a_stripped.reshape(-1), reduction="mean",
+                        ).item()
+                        ssm_losses.append(s_ce)
 
-                    # Logit fidelity against full-KV teacher logits.
-                    t_logits_full = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-                    t_logits_stripped = t_logits_full[:, n_stripped:, :]
-                    min_t = min(t_logits_stripped.size(1), s_logits_s.size(1))
-                    if min_t > 0:
-                        tl = t_logits_stripped[:, :min_t, :]
-                        sl = s_logits_s[:, :min_t, :]
+                        # Logit fidelity against full-KV teacher logits.
+                        t_logits_full = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+                        t_logits_stripped = t_logits_full[:, n_stripped:, :]
+                        min_t = min(t_logits_stripped.size(1), s_logits_s.size(1))
+                        if min_t > 0:
+                            tl = t_logits_stripped[:, :min_t, :]
+                            sl = s_logits_s[:, :min_t, :]
 
-                        logit_kls.append(F.kl_div(
-                            F.log_softmax(sl, dim=-1), F.softmax(tl, dim=-1),
-                            reduction="batchmean").item())
-                        logit_cossims.append(F.cosine_similarity(
-                            sl.reshape(-1, sl.size(-1)),
-                            tl.reshape(-1, tl.size(-1)), dim=-1).mean().item())
-                        top1_agrees.append(
-                            (sl.argmax(-1) == tl.argmax(-1)).float().mean().item())
+                            logit_kls.append(F.kl_div(
+                                F.log_softmax(sl, dim=-1), F.softmax(tl, dim=-1),
+                                reduction="batchmean").item())
+                            logit_cossims.append(F.cosine_similarity(
+                                sl.reshape(-1, sl.size(-1)),
+                                tl.reshape(-1, tl.size(-1)), dim=-1).mean().item())
+                            top1_agrees.append(
+                                (sl.argmax(-1) == tl.argmax(-1)).float().mean().item())
 
-                        t5_t = tl.topk(5, dim=-1).indices
-                        t5_s = sl.topk(5, dim=-1).indices
-                        ovlp = sum(
-                            len(set(t5_t[0, t].tolist()) & set(t5_s[0, t].tolist())) / 5.0
-                            for t in range(min_t))
-                        top5_overlaps.append(ovlp / min_t)
+                            t5_t = tl.topk(5, dim=-1).indices
+                            t5_s = sl.topk(5, dim=-1).indices
+                            ovlp = sum(
+                                len(set(t5_t[0, t].tolist()) & set(t5_s[0, t].tolist())) / 5.0
+                                for t in range(min_t))
+                            top5_overlaps.append(ovlp / min_t)
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-ce-or-fidelity")
+                    _cleanup_after_oom(device)
+                    full_kv_preds.pop()
+                    ssm_preds.pop()
+                    continue
+                raise
 
         # Per-query relative squared error on the correct answer's first-token logit.
         if t_logits_s is not None and s_logits_s is not None and first_token_id is not None:
@@ -998,6 +1093,7 @@ def run_experiment(args, sidecar_state_dict=None):
             rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
             query_logit_mses.append(rel_sq)
 
+        processed_gts.append(dp["output"])
         # Track per-dataset
         ds = dp.get("task", dp.get("dataset", "unknown"))
         if ds not in ds_results:
@@ -1010,8 +1106,11 @@ def run_experiment(args, sidecar_state_dict=None):
             ssm_query_total_flops += q_ssm_flops
 
     # ─── Aggregate ───
-    full_acc = _accuracy(full_kv_preds, [dp["output"] for dp in eval_data])
-    ssm_acc = _accuracy(ssm_preds, [dp["output"] for dp in eval_data])
+    full_acc = _accuracy(full_kv_preds, processed_gts)
+    ssm_acc = _accuracy(ssm_preds, processed_gts)
+    n_queries = len(processed_gts)
+    if eval_oom_skips > 0:
+        print(f"[OOM-SKIP][eval-summary] skipped={eval_oom_skips}, processed={n_queries}")
 
     valid_ces = [(f, s) for f, s in zip(full_losses, ssm_losses) if not (math.isnan(f) or math.isnan(s))]
     valid_full = [f for f, _ in valid_ces]
@@ -1134,6 +1233,7 @@ def run_loss_comparison(args, sidecar_state_dict=None):
         eval_ssm_demo_len = st + sidecar.num_virtual_tokens
 
     full_losses, ssm_losses = [], []
+    compare_oom_skips = 0
     for dp in tqdm(eval_data, desc="compare-loss"):
         q_text, ans_text = _normalize_text(dp, is_first=False, add_newlines=add_nl)
         q_ids = tokenizer(q_text, return_tensors="pt",
@@ -1147,29 +1247,40 @@ def run_loss_comparison(args, sidecar_state_dict=None):
         if a_stripped.numel() == 0:
             continue
 
-        with torch.no_grad():
-            t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
-            t_logits_s = t_logits[:, n_stripped:, :]
-            t_ce = F.cross_entropy(
-                t_logits_s.reshape(-1, t_logits_s.size(-1)),
-                a_stripped.reshape(-1), reduction="mean",
-            ).item()
+        try:
+            with torch.no_grad():
+                t_logits = _teacher_qa_logits_nocache(model, demo_ids, q_ids, a_ids)
+                t_logits_s = t_logits[:, n_stripped:, :]
+                t_ce = F.cross_entropy(
+                    t_logits_s.reshape(-1, t_logits_s.size(-1)),
+                    a_stripped.reshape(-1), reduction="mean",
+                ).item()
 
-            s_logits = _student_qa_logits(
-                model, eval_virtual_kv, eval_sink_kv,
-                eval_ssm_demo_len, full_len, align, q_ids, a_ids,
-            )
-            s_logits_s = s_logits[:, n_stripped:, :]
-            s_ce = F.cross_entropy(
-                s_logits_s.reshape(-1, s_logits_s.size(-1)),
-                a_stripped.reshape(-1), reduction="mean",
-            ).item()
+                s_logits = _student_qa_logits(
+                    model, eval_virtual_kv, eval_sink_kv,
+                    eval_ssm_demo_len, full_len, align, q_ids, a_ids,
+                )
+                s_logits_s = s_logits[:, n_stripped:, :]
+                s_ce = F.cross_entropy(
+                    s_logits_s.reshape(-1, s_logits_s.size(-1)),
+                    a_stripped.reshape(-1), reduction="mean",
+                ).item()
+        except RuntimeError as e:
+            if _is_cuda_oom_error(e):
+                compare_oom_skips += 1
+                print("[OOM-SKIP][compare-loss] skipped one datapoint")
+                _cleanup_after_oom(device)
+                continue
+            raise
 
         full_losses.append(t_ce)
         ssm_losses.append(s_ce)
 
     if not full_losses:
         raise ValueError("No valid samples.")
+
+    if compare_oom_skips > 0:
+        print(f"[OOM-SKIP][compare-loss-summary] skipped={compare_oom_skips}, processed={len(full_losses)}")
 
     mf = sum(full_losses) / len(full_losses)
     ms = sum(ssm_losses) / len(ssm_losses)
