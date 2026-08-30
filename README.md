@@ -1,6 +1,6 @@
 # Long-Context Demonstration Selection Using State Space Models
 
-* Authors: [Ziniu Zhang](https://ziniuzhang.github.io), [Zhenshuo Zhang](https://zhenshuozhang.github.io), [Ruoxuan Xiong](https://www.ruoxuanxiong.com/index.html), [Gene Cooperman](https://www.ccs.neu.edu/home/gene/), and [Hongyang R. Zhang](https://www.hongyangzhang.com).
+* Authors: [Ziniu Zhang](https://ziniuzhang.github.io), [Zhenshuo Zhang](https://zhenshuozhang.github.io), [Ruoxuan Xiong](https://www.ruoxuanxiong.com/), [Gene Cooperman](https://www.ccs.neu.edu/home/gene/), and [Hongyang R. Zhang](https://www.hongyangzhang.com).
 
 This repository contains code for reproducing the main experiments of **Long-Context Demonstration Selection Using Grouped State Space Models**. The method uses layer-grouped state space models (SSMs) to compress long demonstration prefixes, and evaluates demonstration-selection strategies for long-context inference.
 
