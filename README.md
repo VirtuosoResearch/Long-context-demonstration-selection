@@ -1,8 +1,8 @@
-# Long-Context Demonstration Selection Using Grouped State Space Models
+# Long-Context Demonstration Selection Using State Space Models
 
-* Authors: [Ziniu Zhang](ziniuzhang.github.io), [Zhenshuo Zhang](zhenshuozhang.github.io), [Ruoxuan Xiong](https://www.ruoxuanxiong.com/index.html), [Gene Cooperman](https://www.ccs.neu.edu/home/gene/), and [Hongyang R. Zhang](www.hongyangzhang.com).
+* Authors: [Ziniu Zhang](https://ziniuzhang.github.io), [Zhenshuo Zhang](https://zhenshuozhang.github.io), [Ruoxuan Xiong](https://www.ruoxuanxiong.com/index.html), [Gene Cooperman](https://www.ccs.neu.edu/home/gene/), and [Hongyang R. Zhang](https://www.hongyangzhang.com).
 
-This repository contains code for reproducing the main experiments of **Long-Context Demonstration Selection Using Grouped State Space Models**. The method uses layer-grouped state space models (SSMs) to compress long demonstration prefixes into compact virtual KV states, and evaluates demonstration-selection strategies for long-context in-context learning.
+This repository contains code for reproducing the main experiments of **Long-Context Demonstration Selection Using Grouped State Space Models**. The method uses layer-grouped state space models (SSMs) to compress long demonstration prefixes, and evaluates demonstration-selection strategies for long-context inference.
 
 The main experiments cover:
 
@@ -138,9 +138,9 @@ If you find this repository useful or use it in a research paper, please cite ou
 
 ```bibtex
 @inproceedings{zhang2026longcontext,
-  title={Long-Context Demonstration Selection Using Grouped State Space Models},
+  title={Long-Context Demonstration Selection Using State Space Models},
   author={Zhang, Ziniu and Zhang, Zhenshuo and Xiong, Ruoxuan and Cooperman, Gene and Zhang, Hongyang R.},
-  booktitle={Findings of the Association for Computational Linguistics: EMNLP},
+  booktitle={Findings of Empirical Methods in Natural Language Processing},
   year={2026}
 }
 ```
