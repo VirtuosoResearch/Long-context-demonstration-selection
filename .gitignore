@@ -191,3 +191,4 @@ src/linear_functions/src/results
 
 *.pt
 *.pdf
+./src/long-context/data/
