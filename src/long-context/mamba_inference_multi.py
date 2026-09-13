@@ -2,7 +2,9 @@ import argparse
 import copy
 import gc
 import math
+import os
 import random
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -18,7 +20,7 @@ from utils.data import load_data
 
 
 # =====================================================================
-# MMLU data loading
+# MMLU / GSM8K data loading
 # =====================================================================
 
 MMLU_COLLEGE_SUBJECTS = [
@@ -29,6 +31,16 @@ MMLU_COLLEGE_SUBJECTS = [
     "college_medicine",
     "college_physics",
 ]
+
+# HF gsm8k only has train/test. Map multi.py's test/dev convention:
+#   test  -> HF train  (retrieval / demo pool)
+#   train -> HF train  (QA supervision pool)
+#   dev   -> HF test   (evaluation)
+_GSM8K_HF_SPLIT = {
+    "test": "train",
+    "train": "train",
+    "dev": "test",
+}
 
 
 def _mmlu_answer_to_index(answer) -> int:
@@ -41,6 +53,18 @@ def _mmlu_answer_to_index(answer) -> int:
         if len(s) == 1 and "A" <= s <= "Z":
             return ord(s) - ord("A")
     raise ValueError(f"Unsupported MMLU answer format: {answer!r}")
+
+
+def extract_answer_number(text: str) -> str:
+    match = re.search(r"####\s*(.+?)$", text.strip(), re.MULTILINE)
+    if match:
+        return match.group(1).strip().replace(",", "")
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
+    return nums[-1].replace(",", "") if nums else ""
+
+
+def extract_generated_answer(text: str) -> str:
+    return extract_answer_number(text)
 
 
 def _build_mmlu_college_data():
@@ -102,13 +126,80 @@ def load_mmlu_college_split(args, split):
     return list(split_data)
 
 
-def _load_dataset(args, split):
-    if args.dataset.strip().lower() == "mmlu":
+def load_gsm8k_hf(split, max_samples=0):
+    """Load generative GSM8K (same format as mamba_inference_cot.py)."""
+    from datasets import load_dataset
+
+    hf_split = _GSM8K_HF_SPLIT.get(split, split)
+    ds = load_dataset("openai/gsm8k", "main", split=hf_split)
+    data = []
+    for ex in ds:
+        answer = ex["answer"]
+        data.append({
+            "input": ex["question"],
+            "output": answer,
+            "answer_number": extract_answer_number(answer),
+            "task": "gsm8k",
+            "dataset": "gsm8k",
+        })
+    if max_samples > 0:
+        data = data[:max_samples]
+    print(f"[GSM8K] split={split} -> hf={hf_split}, n={len(data)}")
+    return data
+
+
+def _local_jsonl_path(dataset_name, split):
+    return os.path.join("data", dataset_name, f"{dataset_name}_{split}.jsonl")
+
+
+def _load_one_dataset(args, name, split):
+    name = name.strip()
+    if not name:
+        return []
+    local_path = _local_jsonl_path(name, split)
+    if os.path.exists(local_path):
+        return load_data(
+            task=None, split=split, k=args.k,
+            seed=args.seed, datasets=[name], is_null=False,
+        )
+    if name.lower() == "mmlu":
         return load_mmlu_college_split(args, split)
-    return load_data(
-        task=None, split=split, k=args.k,
-        seed=args.seed, datasets=args.dataset.split(","), is_null=False
+    if name.lower() == "gsm8k":
+        max_samples = 0
+        if split == args.eval_split:
+            max_samples = getattr(args, "max_eval_samples", 0) or 0
+        elif split == args.retrieval_split:
+            max_samples = getattr(args, "max_retrieval_samples", 0) or 0
+        elif split == args.train_split:
+            max_samples = getattr(args, "max_train_samples", 0) or 0
+        return load_gsm8k_hf(split, max_samples=max_samples)
+    raise FileNotFoundError(
+        f"Missing local data for dataset={name!r} split={split!r}: {local_path}. "
+        f"For gsm8k, either run data/gsm8k/build_gsm8k_splits.py or keep network "
+        f"access so HF fallback can load openai/gsm8k."
     )
+
+
+def _load_dataset(args, split):
+    names = [d.strip() for d in args.dataset.split(",") if d.strip()]
+    if not names:
+        raise ValueError("--dataset is empty")
+    # Single-dataset mmlu keeps the previous in-memory college split behavior
+    # when local jsonl is absent.
+    if len(names) == 1:
+        return _load_one_dataset(args, names[0], split)
+    data = []
+    for name in names:
+        part = _load_one_dataset(args, name, split)
+        print(f"[Data] {name}/{split}: {len(part)} examples")
+        data.extend(part)
+    print(f"[Data] merged {names} / {split}: {len(data)} examples")
+    return data
+
+
+def _is_generative_dp(dp) -> bool:
+    """GSM8K-style free-form answers (no MCQ options)."""
+    return not dp.get("options")
 
 
 # =====================================================================
@@ -322,6 +413,91 @@ def _pos_ids(start, length, device, bsz=1):
 
 
 # =====================================================================
+# Generation helpers (GSM8K / free-form CoT eval)
+# =====================================================================
+
+@torch.no_grad()
+def full_kv_generate(model, tokenizer, demo_ids, q_ids, device,
+                     max_new_tokens=512, temperature=0.0, stop_strings=None):
+    if stop_strings is None:
+        stop_strings = ["\n\nQ:", "\n\nQuestion:", "\nQ:"]
+    prefix = torch.cat([demo_ids, q_ids], dim=1)
+    out = model(input_ids=prefix, use_cache=True)
+    logits = out.logits[:, -1, :]
+    past = out.past_key_values
+    generated_ids = []
+    for _ in range(max_new_tokens):
+        if temperature <= 0:
+            next_id = logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = F.softmax(logits / temperature, dim=-1)
+            next_id = torch.multinomial(probs, 1)
+        token_id = next_id.item()
+        generated_ids.append(token_id)
+        if token_id == tokenizer.eos_token_id:
+            break
+        partial = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if any(ss in partial for ss in stop_strings):
+            break
+        if "####" in partial:
+            after = partial.split("####")[-1].strip()
+            if after and (len(after) > 10 or "\n" in after):
+                break
+        out = model(input_ids=next_id, past_key_values=past, use_cache=True)
+        logits = out.logits[:, -1, :]
+        past = out.past_key_values
+    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+
+@torch.no_grad()
+def ssm_generate(model, tokenizer, demo_cache, demo_len, true_demo_len,
+                 align_true_positions, q_text, device,
+                 max_new_tokens=512, temperature=0.0, stop_strings=None):
+    if stop_strings is None:
+        stop_strings = ["\n\nQ:", "\n\nQuestion:", "\nQ:"]
+    q_ids = tokenizer(q_text, return_tensors="pt",
+                      add_special_tokens=False)["input_ids"].to(device)
+    if q_ids.numel() == 0:
+        return ""
+    cache = _fresh_cache_copy(demo_cache)
+    ctx_len = demo_len + q_ids.shape[1]
+    attn = torch.ones(1, ctx_len, dtype=torch.long, device=device)
+    pos_start = true_demo_len if align_true_positions else demo_len
+    out = model(input_ids=q_ids, past_key_values=cache, attention_mask=attn,
+                position_ids=_pos_ids(pos_start, q_ids.shape[1], device), use_cache=True)
+    logits = out.logits[:, -1, :]
+    past = out.past_key_values
+    cur_pos = pos_start + q_ids.shape[1]
+    cur_ctx = ctx_len
+    generated_ids = []
+    for _ in range(max_new_tokens):
+        if temperature <= 0:
+            next_id = logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = F.softmax(logits / temperature, dim=-1)
+            next_id = torch.multinomial(probs, 1)
+        token_id = next_id.item()
+        generated_ids.append(token_id)
+        if token_id == tokenizer.eos_token_id:
+            break
+        partial = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if any(ss in partial for ss in stop_strings):
+            break
+        if "####" in partial:
+            after = partial.split("####")[-1].strip()
+            if after and (len(after) > 10 or "\n" in after):
+                break
+        cur_ctx += 1
+        attn = torch.ones(1, cur_ctx, dtype=torch.long, device=device)
+        out = model(input_ids=next_id, past_key_values=past, attention_mask=attn,
+                    position_ids=_pos_ids(cur_pos, 1, device), use_cache=True)
+        logits = out.logits[:, -1, :]
+        past = out.past_key_values
+        cur_pos += 1
+    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+
+# =====================================================================
 # KV matching loss
 # =====================================================================
 
@@ -474,12 +650,21 @@ def _load_causal_lm(args, device):
     return AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
 
 
+def _sample_indices_allow_reuse(n, k, rng):
+    """Sample k indices from [0, n). Reuse with replacement if k > n."""
+    if n <= 0 or k <= 0:
+        return []
+    if k <= n:
+        return rng.sample(range(n), k)
+    return [rng.randrange(n) for _ in range(k)]
+
+
 def _generate_diverse_demo_texts(retrieval_data, k, num_sets, seed, add_newlines):
     rng = random.Random(seed)
     n = len(retrieval_data)
     texts = []
     for _ in range(num_sets):
-        indices = rng.sample(range(n), min(k, n))
+        indices = _sample_indices_allow_reuse(n, k, rng)
         demos = [retrieval_data[i] for i in indices]
         texts.append(_build_demo_text(demos, add_newlines))
     return texts
@@ -711,6 +896,10 @@ def run_distillation_training(args):
                                               add_special_tokens=False)["input_ids"].to(device)
                             if q_ids.numel() == 0 or a_ids.numel() == 0:
                                 continue
+                            # Truncate long CoT answers (gsm8k) for memory.
+                            max_a = getattr(args, "max_answer_tokens", 0) or 0
+                            if max_a > 0 and a_ids.shape[1] > max_a:
+                                a_ids = a_ids[:, :max_a]
 
                             with torch.no_grad():
                                 t_logits, t_hidden = _teacher_qa_forward(
@@ -879,8 +1068,7 @@ def run_experiment(args, sidecar_state_dict=None):
 
         # Pick demos for this query
         if per_query_random:
-            indices = rng_eval.sample(range(len(retrieval_data)),
-                                      min(args.k, len(retrieval_data)))
+            indices = _sample_indices_allow_reuse(len(retrieval_data), args.k, rng_eval)
             demos = [retrieval_data[i] for i in indices]
         else:
             if not hasattr(run_experiment, '_fixed_demos'):
@@ -892,46 +1080,70 @@ def run_experiment(args, sidecar_state_dict=None):
         demo_ids = tokenizer(demo_text, return_tensors="pt",
                              add_special_tokens=False)["input_ids"].to(device)
         original_demo_len = demo_ids.shape[1]
-        opts = dp["options"]
+        generative = _is_generative_dp(dp)
+        gt_label = (
+            str(dp.get("answer_number") or extract_answer_number(dp["output"]))
+            if generative else dp["output"]
+        )
+        max_a = getattr(args, "max_answer_tokens", 0) or 0
+        if max_a > 0 and a_ids.shape[1] > max_a:
+            a_ids = a_ids[:, :max_a]
         q_full_kv_flops = 0.0
         q_ssm_flops = 0.0
+        opt_scores = {}
 
-        # ─── Full-KV: concatenated forward ───
+        # ─── Full-KV prediction ───
         if track_cuda_peak_mem:
             torch.cuda.reset_peak_memory_stats()
-        opt_scores = {}
-        for opt in opts:
-            opt_text = _normalize_option(opt, add_nl)
-            opt_ids = tokenizer(opt_text, return_tensors="pt",
-                                add_special_tokens=False)["input_ids"].to(device)
-            if opt_ids.numel() == 0:
-                opt_scores[opt] = float("inf")
-                continue
-            if args.flops:
-                total_len = original_demo_len + q_ids.shape[1] + opt_ids.shape[1]
-                q_full_kv_flops += _analytical_flops_full(flop_params, total_len)
+        if generative:
             try:
                 with torch.no_grad():
-                    all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
-                    out = model(input_ids=all_ids, use_cache=False)
-                    start = demo_ids.shape[1] + q_ids.shape[1] - 1
-                    pred_logits = out.logits[:, start:start + opt_ids.shape[1], :]
-                    nll = F.cross_entropy(
-                        pred_logits.reshape(-1, pred_logits.size(-1)),
-                        opt_ids.reshape(-1), reduction="sum",
-                    ).item()
+                    full_gen = full_kv_generate(
+                        model, tokenizer, demo_ids, q_ids, device,
+                        max_new_tokens=args.max_gen_tokens,
+                    )
+                full_kv_preds.append(extract_generated_answer(full_gen))
             except RuntimeError as e:
                 if _is_cuda_oom_error(e):
-                    oom_in_dp = True
-                    break
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=full-kv-gen")
+                    _cleanup_after_oom(device)
+                    continue
                 raise
-            opt_scores[opt] = nll
-        if oom_in_dp:
-            eval_oom_skips += 1
-            print(f"[OOM-SKIP][eval-dp] idx={qi} stage=full-kv")
-            _cleanup_after_oom(device)
-            continue
-        full_kv_preds.append(min(opt_scores, key=opt_scores.get))
+        else:
+            opts = dp["options"]
+            for opt in opts:
+                opt_text = _normalize_option(opt, add_nl)
+                opt_ids = tokenizer(opt_text, return_tensors="pt",
+                                    add_special_tokens=False)["input_ids"].to(device)
+                if opt_ids.numel() == 0:
+                    opt_scores[opt] = float("inf")
+                    continue
+                if args.flops:
+                    total_len = original_demo_len + q_ids.shape[1] + opt_ids.shape[1]
+                    q_full_kv_flops += _analytical_flops_full(flop_params, total_len)
+                try:
+                    with torch.no_grad():
+                        all_ids = torch.cat([demo_ids, q_ids, opt_ids], dim=1)
+                        out = model(input_ids=all_ids, use_cache=False)
+                        start = demo_ids.shape[1] + q_ids.shape[1] - 1
+                        pred_logits = out.logits[:, start:start + opt_ids.shape[1], :]
+                        nll = F.cross_entropy(
+                            pred_logits.reshape(-1, pred_logits.size(-1)),
+                            opt_ids.reshape(-1), reduction="sum",
+                        ).item()
+                except RuntimeError as e:
+                    if _is_cuda_oom_error(e):
+                        oom_in_dp = True
+                        break
+                    raise
+                opt_scores[opt] = nll
+            if oom_in_dp:
+                eval_oom_skips += 1
+                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=full-kv")
+                _cleanup_after_oom(device)
+                continue
+            full_kv_preds.append(min(opt_scores, key=opt_scores.get))
         if track_cuda_peak_mem:
             full_kv_peak_mem_bytes = max(full_kv_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
@@ -988,47 +1200,65 @@ def run_experiment(args, sidecar_state_dict=None):
             if st > 0:
                 ssm_demo_flops += _analytical_flops_full(flop_params, st)
 
-        # SSM accuracy: build scorer on the fly for this query's demos
-        scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
-                                    sink_tokens=args.sink_tokens, align_true_positions=align)
-        scorer.demo_cache = _build_cache_from_kv_list(virtual_kv, sink_kv=sink_kv)
-        scorer.demo_len = ssm_demo_len
-        scorer.true_demo_len = original_demo_len
-
+        # SSM accuracy
         if track_cuda_peak_mem:
             torch.cuda.reset_peak_memory_stats()
-        try:
-            first, q_past, q_len = scorer.prefill_question(q_text)
-        except RuntimeError as e:
-            if _is_cuda_oom_error(e):
-                eval_oom_skips += 1
-                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-prefill")
-                _cleanup_after_oom(device)
-                full_kv_preds.pop()
-                continue
-            raise
-        if args.flops:
-            q_ssm_flops += _analytical_flops_inc(flop_params, q_len, ssm_demo_len)
-        opt_texts = [_normalize_option(o, add_nl) for o in opts]
-        try:
-            scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
-        except RuntimeError as e:
-            if _is_cuda_oom_error(e):
-                eval_oom_skips += 1
-                print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-options")
-                _cleanup_after_oom(device)
-                full_kv_preds.pop()
-                continue
-            raise
-        scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
-        option_output_kls.append(_option_output_kl_from_nll(opt_scores, scores))
-        if args.flops:
-            for opt_text in opt_texts:
-                opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
-                q_ssm_flops += _analytical_flops_inc(
-                    flop_params, opt_len, ssm_demo_len + q_len
-                )
-        ssm_preds.append(min(scores, key=scores.get))
+        if generative:
+            try:
+                ssm_cache = _build_cache_from_kv_list(virtual_kv, sink_kv=sink_kv)
+                with torch.no_grad():
+                    ssm_gen = ssm_generate(
+                        model, tokenizer, ssm_cache, ssm_demo_len, original_demo_len,
+                        align, q_text, device, max_new_tokens=args.max_gen_tokens,
+                    )
+                ssm_preds.append(extract_generated_answer(ssm_gen))
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-gen")
+                    _cleanup_after_oom(device)
+                    full_kv_preds.pop()
+                    continue
+                raise
+        else:
+            scorer = SSMHybridICLScorer(model, tokenizer, device, sidecar,
+                                        sink_tokens=args.sink_tokens, align_true_positions=align)
+            scorer.demo_cache = _build_cache_from_kv_list(virtual_kv, sink_kv=sink_kv)
+            scorer.demo_len = ssm_demo_len
+            scorer.true_demo_len = original_demo_len
+            try:
+                first, q_past, q_len = scorer.prefill_question(q_text)
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-prefill")
+                    _cleanup_after_oom(device)
+                    full_kv_preds.pop()
+                    continue
+                raise
+            if args.flops:
+                q_ssm_flops += _analytical_flops_inc(flop_params, q_len, ssm_demo_len)
+            opts = dp["options"]
+            opt_texts = [_normalize_option(o, add_nl) for o in opts]
+            try:
+                scores_t = scorer.score_options_nll(first, q_past, q_len, opt_texts)
+            except RuntimeError as e:
+                if _is_cuda_oom_error(e):
+                    eval_oom_skips += 1
+                    print(f"[OOM-SKIP][eval-dp] idx={qi} stage=ssm-options")
+                    _cleanup_after_oom(device)
+                    full_kv_preds.pop()
+                    continue
+                raise
+            scores = {o: scores_t[ot] for o, ot in zip(opts, opt_texts)}
+            option_output_kls.append(_option_output_kl_from_nll(opt_scores, scores))
+            if args.flops:
+                for opt_text in opt_texts:
+                    opt_len = len(tokenizer(opt_text, add_special_tokens=False)["input_ids"])
+                    q_ssm_flops += _analytical_flops_inc(
+                        flop_params, opt_len, ssm_demo_len + q_len
+                    )
+            ssm_preds.append(min(scores, key=scores.get))
         if track_cuda_peak_mem:
             ssm_query_peak_mem_bytes = max(ssm_query_peak_mem_bytes, torch.cuda.max_memory_allocated())
 
@@ -1093,14 +1323,14 @@ def run_experiment(args, sidecar_state_dict=None):
             rel_sq = ((s_first_val - t_first_val) / denom) ** 2 if denom != 0 else 0.0
             query_logit_mses.append(rel_sq)
 
-        processed_gts.append(dp["output"])
+        processed_gts.append(gt_label)
         # Track per-dataset
         ds = dp.get("task", dp.get("dataset", "unknown"))
         if ds not in ds_results:
             ds_results[ds] = {"full_p": [], "ssm_p": [], "gt": []}
         ds_results[ds]["full_p"].append(full_kv_preds[-1])
         ds_results[ds]["ssm_p"].append(ssm_preds[-1])
-        ds_results[ds]["gt"].append(dp["output"])
+        ds_results[ds]["gt"].append(gt_label)
         if args.flops:
             full_kv_total_flops += q_full_kv_flops
             ssm_query_total_flops += q_ssm_flops
@@ -1332,9 +1562,15 @@ def _build_demo_text(demos, add_newlines):
 
 
 def _choose_fixed_demos(data, k, strategy, seed):
+    n = len(data)
+    if k <= 0 or n == 0:
+        return []
     if strategy == "first":
-        return data[:k]
-    return [data[i] for i in random.Random(seed).sample(range(len(data)), k)]
+        if k <= n:
+            return data[:k]
+        reps = (k + n - 1) // n
+        return (list(data) * reps)[:k]
+    return [data[i] for i in _sample_indices_allow_reuse(n, k, random.Random(seed))]
 
 
 def _accuracy(preds, gts):
@@ -1553,6 +1789,16 @@ if __name__ == "__main__":
     p.add_argument("--load_sidecar_path", type=str, default="")
     p.add_argument("--empty_cache_every", type=int, default=0,
                    help="If >0, run gc.collect()+torch.cuda.empty_cache() every N train steps.")
+    p.add_argument("--max_answer_tokens", type=int, default=256,
+                   help="Truncate long CoT answers (gsm8k) during train/eval teacher-forced losses.")
+    p.add_argument("--max_gen_tokens", type=int, default=512,
+                   help="Max new tokens for generative gsm8k eval.")
+    p.add_argument("--max_retrieval_samples", type=int, default=0,
+                   help="Optional cap when loading gsm8k from HF (0 = all).")
+    p.add_argument("--max_train_samples", type=int, default=0,
+                   help="Optional cap when loading gsm8k from HF (0 = all).")
+    p.add_argument("--max_eval_samples", type=int, default=0,
+                   help="Optional cap when loading gsm8k from HF (0 = all).")
 
     args = p.parse_args()
 
