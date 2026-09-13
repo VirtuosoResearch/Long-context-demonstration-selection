@@ -331,7 +331,9 @@ class LayerGroupSSMSidecar(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
         self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_virtual_tokens = num_virtual_tokens
         self.num_groups = num_groups
         self.ssm_dim = ssm_dim
@@ -1623,7 +1625,7 @@ def _get_model_flop_params(model):
     num_layers = getattr(cfg, "num_hidden_layers", 0)
     num_q_heads = getattr(cfg, "num_attention_heads", 0)
     num_kv_heads = getattr(cfg, "num_key_value_heads", num_q_heads)
-    head_dim = hidden // max(1, num_q_heads)
+    head_dim = getattr(cfg, "head_dim", hidden // max(1, num_q_heads))
     intermediate = getattr(cfg, "intermediate_size", 4 * hidden)
     vocab_size = getattr(cfg, "vocab_size", 0)
 
